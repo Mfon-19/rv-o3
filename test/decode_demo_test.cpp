@@ -4,15 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
-
-#if defined(__GNUC__) || defined(__clang__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wunused-function"
-#endif
 #include "../rv-five-stage.cpp"
-#if defined(__GNUC__) || defined(__clang__)
-#pragma GCC diagnostic pop
-#endif
 
 static const uint32_t kDemoProgram[] = {
     0x00000293,  //        addi t0, zero, 0    ; sum = 0
