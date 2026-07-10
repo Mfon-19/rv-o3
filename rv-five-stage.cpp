@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 
@@ -373,5 +374,407 @@ struct Memory {
         bytes[a + 1] = (uint8_t)(v >> 8);
         bytes[a + 2] = (uint8_t)(v >> 16);
         bytes[a + 3] = (uint8_t)(v >> 24);
+    }
+};
+
+// Pipeline latches (registers)
+//
+// Each struct is the register file between two stages, named after the
+// stages it separates. valid == false means the slot holds a bubble, because
+// either the pipe hasn't filled yet, or a stall/flush inserted one. 
+// Default-constructing a latch yields a bubble, which we exploit when 
+// squashing: e.g., idex = IDEX{}
+
+struct IFID {
+    bool valid = false;
+    uint32_t pc = 0; // address the word was fetched from
+    uint32_t raw = 0;
+};
+
+struct IDEX {
+    bool valid = false;
+    uint32_t pc = 0;
+    Instr ins; // the decoded instruction
+    // EX may override these with forwarded values
+    uint32_t rs1val = 0;
+    uint32_t rs2val = 0;
+};
+
+struct EXMEM {
+    bool valid = false;
+    uint32_t pc = 0;
+    Instr ins;
+    uint32_t aluResult = 0; // ALU result / effective address / link address
+    uint32_t storeData = 0; // rs2 value for stores (already EX-forwarded)
+};
+
+struct MEMWB {
+    bool valid = false;
+    uint32_t pc = 0;
+    Instr ins;
+    uint32_t result = 0; // value to write into rd: load data or ALU result
+};
+
+// The CPU
+
+class CPU {
+public:
+    CPU(size_t memBytes, uint16_t maxCycles)
+        : mem(memBytes), maxCycles(maxCycles) {
+        memset(regs, 0, sizeof regs);
+    }
+
+    Memory mem;
+
+private:
+    // architectural state
+    uint32_t regs[32];
+    uint32_t pc = 0;
+
+    // pipeline state
+    IFID ifid;
+    IDEX idex;
+    EXMEM exmem;
+    MEMWB memwb;
+
+    // bookkeeping
+    bool halted = false;
+    int exitCode = 0;
+    bool trace;
+    uint64_t maxCycles;
+    uint64_t cycles = 0;
+    uint64_t retired = 0; // instructions that completed WB
+    uint64_t loadUseStalls = 0; // bubbles inserted by the interlock
+    uint64_t redirects = 0; // taken branches/jumps
+    uint64_t squashed = 0; // wrong-path instructions killed by redirects
+
+    // IF - instruction fetch stage
+    IFID doIF() {
+        if (pc % 4 != 0) {
+            fprintf(stderr, "fatal: misaligned fetch at pc=0x%8x\n", pc);
+            exit(1);
+        }
+        IFID out;
+        out.valid = true;
+        out.pc = pc;
+        out.raw = mem.load32(pc);
+        return out;
+    }
+
+    // ID - instruction decode stage: decode instruction, read registers,
+    //      detect the load-use hazard
+    IDEX doID(bool& stall) {
+        IDEX out;
+        if (!ifid.valid) return out;
+
+        const Instr I = decode(ifid.raw);
+
+        // Hazard detection unit. If the instruction currently in EX (i.e., the
+        // one in the ID/EX latch right now) is a load whose destination this
+        // instruction needs in EX next cycle, we must stall to prevent a load-use
+        // hazard. The load's data is only available after MEM, one cycle too late
+        // for any forwarding path to save us. 
+        if ((idex.valid && isLoad(idex.ins.op) && idex.ins.rd != 0) && 
+            ((usesRs1(I.op) && I.rs1 == idex.ins.rd) || (rs2NeededInEX(I.op) && I.rs2 == idex.ins.rd))) {
+            stall = true;
+            return out; // default-constructed IDEX is a bubble
+        }
+
+        out.valid = true;
+        out.pc = ifid.pc;
+        out.ins = I;
+        // Register file read. WB already ran this cycle, so a producer
+        // three instructions ahead needs no forwarding at all
+        out.rs1val = regs[I.rs1];
+        out.rs2val = regs[I.rs2];
+        return out;
+    }
+
+    // Operand forwarding. The instruction in EX/MEM is younger than the one in
+    // MEM/WB, so its value must win when both match. Loads are excluded as EX/MEM 
+    // sources because their data does not exist until the end of MEM.
+    uint32_t fwd(uint8_t reg, uint32_t valueFromID) const {
+        if (reg == 0) return 0; // x0 never forwards
+        if (exmem.valid && writesRd(exmem.ins.op) && !isLoad(exmem.ins.op) &&
+            exmem.ins.rd) {
+            return exmem.aluResult;
+        }
+        if (memwb.valid && writesRd(memwb.ins.op) && memwb.ins.rd == reg) {
+            return memwb.result;
+        }
+        return valueFromID; // no in-flight producer, the ID read is good
+    }
+
+    // EX - execute stage: ALU, effective addresses, branch resolution
+    EXMEM doEX(bool& redirect, uint32_t& redirectPC) {
+        EXMEM out;
+        if (!idex.valid) return out;
+        const Instr& I = idex.ins;
+
+        out.valid = true;
+        out.pc = idex.pc;
+        out.ins = I;
+
+        // Resolve source operands through the forwarding network
+        const uint32_t a = usesRs1(I.op) ? fwd(I.rs1, idex.rs1val) : 0;
+        const uint32_t b = usesRs2(I.op) ? fwd(I.rs2, idex.rs2val) : 0;
+        const int32_t sa = (int32_t)a, sb = (int32_t)b; // signed values
+        const uint32_t imm = (uint32_t)I.imm;
+
+        switch (I.op) {
+            // upper-immediate
+            case Op::LUI: out.aluResult = imm; break;
+            case Op::AUIPC: out.aluResult = idex.pc + imm; break;
+
+            // jumps: link address is pc + 4, always redirect
+            case Op::JAL:
+                out.aluResult = idex.pc + 4;
+                redirect = true;
+                redirectPC = idex.pc + imm;
+                break;
+            case Op::JALR:
+                out.aluResult = idex.pc + 4;
+                redirect = true;
+                redirectPC = (a + imm) & ~1u; // ISA clears bit 0
+                break;
+            
+            // conditional branches: compare, redirect only if taken
+            case Op::BEQ:  if (a == b)   { redirect = true; } break;
+            case Op::BNE:  if (a != b)   { redirect = true; } break;
+            case Op::BLT:  if (sa < sb)  { redirect = true; } break;
+            case Op::BGE:  if (sa >= sb) { redirect = true; } break;
+            case Op::BLTU: if (a < b)    { redirect = true; } break;
+            case Op::BGEU: if (a >= b)   { redirect = true; } break;
+
+            // memory: EX only computes the effective address
+            case Op::LB: case Op::LH: case Op::LW: case Op::LBU: case Op::LHU:
+            case Op::SB: case Op::SH: case Op::SW:
+                out.aluResult = a + imm;
+                out.storeData = b;  // forwarded rs2, carried along for MEM
+                break;
+            
+            // ALU, immediate 
+            case Op::ADDI:  out.aluResult = a + imm;                       break;
+            case Op::SLTI:  out.aluResult = sa < (int32_t)imm;             break;
+            case Op::SLTIU: out.aluResult = a < imm;                       break;
+            case Op::XORI:  out.aluResult = a ^ imm;                       break;
+            case Op::ORI:   out.aluResult = a | imm;                       break;
+            case Op::ANDI:  out.aluResult = a & imm;                       break;
+            case Op::SLLI:  out.aluResult = a << (imm & 31);               break;
+            case Op::SRLI:  out.aluResult = a >> (imm & 31);               break;
+            case Op::SRAI:  out.aluResult = (uint32_t)(sa >> (imm & 31));  break;
+
+            // ALU, register 
+            case Op::ADD:  out.aluResult = a + b;                      break;
+            case Op::SUB:  out.aluResult = a - b;                      break;
+            case Op::SLL:  out.aluResult = a << (b & 31);              break;
+            case Op::SLT:  out.aluResult = sa < sb;                    break;
+            case Op::SLTU: out.aluResult = a < b;                      break;
+            case Op::XOR:  out.aluResult = a ^ b;                      break;
+            case Op::SRL:  out.aluResult = a >> (b & 31);              break;
+            case Op::SRA:  out.aluResult = (uint32_t)(sa >> (b & 31)); break;
+            case Op::OR:   out.aluResult = a | b;                      break;
+            case Op::AND:  out.aluResult = a & b; break;
+
+            // M extension. We charge 1 cycle like everything else: a real core would be
+            // multicycle for mul and div. The results follow the ISA exactly, including
+            // the divide-by-zero and overflow special cases, which RISC-V defines
+            // instead of trapping
+            case Op::MUL:    out.aluResult = a * b; break;
+            case Op::MULH:   out.aluResult = (uint32_t)(((int64_t)sa * (int64_t)sb) >> 32); break;
+            case Op::MULHSU: out.aluResult = (uint32_t)(((int64_t)sa * (int64_t)(uint64_t)b) >> 32); break;
+            case Op::MULHU:  out.aluResult = (uint32_t)(((uint64_t)a * (uint64_t)b) >> 32); break;
+            case Op::DIV:
+                if (b == 0)                          out.aluResult = 0xFFFFFFFFu;  // -1
+                else if (a == 0x80000000u && sb == -1) out.aluResult = a;          // overflow
+                else                                 out.aluResult = (uint32_t)(sa / sb);
+                break;
+            case Op::DIVU: out.aluResult = (b == 0) ? 0xFFFFFFFFu : a / b; break;
+            case Op::REM:
+                if (b == 0)                          out.aluResult = a;
+                else if (a == 0x80000000u && sb == -1) out.aluResult = 0;
+                else                                 out.aluResult = (uint32_t)(sa % sb);
+                break;
+            case Op::REMU: out.aluResult = (b == 0) ? a : a % b; break;
+
+            // ---- pass-through: no EX work; handled in WB or nowhere ----
+            case Op::FENCE: case Op::ECALL: case Op::EBREAK: case Op::ILLEGAL:
+                break;
+        }
+
+        // Branch targets are pc-relative
+        if (isBranch(I.op) && redirect) redirectPC = idex.pc + imm;
+
+        return out;
+    }
+
+    // RV32I permits trapping on misaligned data accesses, but we
+    // treat them as fatal since we don't model trap handling
+    void checkAlign(Op op, uint32_t addr, uint32_t atPc) {
+        uint32_t need = 1;
+        if (op == Op::LH || op == Op::LHU || op == Op::SH) need = 2;
+        if (op == Op::LW || op == Op::SW) need = 4;
+        if (addr % need != 0) {
+            fprintf(stderr, "fatal: misaligned %s of 0x%08x at pc=0x%08x\n",
+                    isStore(op) ? "store" : "load", addr, atPc);
+            exit(1);
+        }
+    }
+
+    // MEM - data memory stage
+    MEMWB doMEM() {
+        MEMWB out;
+        if (!exmem.valid) return out;
+        const Instr& I = exmem.ins;
+
+        out.valid = true;
+        out.pc = exmem.pc;
+        out.ins = I;
+        out.result = exmem.aluResult;
+
+        const uint32_t addr = exmem.aluResult;
+
+        if (isLoad(I.op)) {
+            checkAlign(I.op, addr, exmem.pc);
+            switch (I.op) {
+                // Sub-word loads sign- or zero-extended into 32 bits as per the ISA
+                case Op::LB:  out.result = (uint32_t)(int32_t)(int8_t)mem.load8(addr);   break;
+                case Op::LBU: out.result = mem.load8(addr);                              break;
+                case Op::LH:  out.result = (uint32_t)(int32_t)(int16_t)mem.load16(addr); break;
+                case Op::LHU: out.result = mem.load16(addr);                             break;
+                case Op::LW:  out.result = mem.load32(addr);                             break;
+                default: break;
+            }
+        } else if (isStore(I.op)) {
+            checkAlign(I.op, addr, exmem.pc);
+            uint32_t data = exmem.storeData;
+            // MEM/WB -> MEM store-data forwarding. Covers the case "lw x1 / sw x1":
+            // when the store sat in EX, the load's data did not exist yet, so the
+            // value carried in the storeData is stale, now the load is in WB and its
+            // data is in the MEM/WB latch. The instruction in WB is always the store's
+            // immediate predecessor, so its value is never outdated
+            if (memwb.valid && writesRd(memwb.ins.op) && memwb.ins.rd != 0 && 
+                memwb.ins.rd == I.rs2) {
+                data = memwb.result;
+            }
+            switch (I.op) {
+                case Op::SB: mem.store8(addr, (uint8_t)data);   break;
+                case Op::SH: mem.store16(addr, (uint16_t)data); break;
+                case Op::SW: mem.store32(addr, data);           break;
+                default: break;
+            }
+        }
+        return out;
+    }
+
+    // WB - write-back stage
+    void doWB() {
+        if (!memwb.valid) return;
+        const Instr& I = memwb.ins;
+
+        switch (I.op) {
+            case Op::ECALL:
+                retired++;
+                doSyscall();
+                return;
+            case Op::EBREAK:
+                retired++;
+                fprintf(stderr, "ebreak at pc=0x%08x — halting\n", memwb.pc);
+                halted = true;
+                return;
+            case Op::ILLEGAL:
+                // We let illegal words flow down the pipe and trap them only here,
+                // so that wrong-path garbage fetched after a taken branch (which
+                // gets squashed long before WB) never causes a spurious error.
+                fprintf(stderr, "illegal instruction 0x%08x at pc=0x%08x\n",
+                        I.raw, memwb.pc);
+                halted = true;
+                exitCode = 1;
+                return;
+            default:
+                break;
+        }
+
+        // The one and only architectural register write
+        if (writesRd(I.op) && I.rd != 0) regs[I.rd] = memwb.result;
+        retired++;
+    }
+
+    // Minimal syscall interface (a7 = number, a0 = argument)
+    //   1  print a0 as a signed decimal integer, followed by a newline
+    //   2  print a0 as a single ASCII character
+    //   3  print the NUL-terminated string at address a0
+    //   93 exit with code a0  (Linux-flavoured number; 10 also accepted)
+    void doSyscall() {
+        const uint32_t num = regs[17]; // a7
+        const uint32_t arg = regs[10]; // a0
+        switch (num) {
+            case 1:  printf("%d\n", (int32_t)arg); break;
+            case 2:  putchar((int)(arg & 0xFF));   break;
+            case 3:
+                for (uint32_t a = arg; mem.load8(a) != 0; a++) putchar(mem.load8(a));
+                break;
+            case 10:
+            case 93:
+                halted = true;
+                exitCode = (int)(arg & 0xFF);
+                break;
+            default:
+                fprintf(stderr, "warning: unknown syscall a7=%u at pc=0x%08x\n",
+                        num, memwb.pc);
+                break;
+        }
+    }
+
+    // One clock cycle
+    //
+    // Evaluation order matters for these two intra-cycle dependencies we model:
+    //      1. WB writes the register file BEFORE ID reads it
+    //      2. MEM reads the current MEM/WB latch for store-data forwarding, 
+    //         and EX reads the current EX/MEM and MEM/WB latches for ALU
+    //         forwarding, hence, all stages compute their output into local
+    //         "next" latches which are committed together at the end
+    void stepCycle() {
+        cycles++;
+        
+        // WB first
+        doWB();
+        if (halted) return;
+
+        // compute next state of every latch from current state
+        MEMWB nMemwb = doMEM();
+        bool redirect = false;
+        uint32_t redirectPC = 0;
+        EXMEM nExmem = doEX(redirect, redirectPC);
+        bool stall = false;
+        IDEX nIdex = doID(stall);
+        IFID nIfid = doIF();
+
+        // commit: this is the clock edge
+        memwb = nMemwb;
+        exmem = nExmem;
+
+        if (redirect) {
+            // A taken branch/jump in EX. The two younger instructios, the one
+            // just decoded and the one just fetched, are on the wrong path. We
+            // squash them by committing bubbled instead, and steer the PC
+            squashed += (nIdex.valid ? 1 : 0) + (nIfid.valid ? 1 : 0);
+            redirects++;
+            idex = IDEX{};
+            ifid = IFID{};
+            pc = redirectPC;
+        } else if (stall) {
+            // Load-use interlock: freeze IF and ID (keep ifid and pc as they
+            // are so ID retries the same instruction next cycle) and inject a
+            // bubble into EX. One cycle later MEM/WB->EX forwarding supplies
+            // the loaded value and the pipe moves on
+            loadUseStalls++;
+            idex = IDEX{};
+        } else {
+            // Normal flow
+            idex = nIdex;
+            ifid = nIfid;
+            pc += 4;
+        }
     }
 };
