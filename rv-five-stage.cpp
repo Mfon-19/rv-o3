@@ -19,6 +19,7 @@
 #include <cstring>
 #include <fstream>
 #include <sstream>
+#include <string>
 #include <vector>
 
 
@@ -474,8 +475,8 @@ struct MEMWB {
 
 class CPU {
 public:
-    CPU(size_t memBytes, uint16_t maxCycles)
-        : mem(memBytes), maxCycles(maxCycles) {
+    CPU(size_t memBytes, bool trace, uint64_t maxCycles)
+        : mem(memBytes), trace(trace), maxCycles(maxCycles) {
         memset(regs, 0, sizeof regs);
     }
 
@@ -486,6 +487,11 @@ public:
         for (size_t i = 0; i < words.size(); i++) {
             mem.store32((uint32_t)(i * 4), words[i]);
         }
+    }
+
+    void loadBytes(const std::vector<uint8_t>& bytes) {
+        mem.check(0, (uint32_t)bytes.size(), "program image");
+        memcpy(mem.bytes.data(), bytes.data(), bytes.size());
     }
 
     // Run until an exit syscall / ebreak / error, or the cycle budget runs out
@@ -499,6 +505,7 @@ public:
             }
             stepCycle();
         }
+        printStats();
         return exitCode;
     }
 
@@ -532,6 +539,7 @@ private:
     uint64_t loadUseStalls = 0; // bubbles inserted by the interlock
     uint64_t redirects = 0; // taken branches/jumps
     uint64_t squashed = 0; // wrong-path instructions killed by redirects
+    std::vector<std::string> events; // per-cycle annotations for the trace
 
     // IF - instruction fetch stage
     IFID doIF() {
@@ -581,7 +589,7 @@ private:
     uint32_t fwd(uint8_t reg, uint32_t valueFromID) const {
         if (reg == 0) return 0; // x0 never forwards
         if (exmem.valid && writesRd(exmem.ins.op) && !isLoad(exmem.ins.op) &&
-            exmem.ins.rd) {
+            exmem.ins.rd == reg) {
             return exmem.aluResult;
         }
         if (memwb.valid && writesRd(memwb.ins.op) && memwb.ins.rd == reg) {
@@ -821,10 +829,15 @@ private:
     //         "next" latches which are committed together at the end
     void stepCycle() {
         cycles++;
-        
+        events.clear();
+        if (trace) captureStageView();
+
         // WB first
         doWB();
-        if (halted) return;
+        if (halted) {
+            if (trace) printTrace();
+            return;
+        }
 
         // compute next state of every latch from current state
         MEMWB nMemwb = doMEM();
@@ -848,6 +861,9 @@ private:
             idex = IDEX{};
             ifid = IFID{};
             pc = redirectPC;
+            char b[80];
+            snprintf(b, sizeof b, "taken -> 0x%08x (squashed 2)", redirectPC);
+            events.push_back(b);
         } else if (stall) {
             // Load-use interlock: freeze IF and ID (keep ifid and pc as they
             // are so ID retries the same instruction next cycle) and inject a
@@ -855,12 +871,47 @@ private:
             // the loaded value and the pipe moves on
             loadUseStalls++;
             idex = IDEX{};
+            events.push_back("load-use stall (bubble -> EX)");
         } else {
             // Normal flow
             idex = nIdex;
             ifid = nIfid;
             pc += 4;
         }
+
+        if (trace) printTrace();
+    }
+
+    // Trace and statistics
+    std::string vIF, vID, vEX, vMEM, vWB; // start-of-cycle stage occupancy
+
+    void captureStageView() {
+        char b[16];
+        snprintf(b, sizeof b, "0x%08x", pc);
+        vIF = b;
+        vID = ifid.valid ? disasm(decode(ifid.raw)) : "-";
+        vEX = idex.valid ? disasm(idex.ins) : "-";
+        vMEM = exmem.valid ? disasm(exmem.ins) : "-";
+        vWB = memwb.valid ? disasm(memwb.ins) : "-";
+    }
+
+    void printTrace() const {
+        fprintf(stderr,
+                "cyc %6" PRIu64 " | IF %-10s | ID %-20s | EX %-20s | MEM %-20s | WB %-20s",
+                cycles, vIF.c_str(), vID.c_str(), vEX.c_str(), vMEM.c_str(),
+                vWB.c_str());
+        for (const auto& event : events) fprintf(stderr, "  ! %s", event.c_str());
+        fputc('\n', stderr);
+    }
+
+    void printStats() const {
+        fprintf(stderr, "--- rvsim: %" PRIu64 " cycles, %" PRIu64
+                " instructions retired, CPI = %.3f\n",
+                cycles, retired, retired ? (double)cycles / (double)retired : 0.0);
+        fprintf(stderr, "--- rvsim: %" PRIu64 " load-use stalls, %" PRIu64
+                " taken branches/jumps (%" PRIu64 " squashed instructions)\n",
+                loadUseStalls, redirects, squashed);
+        fprintf(stderr, "--- rvsim: exit code %d\n", exitCode);
     }
 };
 
@@ -894,6 +945,14 @@ static std::vector<uint32_t> loadHexFile(const char* path) {
   return words;
 }
 
+// Raw little-endian flat binary, loaded at address 0
+static std::vector<uint8_t> loadBinFile(const char* path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) { fprintf(stderr, "cannot open %s\n", path); exit(1); }
+    return std::vector<uint8_t>(std::istreambuf_iterator<char>(f),
+                                std::istreambuf_iterator<char>());
+}
+
 static void usage(const char* argv0) {
     fprintf(stderr,
             "usage: %s [options] [program.hex|program.bin]\n"
@@ -901,7 +960,6 @@ static void usage(const char* argv0) {
             "  -r            dump registers when the simulation ends\n"
             "  -c <cycles>   cycle budget (default 10000000)\n"
             "  -m <bytes>    memory size (default 1 MiB)\n"
-            "With no program file, a built-in demo (sum 1..10) is run.\n"
             "Hex format: whitespace-separated 32-bit hex words, '#' comments.\n",
             argv0);
 }
@@ -922,8 +980,20 @@ int main(int argc, char** argv) {
         else file = argv[i];
     }
 
-    CPU cpu(memBytes, maxCycles);
-    cpu.loadWords(loadHexFile(file));
+    if (!file) {
+        fprintf(stderr, "please provide a program file\n");
+        usage(argv[0]);
+        return 1;
+    }
+
+    CPU cpu(memBytes, trace, maxCycles);
+
+    const size_t n = strlen(file);
+    if (n > 4 && !strcmp(file + n - 4, ".bin")) {
+        cpu.loadBytes(loadBinFile(file));
+    } else {
+        cpu.loadWords(loadHexFile(file));
+    }
 
     int code = cpu.run();
     if (dumpRegs) cpu.dumpRegs();

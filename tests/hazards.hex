@@ -1,0 +1,22 @@
+# hazards.hex — a gauntlet of data hazards; prints 84 and exits with code 0.
+# Exercises:
+#   * EX/MEM -> EX forwarding      (addi feeding the sw address base)
+#   * load-use interlock           (lw t3 immediately used by add)
+#   * MEM/WB -> MEM store-data fwd (lw t5 immediately stored by sw)
+# Data lives at 4096 (0x1000), well clear of the code at 0.
+# Run with -t to watch the stall and the forwards happen.
+
+00001137   # 0x00  lui  sp, 0x1        ; sp = 0x1000, data area
+02A00093   # 0x04  addi ra, zero, 42   ; ra = 42
+00112023   # 0x08  sw   ra, 0(sp)      ; mem[0x1000] = 42
+00012183   # 0x0c  lw   gp, 0(sp)      ; gp = 42
+00318233   # 0x10  add  tp, gp, gp     ; LOAD-USE: 1-cycle stall, tp = 84
+00412223   # 0x14  sw   tp, 4(sp)      ; mem[0x1004] = 84
+00412283   # 0x18  lw   t0, 4(sp)      ; t0 = 84
+00512423   # 0x1c  sw   t0, 8(sp)      ; lw;sw pair: MEM/WB->MEM fwd, no stall
+00812503   # 0x20  lw   a0, 8(sp)      ; a0 = 84
+00100893   # 0x24  addi a7, zero, 1    ; syscall 1: print_int
+00000073   # 0x28  ecall               ; prints "84"
+00000513   # 0x2c  addi a0, zero, 0    ; exit code 0
+05D00893   # 0x30  addi a7, zero, 93   ; syscall 93: exit
+00000073   # 0x34  ecall

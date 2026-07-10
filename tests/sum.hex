@@ -1,0 +1,16 @@
+# sum.hex — computes 1+2+...+10 = 55, prints it, exits with code 0.
+# Exercises: a data-dependent loop, a backward branch taken 9 times
+# (each taken branch costs 2 squashed instructions in this pipeline).
+
+00000293   # 0x00        addi t0, zero, 0    ; sum = 0
+00100313   # 0x04        addi t1, zero, 1    ; i = 1
+00A00393   # 0x08        addi t2, zero, 10   ; limit = 10
+006282B3   # 0x0c  loop: add  t0, t0, t1     ; sum += i
+00130313   # 0x10        addi t1, t1, 1      ; i++
+FE63DCE3   # 0x14        bge  t2, t1, loop   ; while (i <= limit)
+00028513   # 0x18        addi a0, t0, 0      ; a0 = sum
+00100893   # 0x1c        addi a7, zero, 1    ; syscall 1: print_int
+00000073   # 0x20        ecall               ; prints "55"
+00000513   # 0x24        addi a0, zero, 0    ; exit code 0
+05D00893   # 0x28        addi a7, zero, 93   ; syscall 93: exit
+00000073   # 0x2c        ecall
