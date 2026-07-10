@@ -1,0 +1,38 @@
+# Project executable
+/rvsim
+
+.vscode
+
+# Compiler and linker outputs
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.d
+
+# Build directories
+/build/
+/out/
+/cmake-build-*/
+
+# Coverage and profiling data
+*.gcda
+*.gcno
+*.gcov
+*.profraw
+*.profdata
+
+# clangd's project-local cache
+/.cache/
+
+# Editor swap and backup files
+*.swp
+*.swo
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db

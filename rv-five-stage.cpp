@@ -9,7 +9,51 @@
 //                          + reg    branch   memory    file
 //                          read     resolve  access    write
 //
-
+//
+// ISA
+//      RV32I base integer ISA plus the M extension for mul/div, 
+//      little-endian. FENCE is executed as a NOP, ECALL provides
+//      a tiny syscall interface so programs can print and exit,
+//      EBREAK stops the simulation
+//  
+// Microarchitecture
+//      - In-order, single-issue, one instruction per stage per cycle
+//      - Pipeline registers (latches) between stages: IF/ID, ID/EX,
+//        EX/MEM, MEM/WB. Each latch carries a "valid" bit; an invalid
+//        latch is a bubble
+//      - ALU forwarding: EX/MEM -> EX and MEM/WB -> EX, newest value
+//        wins
+//      - Store-data forwarding: MEM/WB -> MEM, which makes the common
+//        "lw x1 ... ; sw x1 ..." pattern run without any stall
+//      - Once-cycle load-use interlock: a load followed immediately
+//        by an instruction that needs the loaded value in EX stalls
+//        for one cycle
+//      - Control transfers (branched, jal, jalr) are resolved in EX
+//        with a static predict-not-taken policy. A taken transfer
+//        squashes the two younger instructions already in IF and ID,
+//        incuring a 2-cycle penalty
+//      - The register file is "write-first" meaning a WB writes in the
+//        first half of the ccle, ID reads in the second half. We model
+//        this by simply running the WB stage before the ID stage each
+//        cycle
+//
+// Simulation technique
+//      On every cycle, we compute the next value of every pipeline latch
+//      from the current values, then commit them all at once. This
+//      double-buffered update models the simultaneous clock edge of real
+//      hardware and makes stage evaluation order irrelevant for correctness
+//      except the one place we indicate.
+//
+// I/O conventions
+//      - Program output (syscalls) goes to stdout
+//      - Trace, statistics and diagnostics go to stderr
+//
+// Limitations
+//      - No CSRs, interrupts, exceptions, priviledge levels. Misaligned
+//        or out-of-bounds accesses terminate the simulation with a message.
+//      
+// Build: make
+// Rum:   ./rvsim [-t] [-r] [-c maxCycles] [-m memBytes] [program.hex|.bin] 
 
 #include <cstddef>
 #include <cstdint>

@@ -1,0 +1,72 @@
+# sort.hex — bubble-sorts ten signed integers and prints them in ascending order.
+#
+# Input:   7, -3, 42, 0, 15, -8, 23, 5, 1, 9
+# Output: -8, -3, 0, 1, 5, 7, 9, 15, 23, 42 (one integer per line)
+#
+# This is a longer integration program exercising:
+#   * nested loops and backward branches
+#   * signed comparisons
+#   * repeated loads and stores
+#   * load-use stalls in the compare loop
+#   * forwarding into stores
+#   * early termination when a pass performs no swaps
+#   * repeated print syscalls
+#
+# The array starts at 0x1000, safely beyond the code image.
+
+00001137   # 0x00  lui  sp, 0x1          ; sp = 0x1000, array base
+
+00700293   # 0x04  addi t0, zero, 7
+00512023   # 0x08  sw   t0, 0(sp)
+FFD00293   # 0x0c  addi t0, zero, -3
+00512223   # 0x10  sw   t0, 4(sp)
+02A00293   # 0x14  addi t0, zero, 42
+00512423   # 0x18  sw   t0, 8(sp)
+00000293   # 0x1c  addi t0, zero, 0
+00512623   # 0x20  sw   t0, 12(sp)
+00F00293   # 0x24  addi t0, zero, 15
+00512823   # 0x28  sw   t0, 16(sp)
+FF800293   # 0x2c  addi t0, zero, -8
+00512A23   # 0x30  sw   t0, 20(sp)
+01700293   # 0x34  addi t0, zero, 23
+00512C23   # 0x38  sw   t0, 24(sp)
+00500293   # 0x3c  addi t0, zero, 5
+00512E23   # 0x40  sw   t0, 28(sp)
+00100293   # 0x44  addi t0, zero, 1
+02512023   # 0x48  sw   t0, 32(sp)
+00900293   # 0x4c  addi t0, zero, 9
+02512223   # 0x50  sw   t0, 36(sp)
+
+00900413   # 0x54        addi s0, zero, 9    ; comparisons this pass
+
+00010313   # 0x58 outer: addi t1, sp, 0       ; current array element
+00000493   # 0x5c        addi s1, zero, 0     ; swapped = false
+00000E13   # 0x60        addi t3, zero, 0     ; inner index = 0
+
+00032E83   # 0x64 inner: lw   t4, 0(t1)       ; left value
+00432F03   # 0x68        lw   t5, 4(t1)       ; right value
+01DF5863   # 0x6c        bge  t5, t4, no_swap ; already ordered?
+01E32023   # 0x70        sw   t5, 0(t1)       ; exchange left and right
+01D32223   # 0x74        sw   t4, 4(t1)
+00100493   # 0x78        addi s1, zero, 1     ; swapped = true
+
+00430313   # 0x7c no_swap: addi t1, t1, 4
+001E0E13   # 0x80          addi t3, t3, 1
+FE8E40E3   # 0x84          blt  t3, s0, inner
+
+00048663   # 0x88  beq  s1, zero, print ; no swaps means sorting is complete
+FFF40413   # 0x8c  addi s0, s0, -1      ; largest remaining value is fixed
+FC0414E3   # 0x90  bne  s0, zero, outer
+
+00010313   # 0x94 print:      addi t1, sp, 0
+00A00393   # 0x98             addi t2, zero, 10
+00032503   # 0x9c print_loop: lw   a0, 0(t1)
+00100893   # 0xa0             addi a7, zero, 1  ; syscall 1: print_int
+00000073   # 0xa4             ecall
+00430313   # 0xa8             addi t1, t1, 4
+FFF38393   # 0xac             addi t2, t2, -1
+FE0396E3   # 0xb0             bne  t2, zero, print_loop
+
+00000513   # 0xb4  addi a0, zero, 0     ; exit code 0
+05D00893   # 0xb8  addi a7, zero, 93    ; syscall 93: exit
+00000073   # 0xbc  ecall

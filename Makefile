@@ -8,6 +8,7 @@ rvsim: rv-five-stage.cpp
 #   sum.hex     -> 55   (loop + branch)
 #   hazards.hex -> 84   (forwarding, load-use stall, lw;sw forwarding)
 #   jump.hex    -> 5    (jal flushes wrong-path instructions)
+#   sort.hex    -> -8, -3, 0, 1, 5, 7, 9, 15, 23, 42 (one per line)
 .PHONY: test
 test: rvsim
 	@for t in tests/*.hex; do \
