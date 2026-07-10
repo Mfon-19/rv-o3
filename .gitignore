@@ -1,6 +1,10 @@
 # Project executable
 /rvsim
 
+# Freestanding C demo outputs (object files are covered by *.o below)
+/cdemo/demo.elf
+/cdemo/demo.bin
+
 .vscode
 
 # Compiler and linker outputs
