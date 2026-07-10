@@ -13,9 +13,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <sstream>
 #include <vector>
 
 
@@ -131,6 +134,13 @@ static bool usesRs2(Op op) {
 static bool rs2NeededInEX(Op op) {
     return usesRs2(op) && !isStore(op);
 }
+
+static const char* kRegName[32] = {
+  "zero", "ra", "sp",  "gp",  "tp", "t0", "t1", "t2",
+  "s0",   "s1", "a0",  "a1",  "a2", "a3", "a4", "a5",
+  "a6",   "a7", "s2",  "s3",  "s4", "s5", "s6", "s7",
+  "s8",   "s9", "s10", "s11", "t3", "t4", "t5", "t6",
+};
 
 // These helpers extract the immediate fields from each instruction type
 // I-type format:
@@ -320,6 +330,51 @@ static Instr decode(uint32_t w) {
     return I;
 }
 
+// Disassembler (used only for the -t trace and error messages)
+
+static std::string disasm(const Instr& I) {
+    char b[64];
+    const char* n = opName(I.op);
+    const char* rd = kRegName[I.rd];
+    const char* r1 = kRegName[I.rs1];
+    const char* r2 = kRegName[I.rs2];
+    switch (I.op) {
+        case Op::LUI: case Op::AUIPC:
+            snprintf(b, sizeof b, "%s %s,0x%x", n, rd, (uint32_t)I.imm >> 12);
+            break;
+        case Op::JAL:
+            snprintf(b, sizeof b, "%s %s,%d", n, rd, I.imm);
+            break;
+        case Op::JALR:
+            snprintf(b, sizeof b, "%s %s,%d(%s)", n, rd, I.imm, r1);
+            break;
+        case Op::BEQ: case Op::BNE: case Op::BLT:
+        case Op::BGE: case Op::BLTU: case Op::BGEU:
+            snprintf(b, sizeof b, "%s %s,%s,%d", n, r1, r2, I.imm);
+            break;
+        case Op::LB: case Op::LH: case Op::LW: case Op::LBU: case Op::LHU:
+            snprintf(b, sizeof b, "%s %s,%d(%s)", n, rd, I.imm, r1);
+            break;
+        case Op::SB: case Op::SH: case Op::SW:
+            snprintf(b, sizeof b, "%s %s,%d(%s)", n, r2, I.imm, r1);
+            break;
+        case Op::ADDI: case Op::SLTI: case Op::SLTIU: case Op::XORI:
+        case Op::ORI: case Op::ANDI: case Op::SLLI: case Op::SRLI: case Op::SRAI:
+            snprintf(b, sizeof b, "%s %s,%s,%d", n, rd, r1, I.imm);
+            break;
+        case Op::FENCE: case Op::ECALL: case Op::EBREAK:
+            snprintf(b, sizeof b, "%s", n);
+            break;
+        case Op::ILLEGAL:
+            snprintf(b, sizeof b, ".word 0x%08x", I.raw);
+            break;
+        default:  // all remaining R-type ops share one format
+            snprintf(b, sizeof b, "%s %s,%s,%s", n, rd, r1, r2);
+            break;
+    }
+    return b;
+}
+
 // Memory: flat, byte addressable, little-endian, zero-initialized
 //
 // A single unified memory that holds both instructions and data. We
@@ -425,6 +480,36 @@ public:
     }
 
     Memory mem;
+
+    // Load a program image (vector of 32-bit words) at address 0
+    void loadWords(const std::vector<uint32_t>& words) {
+        for (size_t i = 0; i < words.size(); i++) {
+            mem.store32((uint32_t)(i * 4), words[i]);
+        }
+    }
+
+    // Run until an exit syscall / ebreak / error, or the cycle budget runs out
+    int run() {
+        while (!halted) {
+            if (cycles >= maxCycles) {
+                fprintf(stderr, "stopping after %" PRIu64
+                        " cycles without an exit syscall (raise with -c)\n", cycles);
+                exitCode = 2;
+                break;
+            }
+            stepCycle();
+        }
+        return exitCode;
+    }
+
+    void dumpRegs() const {
+        fprintf(stderr, "--- registers ---\n");
+        for (int i = 0; i < 32; i++) {
+        fprintf(stderr, "%4s=%08x%s", kRegName[i], regs[i],
+                (i % 4 == 3) ? "\n" : "  ");
+        }
+        fprintf(stderr, "pc  =%08x\n", pc);
+    }
 
 private:
     // architectural state
@@ -778,3 +863,69 @@ private:
         }
     }
 };
+
+// Text format: whitespace-separated 32-bit hex words, laid out sequentially
+// from address 0. '#' and '//' start a comment that runs to end of line.
+static std::vector<uint32_t> loadHexFile(const char* path) {
+  std::ifstream f(path);
+  if (!f) { fprintf(stderr, "cannot open %s\n", path); exit(1); }
+  std::vector<uint32_t> words;
+  std::string line;
+  while (std::getline(f, line)) {
+    // strip comments
+    size_t cut = line.find('#');
+    size_t cut2 = line.find("//");
+    if (cut2 != std::string::npos && (cut == std::string::npos || cut2 < cut))
+      cut = cut2;
+    if (cut != std::string::npos) line.resize(cut);
+
+    std::istringstream ss(line);
+    std::string tok;
+    while (ss >> tok) {
+      char* end = nullptr;
+      unsigned long v = strtoul(tok.c_str(), &end, 16);
+      if (end == tok.c_str() || *end != '\0' || v > 0xFFFFFFFFul) {
+        fprintf(stderr, "%s: bad hex word '%s'\n", path, tok.c_str());
+        exit(1);
+      }
+      words.push_back((uint32_t)v);
+    }
+  }
+  return words;
+}
+
+static void usage(const char* argv0) {
+    fprintf(stderr,
+            "usage: %s [options] [program.hex|program.bin]\n"
+            "  -t            trace pipeline occupancy every cycle (stderr)\n"
+            "  -r            dump registers when the simulation ends\n"
+            "  -c <cycles>   cycle budget (default 10000000)\n"
+            "  -m <bytes>    memory size (default 1 MiB)\n"
+            "With no program file, a built-in demo (sum 1..10) is run.\n"
+            "Hex format: whitespace-separated 32-bit hex words, '#' comments.\n",
+            argv0);
+}
+
+int main(int argc, char** argv) {
+    bool trace = false, dumpRegs = false;
+    uint64_t maxCycles = 10'000'000;
+    size_t memBytes = 1u << 20; // 1 MiB
+    const char* file = nullptr;
+
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-t")) trace = true;
+        else if (!strcmp(argv[i], "-r")) dumpRegs = true;
+        else if (!strcmp(argv[i], "-c") && i + 1 < argc) maxCycles = strtoull(argv[++i], nullptr, 0);
+        else if (!strcmp(argv[i], "-m") && i + 1 < argc) memBytes = strtoull(argv[++i], nullptr, 0);
+        else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(argv[0]); return 0; }
+        else if (argv[i][0] == '-') { usage(argv[0]); return 1; }
+        else file = argv[i];
+    }
+
+    CPU cpu(memBytes, maxCycles);
+    cpu.loadWords(loadHexFile(file));
+
+    int code = cpu.run();
+    if (dumpRegs) cpu.dumpRegs();
+    return code;
+}

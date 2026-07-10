@@ -1,0 +1,16 @@
+# jump.hex — control-hazard test; prints 5 and exits with code 0.
+# The jal skips two instructions that would overwrite ra. In this pipeline
+# the jump is resolved in EX, so both skipped instructions have already
+# been fetched/decoded and must be squashed. If flushing were broken,
+# this program would print 222 instead of 5.
+
+00500093   # 0x00  addi ra, zero, 5     ; ra = 5
+00C0006F   # 0x04  jal  zero, +12       ; goto 0x10
+06F00093   # 0x08  addi ra, zero, 111   ; wrong path — must be squashed
+0DE00093   # 0x0c  addi ra, zero, 222   ; wrong path — must be squashed
+00008513   # 0x10  addi a0, ra, 0       ; a0 = 5
+00100893   # 0x14  addi a7, zero, 1     ; syscall 1: print_int
+00000073   # 0x18  ecall                ; prints "5"
+00000513   # 0x1c  addi a0, zero, 0     ; exit code 0
+05D00893   # 0x20  addi a7, zero, 93    ; syscall 93: exit
+00000073   # 0x24  ecall
