@@ -7,11 +7,13 @@
 // Build: make
 // Run:   ./rvsim [-t] [-r] [-c maxCycles] [-m memBytes] [program.hex|.bin]
 
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
 #include "core/cpu.h"
+#include "core/refmodel.h"
 #include "sim/config.h"
 #include "sim/loader.h"
 
@@ -20,10 +22,51 @@ static void usage(const char *argv0) {
           "usage: %s [options] [program.hex|program.bin]\n"
           "  -t            trace pipeline occupancy every cycle (stderr)\n"
           "  -r            dump registers when the simulation ends\n"
+          "  -f            run the functional reference model (no pipeline)\n"
+          "  -d            differential check: compare the pipeline's commit\n"
+          "                stream against the reference model, instruction by\n"
+          "                instruction\n"
           "  -c <cycles>   cycle budget (default 10000000)\n"
           "  -m <bytes>    memory size (default 1 MiB)\n"
           "Hex format: whitespace-separated 32-bit hex words, '#' comments.\n",
           argv0);
+}
+
+// Differential checking: print one commit record for a divergence report
+static void printCommit(const char *who, const CommitRecord &r) {
+  fprintf(stderr, "  %s: seq %" PRIu64 " pc=0x%08x %-20s", who, r.sequence,
+          r.pc, disasm(decode(r.instruction)).c_str());
+  if (r.registerWrite)
+    fprintf(stderr, "  %s=0x%08x", kRegName[r.registerWrite->rd],
+            r.registerWrite->value);
+  if (r.memoryWrite)
+    fprintf(stderr, "  mem[0x%08x]=0x%x (%u bytes)", r.memoryWrite->addr,
+            r.memoryWrite->value, r.memoryWrite->size);
+  if (r.exception)
+    fprintf(stderr, "  exception=illegal");
+  fputc('\n', stderr);
+}
+
+static bool sameCommit(const CommitRecord &a, const CommitRecord &b) {
+  if (a.sequence != b.sequence || a.pc != b.pc ||
+      a.instruction != b.instruction)
+    return false;
+  if (a.registerWrite.has_value() != b.registerWrite.has_value())
+    return false;
+  if (a.registerWrite && (a.registerWrite->rd != b.registerWrite->rd ||
+                          a.registerWrite->value != b.registerWrite->value))
+    return false;
+  if (a.memoryWrite.has_value() != b.memoryWrite.has_value())
+    return false;
+  if (a.memoryWrite && (a.memoryWrite->addr != b.memoryWrite->addr ||
+                        a.memoryWrite->value != b.memoryWrite->value ||
+                        a.memoryWrite->size != b.memoryWrite->size))
+    return false;
+  if (a.exception.has_value() != b.exception.has_value())
+    return false;
+  if (a.exception && a.exception->kind != b.exception->kind)
+    return false;
+  return true;
 }
 
 int main(int argc, char **argv) {
@@ -35,6 +78,10 @@ int main(int argc, char **argv) {
       cfg.trace = true;
     else if (!strcmp(argv[i], "-r"))
       cfg.dumpRegs = true;
+    else if (!strcmp(argv[i], "-f"))
+      cfg.refModel = true;
+    else if (!strcmp(argv[i], "-d"))
+      cfg.diffCheck = true;
     else if (!strcmp(argv[i], "-c") && i + 1 < argc)
       cfg.maxCycles = strtoull(argv[++i], nullptr, 0);
     else if (!strcmp(argv[i], "-m") && i + 1 < argc)
@@ -55,16 +102,73 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  CPU cpu(cfg);
-
+  // .bin loads as raw bytes, everything else as hex words
   const size_t n = strlen(file);
-  if (n > 4 && !strcmp(file + n - 4, ".bin")) {
-    cpu.loadBytes(loadBinFile(file));
-  } else {
-    cpu.loadWords(loadHexFile(file));
+  const bool isBin = n > 4 && !strcmp(file + n - 4, ".bin");
+  auto loadInto = [&](auto &machine) {
+    if (isBin)
+      machine.loadBytes(loadBinFile(file));
+    else
+      machine.loadWords(loadHexFile(file));
+  };
+
+  if (cfg.refModel) {
+    RefModel ref(cfg);
+    loadInto(ref);
+    int code = ref.run();
+    if (cfg.dumpRegs)
+      ref.dumpRegs();
+    return code;
+  }
+
+  CPU cpu(cfg);
+  loadInto(cpu);
+
+  // Differential check: run the reference model in lockstep as a silent
+  // shadow, advancing it one instruction per pipeline commit and
+  // comparing the two commit records. The first mismatch pinpoints the
+  // exact instruction where the pipeline corrupted architectural state
+  RefModel ref(cfg);
+  uint64_t verified = 0;
+  if (cfg.diffCheck) {
+    ref.quiet = true;
+    loadInto(ref);
+    cpu.onCommit = [&](const CommitRecord &pipe) {
+      CommitRecord refRec;
+      if (!ref.step(&refRec)) {
+        fprintf(stderr,
+                "differential check FAILED: pipeline retired seq %" PRIu64
+                " but the reference model had already halted\n",
+                pipe.sequence);
+        printCommit("pipeline ", pipe);
+        exit(1);
+      }
+      if (!sameCommit(pipe, refRec)) {
+        fprintf(stderr, "differential check FAILED: commit streams diverge\n");
+        printCommit("pipeline ", pipe);
+        printCommit("reference", refRec);
+        exit(1);
+      }
+      verified++;
+    };
   }
 
   int code = cpu.run();
+
+  if (cfg.diffCheck && code != 2) { // a blown cycle budget isn't architectural
+    if (!ref.halted() || ref.exitCode() != code) {
+      fprintf(stderr,
+              "differential check FAILED: exit state diverges "
+              "(pipeline exited %d, reference %s with exit %d)\n",
+              code, ref.halted() ? "halted" : "still running",
+              ref.exitCode());
+      exit(1);
+    }
+    fprintf(stderr,
+            "--- rvsim: differential check: %" PRIu64 " commits verified\n",
+            verified);
+  }
+
   if (cfg.dumpRegs)
     cpu.dumpRegs();
   return code;

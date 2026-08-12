@@ -90,7 +90,8 @@ execution.
 usage: ./rvsim [options] [program.hex|program.bin]
   -t            trace pipeline occupancy every cycle (stderr)
   -r            dump registers when the simulation ends
-  -c <cycles>   cycle budget (default 10000000)
+  -f            run the functional reference model (no pipeline)
+  -c <cycles>   cycle budget (default 10000000; instructions with -f)
   -m <bytes>    memory size (default 1 MiB)
 ```
 
@@ -353,8 +354,10 @@ isa/               Timing-free ISA layer: decode, execute semantics, disassembly
   decode.cpp       Instruction word -> Instr, immediate extraction
   execute.cpp      Pure execute semantics (ALU, branches, M extension)
   disasm.cpp       Disassembler for traces and error messages
-core/              Timing models and architectural state
+core/              Execution models and architectural state
   cpu.{h,cpp}      The five-stage pipeline: latches, hazards, forwarding, syscalls
+  refmodel.{h,cpp} Functional reference model: fetch-decode-execute, no timing
+  commit.h         CommitRecord: what one retired instruction did to arch state
 memory/            Memory system
   memory.h         Flat little-endian main memory (caches will layer on top)
 sim/               Simulation infrastructure

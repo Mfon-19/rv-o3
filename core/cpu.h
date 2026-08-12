@@ -44,9 +44,11 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
+#include "core/commit.h"
 #include "isa/isa.h"
 #include "memory/memory.h"
 #include "sim/config.h"
@@ -88,6 +90,11 @@ struct MEMWB {
   uint32_t pc = 0;
   Instr ins;
   uint32_t result = 0; // value to write into rd: load data or ALU result
+  // The store this instruction performed in MEM, if any. Memory is
+  // written in MEM (one stage before retirement), and the value written
+  // (after store-data forwarding) only exists there — so MEM records it
+  // here for WB to put in the instruction's CommitRecord
+  std::optional<MemoryWrite> memWrite;
 };
 
 // The CPU
@@ -106,6 +113,11 @@ public:
   int run();
 
   void dumpRegs() const;
+
+  // Called once per retired instruction with its CommitRecord, in
+  // retirement order. Null by default; a differential checker plugs in
+  // here to compare the pipeline against the functional reference model
+  std::function<void(const CommitRecord &)> onCommit;
 
 private:
   // architectural state

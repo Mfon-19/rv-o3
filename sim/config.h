@@ -11,7 +11,9 @@
 
 struct SimConfig {
   size_t memBytes = 1u << 20;      // 1 MiB
-  uint64_t maxCycles = 10'000'000; // cycle budget
+  uint64_t maxCycles = 10'000'000; // cycle budget (instructions for -f)
   bool trace = false;              // -t: per-cycle pipeline trace
   bool dumpRegs = false;           // -r: register dump at the end
+  bool refModel = false;           // -f: run the functional reference model
+  bool diffCheck = false;          // -d: lockstep pipeline-vs-reference check
 };

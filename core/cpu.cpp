@@ -200,12 +200,15 @@ MEMWB CPU::doMEM() {
     switch (I.op) {
     case Op::SB:
       mem.store8(addr, (uint8_t)data);
+      out.memWrite = MemoryWrite{addr, (uint8_t)data, 1};
       break;
     case Op::SH:
       mem.store16(addr, (uint16_t)data);
+      out.memWrite = MemoryWrite{addr, (uint16_t)data, 2};
       break;
     case Op::SW:
       mem.store32(addr, data);
+      out.memWrite = MemoryWrite{addr, data, 4};
       break;
     default:
       break;
@@ -214,21 +217,32 @@ MEMWB CPU::doMEM() {
   return out;
 }
 
-// WB - write-back stage
+// WB - write-back stage. Retirement happens here and nowhere else, so
+// this is also where each instruction's CommitRecord is emitted
 void CPU::doWB() {
   if (!memwb.valid)
     return;
   const Instr &I = memwb.ins;
 
+  CommitRecord rec;
+  rec.sequence = stats.retired;
+  rec.pc = memwb.pc;
+  rec.instruction = I.raw;
+  rec.memoryWrite = memwb.memWrite; // recorded by MEM, if a store
+
   switch (I.op) {
   case Op::ECALL:
     stats.retired++;
     doSyscall();
+    if (onCommit)
+      onCommit(rec);
     return;
   case Op::EBREAK:
     stats.retired++;
     fprintf(stderr, "ebreak at pc=0x%08x — halting\n", memwb.pc);
     halted = true;
+    if (onCommit)
+      onCommit(rec);
     return;
   case Op::ILLEGAL:
     // We let illegal words flow down the pipe and trap them only here,
@@ -238,15 +252,22 @@ void CPU::doWB() {
             memwb.pc);
     halted = true;
     exitCode = 1;
+    rec.exception = Exception{ExceptionKind::IllegalInstruction};
+    if (onCommit)
+      onCommit(rec);
     return;
   default:
     break;
   }
 
   // The one and only architectural register write
-  if (writesRd(I.op) && I.rd != 0)
+  if (writesRd(I.op) && I.rd != 0) {
     regs[I.rd] = memwb.result;
+    rec.registerWrite = RegisterWrite{I.rd, memwb.result};
+  }
   stats.retired++;
+  if (onCommit)
+    onCommit(rec);
 }
 
 // Minimal syscall interface (a7 = number, a0 = argument)

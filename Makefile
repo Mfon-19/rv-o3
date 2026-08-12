@@ -3,7 +3,7 @@ CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra
 CXXFLAGS += -I. -MMD -MP
 
 SRCS := isa/decode.cpp isa/disasm.cpp isa/execute.cpp \
-        core/cpu.cpp \
+        core/cpu.cpp core/refmodel.cpp \
         sim/loader.cpp sim/main.cpp
 OBJS := $(SRCS:.cpp=.o)
 DEPS := $(OBJS:.o=.d)
@@ -16,7 +16,9 @@ rvsim: $(OBJS)
 
 -include $(DEPS)
 
-# Run every bundled test program. Expected program output (stdout):
+# Run every bundled test program under -d, which differentially checks
+# the pipeline's commit stream against the functional reference model
+# instruction by instruction. Expected program output (stdout):
 #   sum.hex     -> 55   (loop + branch)
 #   hazards.hex -> 84   (forwarding, load-use stall, lw;sw forwarding)
 #   jump.hex    -> 5    (jal flushes wrong-path instructions)
@@ -24,8 +26,11 @@ rvsim: $(OBJS)
 .PHONY: test
 test: rvsim
 	@for t in tests/*.hex; do \
-		echo "== $$t"; ./rvsim $$t; \
+		echo "== $$t"; ./rvsim -d $$t || exit 1; \
 	done
+	@if [ -f cdemo/demo.bin ]; then \
+		echo "== cdemo/demo.bin"; ./rvsim -d cdemo/demo.bin || exit 1; \
+	fi
 
 .PHONY: clean
 clean:

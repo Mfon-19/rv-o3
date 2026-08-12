@@ -1,6 +1,9 @@
 # Project executable
 /rvsim
 
+# Local planning notes (not part of the published repo)
+/doc/
+
 # Freestanding C demo outputs (object files are covered by *.o below)
 /cdemo/demo.elf
 /cdemo/demo.bin
