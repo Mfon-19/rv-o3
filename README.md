@@ -2,8 +2,9 @@
 
 This is a cycle-level simulator of the classic five-stage RISC-V pipeline
 (`IF -> ID -> EX -> MEM -> WB`), implementing the base RV32I ISA plus the M
-extension for multiplication and division. The whole simulator is one
-readable C++ file with no dependencies. It exists to make pipeline
+extension for multiplication and division. The simulator is a small,
+readable C++ codebase with no dependencies, split into components (ISA,
+core, memory, sim driver). It exists to make pipeline
 behavior *visible*: forwarding, load-use stalls, branch squashes, and
 control-flow redirects can all be watched happening cycle by cycle.
 
@@ -347,7 +348,20 @@ retired, CPI, stalls, redirects, squashes) show *how* it ran.
 ## Project layout
 
 ```text
-rv-five-stage.cpp  The entire simulator: decode, pipeline, memory, syscalls, CLI
+isa/               Timing-free ISA layer: decode, execute semantics, disassembly
+  isa.h            Opcodes, decoded-instruction record, classification helpers
+  decode.cpp       Instruction word -> Instr, immediate extraction
+  execute.cpp      Pure execute semantics (ALU, branches, M extension)
+  disasm.cpp       Disassembler for traces and error messages
+core/              Timing models and architectural state
+  cpu.{h,cpp}      The five-stage pipeline: latches, hazards, forwarding, syscalls
+memory/            Memory system
+  memory.h         Flat little-endian main memory (caches will layer on top)
+sim/               Simulation infrastructure
+  config.h         All configuration knobs in one struct
+  stats.h          Statistics counters and end-of-run report
+  loader.{h,cpp}   .hex and .bin program-image loaders
+  main.cpp         CLI driver
 tests/             Annotated test programs (.hex)
 cdemo/             Freestanding C demo and its startup/linker support
 Makefile           Build (`make`) and test (`make test`) targets

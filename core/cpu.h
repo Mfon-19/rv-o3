@@ -1,0 +1,144 @@
+// ==============================================================
+// The classic 5-stage in-order RISC-V pipeline
+// ==============================================================
+//
+//                +----+   +----+   +----+   +-----+   +----+
+//   instruction  | IF |-->| ID |-->| EX |-->| MEM |-->| WB |
+//   flow ------> +----+   +----+   +----+   +-----+   +----+
+//                 fetch    decode   ALU /    data      reg-
+//                          + reg    branch   memory    file
+//                          read     resolve  access    write
+//
+// Microarchitecture
+//      - In-order, single-issue, one instruction per stage per cycle
+//      - Pipeline registers (latches) between stages: IF/ID, ID/EX,
+//        EX/MEM, MEM/WB. Each latch carries a "valid" bit; an invalid
+//        latch is a bubble
+//      - ALU forwarding: EX/MEM -> EX and MEM/WB -> EX, newest value
+//        wins
+//      - Store-data forwarding: MEM/WB -> MEM, which makes the common
+//        "lw x1 ... ; sw x1 ..." pattern run without any stall
+//      - One-cycle load-use interlock: a load followed immediately
+//        by an instruction that needs the loaded value in EX stalls
+//        for one cycle
+//      - Control transfers (branches, jal, jalr) are resolved in EX
+//        with a static predict-not-taken policy. A taken transfer
+//        squashes the two younger instructions already in IF and ID,
+//        incurring a 2-cycle penalty
+//      - The register file is "write-first" meaning a WB writes in the
+//        first half of the cycle, ID reads in the second half. We model
+//        this by simply running the WB stage before the ID stage each
+//        cycle
+//
+// Simulation technique
+//      On every cycle, we compute the next value of every pipeline latch
+//      from the current values, then commit them all at once. This
+//      double-buffered update models the simultaneous clock edge of real
+//      hardware and makes stage evaluation order irrelevant for correctness
+//      except the one place we indicate.
+//
+// Limitations
+//      - No CSRs, interrupts, exceptions, privilege levels. Misaligned
+//        or out-of-bounds accesses terminate the simulation with a message.
+
+#pragma once
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include "isa/isa.h"
+#include "memory/memory.h"
+#include "sim/config.h"
+#include "sim/stats.h"
+
+// Pipeline latches (registers)
+//
+// Each struct is the register file between two stages, named after the
+// stages it separates. valid == false means the slot holds a bubble, because
+// either the pipe hasn't filled yet, or a stall/flush inserted one.
+// Default-constructing a latch yields a bubble, which we exploit when
+// squashing: e.g., idex = IDEX{}
+
+struct IFID {
+  bool valid = false;
+  uint32_t pc = 0; // address the word was fetched from
+  uint32_t raw = 0;
+};
+
+struct IDEX {
+  bool valid = false;
+  uint32_t pc = 0;
+  Instr ins; // the decoded instruction
+  // EX may override these with forwarded values
+  uint32_t rs1val = 0;
+  uint32_t rs2val = 0;
+};
+
+struct EXMEM {
+  bool valid = false;
+  uint32_t pc = 0;
+  Instr ins;
+  uint32_t aluResult = 0; // ALU result / effective address / link address
+  uint32_t storeData = 0; // rs2 value for stores (already EX-forwarded)
+};
+
+struct MEMWB {
+  bool valid = false;
+  uint32_t pc = 0;
+  Instr ins;
+  uint32_t result = 0; // value to write into rd: load data or ALU result
+};
+
+// The CPU
+
+class CPU {
+public:
+  explicit CPU(const SimConfig &cfg);
+
+  Memory mem;
+
+  // Load a program image (vector of 32-bit words) at address 0
+  void loadWords(const std::vector<uint32_t> &words);
+  void loadBytes(const std::vector<uint8_t> &bytes);
+
+  // Run until an exit syscall / ebreak / error, or the cycle budget runs out
+  int run();
+
+  void dumpRegs() const;
+
+private:
+  // architectural state
+  uint32_t regs[32];
+  uint32_t pc = 0;
+
+  // pipeline state
+  IFID ifid;
+  IDEX idex;
+  EXMEM exmem;
+  MEMWB memwb;
+
+  // bookkeeping
+  bool halted = false;
+  int exitCode = 0;
+  bool trace;
+  uint64_t maxCycles;
+  Stats stats;
+  std::vector<std::string> events; // per-cycle annotations for the trace
+
+  // pipeline stages
+  IFID doIF();
+  IDEX doID(bool &stall);
+  uint32_t fwd(uint8_t reg, uint32_t valueFromID) const;
+  EXMEM doEX(bool &redirect, uint32_t &redirectPC);
+  void checkAlign(Op op, uint32_t addr, uint32_t atPc);
+  MEMWB doMEM();
+  void doWB();
+  void doSyscall();
+  void stepCycle();
+
+  // trace
+  std::string vIF, vID, vEX, vMEM, vWB; // start-of-cycle stage occupancy
+  void captureStageView();
+  void printTrace() const;
+};
