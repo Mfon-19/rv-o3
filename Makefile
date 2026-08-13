@@ -4,6 +4,7 @@ CXXFLAGS += -I. -MMD -MP
 
 SRCS := isa/decode.cpp isa/disasm.cpp isa/execute.cpp \
         core/cpu.cpp core/refmodel.cpp \
+        memory/dram.cpp memory/cache.cpp memory/system.cpp \
         sim/loader.cpp sim/main.cpp
 OBJS := $(SRCS:.cpp=.o)
 DEPS := $(OBJS:.o=.d)
@@ -19,6 +20,7 @@ rvsim: $(OBJS)
 # Run every bundled test program under -d, which differentially checks
 # the pipeline's commit stream against the functional reference model
 # instruction by instruction. Expected program output (stdout):
+#   cache.hex   -> 42, 50 (dirty eviction, writeback, refill round trip)
 #   sum.hex     -> 55   (loop + branch)
 #   hazards.hex -> 84   (forwarding, load-use stall, lw;sw forwarding)
 #   jump.hex    -> 5    (jal flushes wrong-path instructions)

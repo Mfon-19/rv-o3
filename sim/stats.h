@@ -2,7 +2,9 @@
 //
 // Counters are accumulated by the timing model as it runs and printed
 // to stderr at the end. Program output goes to stdout; trace,
-// statistics and diagnostics go to stderr.
+// statistics and diagnostics go to stderr. Per-cache counters live with
+// the caches themselves (CacheStats in memory/cache.h); this struct
+// holds the core-side counters.
 
 #pragma once
 
@@ -16,16 +18,25 @@ struct Stats {
   uint64_t loadUseStalls = 0; // bubbles inserted by the interlock
   uint64_t redirects = 0;     // taken branches/jumps
   uint64_t squashed = 0;      // wrong-path instructions killed by redirects
+  uint64_t fetchStallCycles = 0; // cycles IF had no instruction ready
+  uint64_t dataStallCycles = 0;  // cycles MEM held the pipeline for memory
 
-  void print(int exitCode) const {
-    fprintf(stderr,
-            "--- rvsim: %" PRIu64 " cycles, %" PRIu64
+  void printCore() const {
+    fprintf(stderr, "--- rvsim: %" PRIu64 " cycles, %" PRIu64
             " instructions retired, CPI = %.3f\n",
             cycles, retired, retired ? (double)cycles / (double)retired : 0.0);
-    fprintf(stderr,
-            "--- rvsim: %" PRIu64 " load-use stalls, %" PRIu64
+    fprintf(stderr, "--- rvsim: %" PRIu64 " load-use stalls, %" PRIu64
             " taken branches/jumps (%" PRIu64 " squashed instructions)\n",
             loadUseStalls, redirects, squashed);
+  }
+
+  void printMemStalls() const {
+    fprintf(stderr, "--- rvsim: %" PRIu64 " ifetch stall cycles, %" PRIu64
+            " data stall cycles\n",
+            fetchStallCycles, dataStallCycles);
+  }
+
+  void printExit(int exitCode) const {
     fprintf(stderr, "--- rvsim: exit code %d\n", exitCode);
   }
 };

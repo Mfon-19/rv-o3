@@ -6,20 +6,22 @@
 
 #include "isa/execute.h"
 
-CPU::CPU(const SimConfig &cfg)
-    : mem(cfg.memBytes), trace(cfg.trace), maxCycles(cfg.maxCycles) {
+CPU::CPU(const SimConfig &cfg, MemorySystem &msys)
+    : msys(msys), imem(msys.imem), dmem(msys.dmem),
+      showMemStats(!cfg.flatMemory || cfg.flatLatency > 1), trace(cfg.trace),
+      maxCycles(cfg.maxCycles) {
   memset(regs, 0, sizeof regs);
 }
 
 void CPU::loadWords(const std::vector<uint32_t> &words) {
   for (size_t i = 0; i < words.size(); i++) {
-    mem.store32((uint32_t)(i * 4), words[i]);
+    msys.backing.store32((uint32_t)(i * 4), words[i]);
   }
 }
 
 void CPU::loadBytes(const std::vector<uint8_t> &bytes) {
-  mem.check(0, (uint32_t)bytes.size(), "program image");
-  memcpy(mem.bytes.data(), bytes.data(), bytes.size());
+  msys.backing.check(0, (uint32_t)bytes.size(), "program image");
+  memcpy(msys.backing.bytes.data(), bytes.data(), bytes.size());
 }
 
 int CPU::run() {
@@ -34,7 +36,12 @@ int CPU::run() {
     }
     stepCycle();
   }
-  stats.print(exitCode);
+  stats.printCore();
+  if (showMemStats) {
+    stats.printMemStalls();
+    msys.printStats(stats.retired);
+  }
+  stats.printExit(exitCode);
   return exitCode;
 }
 
@@ -47,17 +54,47 @@ void CPU::dumpRegs() const {
   fprintf(stderr, "pc  =%08x\n", pc);
 }
 
-// IF - instruction fetch stage
-IFID CPU::doIF() {
-  if (pc % 4 != 0) {
-    fprintf(stderr, "fatal: misaligned fetch at pc=0x%8x\n", pc);
-    exit(1);
+// The fetch unit (IF stage). Runs every cycle, even while MEM holds the
+// rest of the pipeline: it drains a completed fetch into the one-entry
+// buffer (dropping it if a redirect made it stale) and issues a fetch
+// for pc as soon as it has nothing in flight and nothing buffered. pc
+// advances at issue; a redirect rewrites it and empties the buffer
+void CPU::updateFetch() {
+  if (fOutstanding && imem->done()) {
+    MemResponse r = imem->response();
+    fOutstanding = false;
+    if (fStale)
+      fStale = false; // wrong-path fetch: drop it
+    else {
+      fBufValid = true;
+      fBufPC = fPC;
+      fBufRaw = r.rdata;
+    }
   }
-  IFID out;
-  out.valid = true;
-  out.pc = pc;
-  out.raw = mem.load32(pc);
-  return out;
+  if (!fOutstanding && !fBufValid) {
+    if (pc % 4 != 0) {
+      fprintf(stderr, "fatal: misaligned fetch at pc=0x%8x\n", pc);
+      exit(1);
+    }
+    if (imem->canAccept()) {
+      MemRequest req;
+      req.addr = pc;
+      req.size = 4;
+      imem->access(req);
+      fOutstanding = true;
+      fPC = pc;
+      pc += 4;
+      if (imem->done()) { // 1-cycle port: complete within this cycle
+        MemResponse r = imem->response();
+        fOutstanding = false;
+        fBufValid = true;
+        fBufPC = fPC;
+        fBufRaw = r.rdata;
+      } else {
+        events.push_back("ifetch wait");
+      }
+    }
+  }
 }
 
 // ID - instruction decode stage: decode instruction, read registers,
@@ -149,9 +186,15 @@ void CPU::checkAlign(Op op, uint32_t addr, uint32_t atPc) {
   }
 }
 
-// MEM - data memory stage
-MEMWB CPU::doMEM() {
+// MEM - data memory stage. Non-memory instructions pass through in one
+// cycle. Loads and stores issue to the data port on their first cycle
+// in the stage — capturing store-data forwarding from the current
+// MEM/WB latch at that instant, which always holds the store's
+// immediate predecessor — and complete when the port answers. memDone
+// is false while the answer is outstanding; the pipeline holds
+MEMWB CPU::doMEM(bool &memDone) {
   MEMWB out;
+  memDone = true;
   if (!exmem.valid)
     return out;
   const Instr &I = exmem.ins;
@@ -161,58 +204,79 @@ MEMWB CPU::doMEM() {
   out.ins = I;
   out.result = exmem.aluResult;
 
-  const uint32_t addr = exmem.aluResult;
+  if (!isLoad(I.op) && !isStore(I.op))
+    return out;
 
-  if (isLoad(I.op)) {
+  if (!dOutstanding) {
+    const uint32_t addr = exmem.aluResult;
     checkAlign(I.op, addr, exmem.pc);
+    uint32_t size = 4;
+    if (I.op == Op::LB || I.op == Op::LBU || I.op == Op::SB)
+      size = 1;
+    else if (I.op == Op::LH || I.op == Op::LHU || I.op == Op::SH)
+      size = 2;
+
+    MemRequest req;
+    req.addr = addr;
+    req.size = size;
+    req.isWrite = isStore(I.op);
+    if (req.isWrite) {
+      uint32_t data = exmem.storeData;
+      // MEM/WB -> MEM store-data forwarding. Covers the case "lw x1 / sw
+      // x1": when the store sat in EX, the load's data did not exist yet,
+      // so the value carried in storeData is stale; now the load is in WB
+      // and its data is in the MEM/WB latch. The instruction in WB is
+      // always the store's immediate predecessor (it completed MEM before
+      // the store entered), so its value is never outdated
+      if (memwb.valid && writesRd(memwb.ins.op) && memwb.ins.rd != 0 &&
+          memwb.ins.rd == I.rs2) {
+        data = memwb.result;
+      }
+      req.wdata = data;
+      dVal = (size == 4) ? data : (data & ((1u << (8 * size)) - 1));
+    }
+    if (!dmem->canAccept()) {
+      // Cannot happen in the blocking design: MEM is the port's only
+      // requester and consumed its previous response before reissuing
+      fprintf(stderr, "internal error: data port busy at issue\n");
+      exit(1);
+    }
+    dmem->access(req);
+    dOutstanding = true;
+    dAddr = addr;
+    dSize = (uint8_t)size;
+    if (!dmem->done())
+      events.push_back("dmem wait");
+  }
+
+  if (!dmem->done()) {
+    memDone = false;
+    return out;
+  }
+
+  MemResponse resp = dmem->response();
+  dOutstanding = false;
+  if (isLoad(I.op)) {
     switch (I.op) {
     // Sub-word loads sign- or zero-extended into 32 bits as per the ISA
     case Op::LB:
-      out.result = (uint32_t)(int32_t)(int8_t)mem.load8(addr);
+      out.result = (uint32_t)(int32_t)(int8_t)resp.rdata;
       break;
     case Op::LBU:
-      out.result = mem.load8(addr);
+      out.result = resp.rdata & 0xFF;
       break;
     case Op::LH:
-      out.result = (uint32_t)(int32_t)(int16_t)mem.load16(addr);
+      out.result = (uint32_t)(int32_t)(int16_t)resp.rdata;
       break;
     case Op::LHU:
-      out.result = mem.load16(addr);
-      break;
-    case Op::LW:
-      out.result = mem.load32(addr);
+      out.result = resp.rdata & 0xFFFF;
       break;
     default:
+      out.result = resp.rdata;
       break;
     }
-  } else if (isStore(I.op)) {
-    checkAlign(I.op, addr, exmem.pc);
-    uint32_t data = exmem.storeData;
-    // MEM/WB -> MEM store-data forwarding. Covers the case "lw x1 / sw x1":
-    // when the store sat in EX, the load's data did not exist yet, so the
-    // value carried in the storeData is stale, now the load is in WB and its
-    // data is in the MEM/WB latch. The instruction in WB is always the store's
-    // immediate predecessor, so its value is never outdated
-    if (memwb.valid && writesRd(memwb.ins.op) && memwb.ins.rd != 0 &&
-        memwb.ins.rd == I.rs2) {
-      data = memwb.result;
-    }
-    switch (I.op) {
-    case Op::SB:
-      mem.store8(addr, (uint8_t)data);
-      out.memWrite = MemoryWrite{addr, (uint8_t)data, 1};
-      break;
-    case Op::SH:
-      mem.store16(addr, (uint16_t)data);
-      out.memWrite = MemoryWrite{addr, (uint16_t)data, 2};
-      break;
-    case Op::SW:
-      mem.store32(addr, data);
-      out.memWrite = MemoryWrite{addr, data, 4};
-      break;
-    default:
-      break;
-    }
+  } else {
+    out.memWrite = MemoryWrite{dAddr, dVal, dSize};
   }
   return out;
 }
@@ -286,8 +350,10 @@ void CPU::doSyscall() {
     putchar((int)(arg & 0xFF));
     break;
   case 3:
-    for (uint32_t a = arg; mem.load8(a) != 0; a++)
-      putchar(mem.load8(a));
+    // Reads snoop the caches (peek8): with write-back caches the newest
+    // copy of a byte may not have reached the backing store yet
+    for (uint32_t a = arg; msys.peek8(a) != 0; a++)
+      putchar(msys.peek8(a));
     break;
   case 10:
   case 93:
@@ -303,12 +369,16 @@ void CPU::doSyscall() {
 
 // One clock cycle
 //
-// Evaluation order matters for these two intra-cycle dependencies we model:
+// Evaluation order matters for these intra-cycle dependencies we model:
 //      1. WB writes the register file BEFORE ID reads it
 //      2. MEM reads the current MEM/WB latch for store-data forwarding,
 //         and EX reads the current EX/MEM and MEM/WB latches for ALU
 //         forwarding, hence, all stages compute their output into local
 //         "next" latches which are committed together at the end
+//      3. If MEM's port has not answered yet, only WB advances (it
+//         receives a bubble); every older latch and the fetch buffer
+//         hold, which preserves the relative stage positions that the
+//         forwarding invariants above rely on
 void CPU::stepCycle() {
   stats.cycles++;
   events.clear();
@@ -324,45 +394,83 @@ void CPU::stepCycle() {
   }
 
   // compute next state of every latch from current state
-  MEMWB nMemwb = doMEM();
+  bool memDone = true;
+  MEMWB nMemwb = doMEM(memDone);
+
+  if (!memDone) {
+    // MEM is waiting on the data port: bubble into WB, hold the rest.
+    // The fetch unit keeps running — it can fill its buffer meanwhile
+    stats.dataStallCycles++;
+    // The frozen EX instruction's operands were read from the register
+    // file back in ID; its producer is about to drain out of the
+    // forwarding window (WB already wrote the register file this cycle,
+    // and memwb becomes a bubble below). Capture the forwarded values
+    // into the ID/EX latch while they are still visible, so EX computes
+    // with fresh operands when the stall ends. Idempotent on later
+    // stall cycles: with memwb a bubble, fwd() returns the latch value
+    if (idex.valid) {
+      if (usesRs1(idex.ins.op))
+        idex.rs1val = fwd(idex.ins.rs1, idex.rs1val);
+      if (usesRs2(idex.ins.op))
+        idex.rs2val = fwd(idex.ins.rs2, idex.rs2val);
+    }
+    memwb = MEMWB{};
+    updateFetch();
+    msys.tick();
+    if (trace)
+      printTrace();
+    return;
+  }
+
   bool redirect = false;
   uint32_t redirectPC = 0;
   EXMEM nExmem = doEX(redirect, redirectPC);
   bool stall = false;
   IDEX nIdex = doID(stall);
-  IFID nIfid = doIF();
+  updateFetch(); // may complete a fetch into the buffer this cycle
 
   // commit: this is the clock edge
   memwb = nMemwb;
   exmem = nExmem;
 
   if (redirect) {
-    // A taken branch/jump in EX. The two younger instructions, the one
-    // just decoded and the one just fetched, are on the wrong path. We
-    // squash them by committing bubbles instead, and steer the PC
-    stats.squashed += (nIdex.valid ? 1 : 0) + (nIfid.valid ? 1 : 0);
+    // A taken branch/jump in EX. The two younger instructions — the one
+    // just decoded and the one fetched (buffered or still in flight) —
+    // are on the wrong path. We squash them by committing bubbles
+    // instead, and steer the PC
+    stats.squashed += (nIdex.valid ? 1 : 0) +
+                      ((fBufValid || fOutstanding) ? 1 : 0);
     stats.redirects++;
     idex = IDEX{};
     ifid = IFID{};
+    fBufValid = false;
+    if (fOutstanding)
+      fStale = true; // drain and drop when it lands
     pc = redirectPC;
     char b[80];
     snprintf(b, sizeof b, "taken -> 0x%08x (squashed 2)", redirectPC);
     events.push_back(b);
   } else if (stall) {
-    // Load-use interlock: freeze IF and ID (keep ifid and pc as they
-    // are so ID retries the same instruction next cycle) and inject a
-    // bubble into EX. One cycle later MEM/WB->EX forwarding supplies
-    // the loaded value and the pipe moves on
+    // Load-use interlock: freeze IF and ID (keep ifid, the fetch buffer
+    // and pc as they are so ID retries the same instruction next cycle)
+    // and inject a bubble into EX. One cycle later MEM/WB->EX forwarding
+    // supplies the loaded value and the pipe moves on
     stats.loadUseStalls++;
     idex = IDEX{};
     events.push_back("load-use stall (bubble -> EX)");
   } else {
-    // Normal flow
+    // Normal flow: ID takes the fetch buffer's instruction, if any
     idex = nIdex;
-    ifid = nIfid;
-    pc += 4;
+    if (fBufValid) {
+      ifid = IFID{true, fBufPC, fBufRaw};
+      fBufValid = false;
+    } else {
+      ifid = IFID{};
+      stats.fetchStallCycles++;
+    }
   }
 
+  msys.tick();
   if (trace)
     printTrace();
 }
@@ -371,7 +479,9 @@ void CPU::stepCycle() {
 
 void CPU::captureStageView() {
   char b[16];
-  snprintf(b, sizeof b, "0x%08x", pc);
+  // IF shows the pc of the instruction occupying the fetch unit: the
+  // buffered word, else the fetch in flight, else the next pc to issue
+  snprintf(b, sizeof b, "0x%08x", fBufValid ? fBufPC : (fOutstanding ? fPC : pc));
   vIF = b;
   vID = ifid.valid ? disasm(decode(ifid.raw)) : "-";
   vEX = idex.valid ? disasm(idex.ins) : "-";

@@ -30,6 +30,22 @@
 //        this by simply running the WB stage before the ID stage each
 //        cycle
 //
+// Memory interface (phase 1)
+//      IF and MEM no longer read memory directly: each talks to a
+//      MemPort (an L1 cache, or flat memory in --flat mode) that may
+//      take several cycles to answer.
+//      - IF is a small fetch unit: it issues a fetch for pc, holds the
+//        completed word in a one-entry buffer until ID can take it, and
+//        marks an in-flight fetch stale on a redirect (the response is
+//        drained and dropped). With a 1-cycle port this collapses to
+//        exactly the phase-0 fetch timing.
+//      - MEM issues its load/store when the instruction first enters
+//        the stage (capturing store-data forwarding at that instant)
+//        and holds the whole pipeline behind it until the response
+//        arrives; WB receives bubbles meanwhile. Because stages only
+//        advance together, all phase-0 forwarding invariants are
+//        preserved during and after a stall.
+//
 // Simulation technique
 //      On every cycle, we compute the next value of every pipeline latch
 //      from the current values, then commit them all at once. This
@@ -50,7 +66,7 @@
 
 #include "core/commit.h"
 #include "isa/isa.h"
-#include "memory/memory.h"
+#include "memory/system.h"
 #include "sim/config.h"
 #include "sim/stats.h"
 
@@ -101,9 +117,7 @@ struct MEMWB {
 
 class CPU {
 public:
-  explicit CPU(const SimConfig &cfg);
-
-  Memory mem;
+  CPU(const SimConfig &cfg, MemorySystem &msys);
 
   // Load a program image (vector of 32-bit words) at address 0
   void loadWords(const std::vector<uint32_t> &words);
@@ -120,15 +134,35 @@ public:
   std::function<void(const CommitRecord &)> onCommit;
 
 private:
+  // memory system
+  MemorySystem &msys;
+  MemPort *imem; // fetch port (L1I or flat)
+  MemPort *dmem; // data port (L1D or flat)
+  bool showMemStats;
+
   // architectural state
   uint32_t regs[32];
-  uint32_t pc = 0;
+  uint32_t pc = 0; // next address the fetch unit will request
 
   // pipeline state
   IFID ifid;
   IDEX idex;
   EXMEM exmem;
   MEMWB memwb;
+
+  // fetch unit state (the IF stage)
+  bool fOutstanding = false; // a fetch is in flight at imem
+  bool fStale = false;       // drop the in-flight fetch when it lands
+  uint32_t fPC = 0;          // pc of the in-flight fetch
+  bool fBufValid = false;    // one-entry buffer of a completed fetch
+  uint32_t fBufPC = 0;
+  uint32_t fBufRaw = 0;
+
+  // data access state (the MEM stage)
+  bool dOutstanding = false; // a load/store is in flight at dmem
+  uint32_t dAddr = 0;        // saved at issue for the commit record
+  uint32_t dVal = 0;
+  uint8_t dSize = 0;
 
   // bookkeeping
   bool halted = false;
@@ -139,12 +173,12 @@ private:
   std::vector<std::string> events; // per-cycle annotations for the trace
 
   // pipeline stages
-  IFID doIF();
+  void updateFetch(); // run the fetch unit for one cycle
   IDEX doID(bool &stall);
   uint32_t fwd(uint8_t reg, uint32_t valueFromID) const;
   EXMEM doEX(bool &redirect, uint32_t &redirectPC);
   void checkAlign(Op op, uint32_t addr, uint32_t atPc);
-  MEMWB doMEM();
+  MEMWB doMEM(bool &memDone);
   void doWB();
   void doSyscall();
   void stepCycle();

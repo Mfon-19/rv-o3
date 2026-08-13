@@ -14,6 +14,7 @@
 
 #include "core/cpu.h"
 #include "core/refmodel.h"
+#include "memory/system.h"
 #include "sim/config.h"
 #include "sim/loader.h"
 
@@ -28,6 +29,8 @@ static void usage(const char *argv0) {
           "                instruction\n"
           "  -c <cycles>   cycle budget (default 10000000)\n"
           "  -m <bytes>    memory size (default 1 MiB)\n"
+          "The memory hierarchy (32K 8-way L1I/L1D, 256K 8-way L2, 64 B\n"
+          "lines, 30-cycle DRAM) is fixed; see SimConfig in sim/config.h.\n"
           "Hex format: whitespace-separated 32-bit hex words, '#' comments.\n",
           argv0);
 }
@@ -73,6 +76,10 @@ int main(int argc, char **argv) {
   SimConfig cfg;
   const char *file = nullptr;
 
+  auto numArg = [&](int &i) -> uint64_t {
+    return strtoull(argv[++i], nullptr, 0);
+  };
+
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "-t"))
       cfg.trace = true;
@@ -83,9 +90,9 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "-d"))
       cfg.diffCheck = true;
     else if (!strcmp(argv[i], "-c") && i + 1 < argc)
-      cfg.maxCycles = strtoull(argv[++i], nullptr, 0);
+      cfg.maxCycles = numArg(i);
     else if (!strcmp(argv[i], "-m") && i + 1 < argc)
-      cfg.memBytes = strtoull(argv[++i], nullptr, 0);
+      cfg.memBytes = numArg(i);
     else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
       usage(argv[0]);
       return 0;
@@ -121,7 +128,8 @@ int main(int argc, char **argv) {
     return code;
   }
 
-  CPU cpu(cfg);
+  MemorySystem msys(cfg);
+  CPU cpu(cfg, msys);
   loadInto(cpu);
 
   // Differential check: run the reference model in lockstep as a silent
@@ -160,8 +168,7 @@ int main(int argc, char **argv) {
       fprintf(stderr,
               "differential check FAILED: exit state diverges "
               "(pipeline exited %d, reference %s with exit %d)\n",
-              code, ref.halted() ? "halted" : "still running",
-              ref.exitCode());
+              code, ref.halted() ? "halted" : "still running", ref.exitCode());
       exit(1);
     }
     fprintf(stderr,
