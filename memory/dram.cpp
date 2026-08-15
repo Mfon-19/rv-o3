@@ -2,50 +2,63 @@
 
 #include <cstring>
 
+// Perform the access on the backing store now. Writes take effect
+// immediately (see the header for why that is safe); reads capture
+// their data here, so a later write cannot retroactively change an
+// in-flight read — arrival order is memory order
+MemResponse DRAM::perform(const MemRequest &req) {
+  MemResponse r;
+  r.src = req.src;
+  r.tag = req.tag;
+  backing.check(req.addr, req.size, req.isWrite ? "store" : "load");
+  if (req.isWrite) {
+    if (req.size <= 4) {
+      switch (req.size) {
+      case 1: backing.store8(req.addr, (uint8_t)req.wdata); break;
+      case 2: backing.store16(req.addr, (uint16_t)req.wdata); break;
+      default: backing.store32(req.addr, req.wdata); break;
+      }
+    } else {
+      memcpy(backing.bytes.data() + req.addr, req.wline.data(), req.size);
+    }
+  } else {
+    if (req.size <= 4) {
+      switch (req.size) {
+      case 1: r.rdata = backing.load8(req.addr); break;
+      case 2: r.rdata = backing.load16(req.addr); break;
+      default: r.rdata = backing.load32(req.addr); break;
+      }
+    } else {
+      r.rline.assign(backing.bytes.begin() + req.addr,
+                     backing.bytes.begin() + req.addr + req.size);
+    }
+  }
+  return r;
+}
+
 void DRAM::access(const MemRequest &req) {
-  cur = req;
-  busy = true;
-  ready = false;
-  ctr = latency - 1;
-  if (ctr == 0)
-    complete();
+  acceptedThisCycle = true;
+  MemResponse r = perform(req);
+  if (latency == 1)
+    respQ.push_back(std::move(r)); // combinational answer
+  else
+    inflight.push_back(Txn{std::move(r), latency - 1});
 }
 
 void DRAM::tick() {
-  if (busy && !ready && ctr > 0 && --ctr == 0)
-    complete();
+  acceptedThisCycle = false;
+  for (size_t i = 0; i < inflight.size();) {
+    if (--inflight[i].remaining == 0) {
+      respQ.push_back(std::move(inflight[i].resp));
+      inflight.erase(inflight.begin() + i);
+    } else {
+      i++;
+    }
+  }
 }
 
 MemResponse DRAM::response() {
-  ready = false;
-  busy = false;
-  return std::move(resp);
-}
-
-void DRAM::complete() {
-  resp = MemResponse{};
-  backing.check(cur.addr, cur.size, cur.isWrite ? "store" : "load");
-  if (cur.isWrite) {
-    if (cur.size <= 4) {
-      switch (cur.size) {
-      case 1: backing.store8(cur.addr, (uint8_t)cur.wdata); break;
-      case 2: backing.store16(cur.addr, (uint16_t)cur.wdata); break;
-      default: backing.store32(cur.addr, cur.wdata); break;
-      }
-    } else {
-      memcpy(backing.bytes.data() + cur.addr, cur.wline.data(), cur.size);
-    }
-  } else {
-    if (cur.size <= 4) {
-      switch (cur.size) {
-      case 1: resp.rdata = backing.load8(cur.addr); break;
-      case 2: resp.rdata = backing.load16(cur.addr); break;
-      default: resp.rdata = backing.load32(cur.addr); break;
-      }
-    } else {
-      resp.rline.assign(backing.bytes.begin() + cur.addr,
-                        backing.bytes.begin() + cur.addr + cur.size);
-    }
-  }
-  ready = true;
+  MemResponse r = std::move(respQ.front());
+  respQ.pop_front();
+  return r;
 }

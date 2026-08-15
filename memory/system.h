@@ -12,9 +12,11 @@
 // the original timing model exactly (dual-ported flat memory, no
 // structural hazards).
 //
-// The L2 is single-ported: when both L1s want it in the same cycle,
-// one sees canAccept() == false and retries — that is the explicit
-// backpressure of the blocking design.
+// Every level is nonblocking and tagged; the MemorySystem's tick
+// routes each level's completions to its requester: DRAM completions
+// to the L2, and the L2's — which carry the src id of the L1 that
+// asked — back to the right L1. Backpressure is MSHR/writeback-queue
+// occupancy (canAccept), not a busy port.
 
 #pragma once
 
@@ -25,6 +27,9 @@
 #include "memory/memory.h"
 #include "memory/request.h"
 #include "sim/config.h"
+
+// Requester ids carried in MemRequest::src for response routing
+enum : uint8_t { SRC_L1I = 0, SRC_L1D = 1, SRC_L2 = 2 };
 
 struct MemorySystem {
   explicit MemorySystem(const SimConfig &cfg);

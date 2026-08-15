@@ -14,6 +14,15 @@ struct CacheConfig {
   uint32_t ways;
   uint32_t lineBytes;
   uint32_t hitLatency; // cycles; 1 = same-cycle
+  uint32_t mshrs;      // outstanding missed lines (nonblocking depth)
+  uint32_t wbq;        // dirty victims parked awaiting writeback
+};
+
+// How aggressively loads move around older stores
+enum class MemOrder {
+  Conservative, // wait until every older store address is known
+  Bypass,       // pass resolved, provably non-overlapping stores
+  Speculative,  // pass unknown addresses too; replay on a violation
 };
 
 struct SimConfig {
@@ -32,9 +41,9 @@ struct SimConfig {
   bool flatMemory = false;   // no caches, direct fixed-latency ports
   uint32_t flatLatency = 1;  // flat-mode access latency
   uint32_t dramLatency = 30; // DRAM latency in cache mode
-  CacheConfig l1i{32 * 1024, 8, 64, 1};
-  CacheConfig l1d{32 * 1024, 8, 64, 1};
-  CacheConfig l2{256 * 1024, 8, 64, 4};
+  CacheConfig l1i{32 * 1024, 8, 64, 1, 2, 2};
+  CacheConfig l1d{32 * 1024, 8, 64, 1, 4, 4};
+  CacheConfig l2{256 * 1024, 8, 64, 4, 4, 4};
 
   // Functional units. Internal like the cache geometry —
   // the future configuration interface exposes these, not the CLI
@@ -53,6 +62,9 @@ struct SimConfig {
   uint32_t physRegs = 64;    // 32 architectural + one per ROB entry
   uint32_t fetchQSize = 8;   // fetched instructions waiting to dispatch
   bool usePredictor = true;  // false: static not-taken (bring-up mode)
+  MemOrder memOrder = MemOrder::Speculative; // load aggressiveness
+  bool depPredictor = false; // remember conflicting loads, issue them
+  uint32_t depTableSize = 64; // conservatively (Speculative mode only)
   uint32_t phtBits = 10;     // gshare: 2^10 two-bit counters
   uint32_t ghrBits = 0;      // history bits; 0 = plain bimodal (these
                              // kernels end before history would warm up)

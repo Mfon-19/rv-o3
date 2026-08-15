@@ -132,13 +132,15 @@ private:
   bool fOutstanding = false, fStale = false;
   uint32_t fBlock = 0, fFetchPc = 0;
 
-  // data-port ownership (one blocking port, three kinds of customer)
-  enum class DPort { FREE, LOAD, LOAD_STALE, STORE };
-  DPort dport = DPort::FREE;
-  uint32_t dLoadLsqIdx = 0;
-  uint64_t dLoadSeq = 0;
+  // several loads and committed stores can be in flight at the L1D at
+  // once; completions match back through {lsq slot, generation} tags
+  // for loads and store-buffer transaction ids for stores
+  std::vector<FuOp> loadOuts; // completed loads awaiting WB ports
+  uint32_t sbTxnCtr = 0;
 
-  FuOp loadOut; // completed load waiting for a writeback port
+  // memory-dependence predictor: loads that violated recently are
+  // issued conservatively (Speculative mode only)
+  std::vector<uint8_t> depTable;
 
   // control
   uint64_t seqCtr = 0;
@@ -155,6 +157,8 @@ private:
   void writebackStage();
   void recover(uint64_t seq); // flush younger than seq everywhere
   void aguDrain();
+  void violationScan(const LsqEntry &store); // replay loads that jumped
+  void drainDataResponses();
   void lsqOperate();
   void issueStage();
   void dispatchStage();

@@ -1,0 +1,23 @@
+# Directed memory test: speculative load replay. The second store's
+# address hides behind a divide and turns out to ALIAS the younger
+# load's address. In Speculative mode the load doesn't wait — it reads
+# the parked 55, and when the store's address resolves the ordering
+# violation is detected: the load and everything younger flush and
+# refetch (1 replay in the stats), re-reading 99 by forwarding. In the
+# conservative modes the load simply waits. Either way: 100.
+# Expected output: 100, exit 0.
+10000213   # addi x4, x0, 256     the aliased address
+00400293   # addi x5, x0, 4
+40000393   # addi x7, x0, 1024
+03700493   # addi x9, x0, 55
+00922023   # sw   x9, 0(x4)       park 55 at 256
+0253D133   # divu x2, x7, x5      256, slowly
+06300413   # addi x8, x0, 99
+00812023   # sw   x8, 0(x2)       aliasing store, address arrives late
+00022483   # lw   x9, 0(x4)       speculates to 55, replays to 99
+00148513   # addi x10, x9, 1      100
+00100893   # addi x17, x0, 1      syscall 1: print integer
+00000073   # ecall                prints 100
+00000513   # addi x10, x0, 0
+05D00893   # addi x17, x0, 93     syscall 93: exit
+00000073   # ecall

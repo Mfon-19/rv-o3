@@ -25,6 +25,8 @@ struct Stats {
   uint64_t flushes = 0;                   // recovery events
   uint64_t wbConflicts = 0; // completions held a cycle by port arbitration
   uint64_t loadsForwarded = 0;   // store->load forwards
+  uint64_t specLoads = 0;        // loads issued past unknown store addrs
+  uint64_t loadReplays = 0;      // ordering violations, flush-and-refetch
   uint64_t sbCommitStalls = 0;   // store-buffer-full commit stalls
   uint64_t issuedOps = 0;        // total ops issued (avg issue width)
   uint64_t fetchStallCycles = 0; // cycles dispatch had nothing fetched

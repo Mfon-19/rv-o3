@@ -11,23 +11,31 @@ MemorySystem::MemorySystem(const SimConfig &cfg)
     imem = &*flatI;
     dmem = &dram;
   } else {
-    l2.emplace("L2", cfg.l2, &dram);
-    l1i.emplace("L1I", cfg.l1i, &*l2);
-    l1d.emplace("L1D", cfg.l1d, &*l2);
+    l2.emplace("L2", cfg.l2, &dram, SRC_L2);
+    l1i.emplace("L1I", cfg.l1i, &*l2, SRC_L1I);
+    l1d.emplace("L1D", cfg.l1d, &*l2, SRC_L1D);
     imem = &*l1i;
     dmem = &*l1d;
   }
 }
 
+// Bottom-up: advance each level, then route its completions to the
+// requester above before that requester's own tick
 void MemorySystem::tick() {
   dram.tick();
   if (flat) {
     flatI->tick();
-  } else {
-    l2->tick();
-    l1i->tick();
-    l1d->tick();
+    return;
   }
+  while (dram.hasResponse())
+    l2->deliverBelowResponse(dram.response());
+  l2->tick();
+  while (l2->hasResponse()) {
+    MemResponse r = l2->response();
+    (r.src == SRC_L1I ? l1i : l1d)->deliverBelowResponse(r);
+  }
+  l1i->tick();
+  l1d->tick();
 }
 
 uint8_t MemorySystem::peek8(uint32_t addr) const {
@@ -51,10 +59,12 @@ void MemorySystem::printStats(uint64_t retired) const {
     const double avgLat = s.accesses ? (double)s.latencySum / s.accesses : 0.0;
     fprintf(stderr,
             "--- rvsim: %-3s %" PRIu64 " accesses, %" PRIu64
-            " misses (%.2f%%, %.2f MPKI), %" PRIu64
+            " misses (%.2f%%, %.2f MPKI), %" PRIu64 " merged, %" PRIu64
+            " hit-under-miss, %" PRIu64 " overlap cycles, %" PRIu64
             " dirty evictions, %" PRIu64 " B in, %" PRIu64
             " B out, avg latency %.2f cycles\n",
-            c->name, s.accesses, s.misses, missRate, mpki, s.dirtyEvictions,
-            s.bytesRead, s.bytesWritten, avgLat);
+            c->name, s.accesses, s.misses, missRate, mpki, s.mergedMisses,
+            s.hitUnderMiss, s.overlapCycles, s.dirtyEvictions, s.bytesRead,
+            s.bytesWritten, avgLat);
   }
 }

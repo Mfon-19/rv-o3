@@ -38,7 +38,6 @@ struct FuOp {
   uint32_t value = 0;    // result / effective address (memory ops)
   uint8_t pdst = kNoReg; // physical destination register
   uint32_t lsqIdx = 0;   // memory ops: the LSQ entry to fill at AGU drain
-  uint32_t storeData = 0; // stores: the data operand, captured at issue
   bool redirect = false; // branches: the RESOLVED direction and target,
   uint32_t target = 0;   // compared against the prediction at writeback
 };

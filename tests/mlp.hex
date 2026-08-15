@@ -1,0 +1,18 @@
+# Directed memory test: miss-level parallelism. Two independent loads
+# from cold lines far apart — both miss L1D, L2, and go to DRAM. With
+# MSHRs the two 30-cycle misses overlap (L1D "overlap cycles" > 0 in
+# the stats) instead of serializing; total time is one miss plus a few
+# cycles, not two misses. The loaded values are zero (cold memory);
+# correctness rides on -d as always.
+# Expected output: 7, exit 0.
+000100B7   # lui  x1, 0x10        0x10000
+00020137   # lui  x2, 0x20        0x20000
+0000A183   # lw   x3, 0(x1)       miss all the way to DRAM
+00012203   # lw   x4, 0(x2)       independent miss: overlaps the first
+004182B3   # add  x5, x3, x4      0
+00728513   # addi x10, x5, 7
+00100893   # addi x17, x0, 1      syscall 1: print integer
+00000073   # ecall                prints 7
+00000513   # addi x10, x0, 0
+05D00893   # addi x17, x0, 93     syscall 93: exit
+00000073   # ecall
