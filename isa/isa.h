@@ -118,12 +118,6 @@ inline bool usesRs2(Op op) {
   return isBranch(op) || isStore(op) || (op >= Op::ADD && op <= Op::REMU);
 }
 
-// Is the rs2 value needed at issue time? Stores are the exception:
-// they only need the data when the memory access starts, one cycle
-// later, and the writeback broadcast delivers it if it is still in
-// flight — so a load feeding a store's data never has to stall
-inline bool rs2NeededAtIssue(Op op) { return usesRs2(op) && !isStore(op); }
-
 // Which functional unit executes each op. System ops (fence,
 // ecall, ebreak, illegal) need no unit: they serialize the machine and
 // take effect at retirement

@@ -11,9 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <memory>
 
-#include "core/cpu.h"
 #include "core/ooo.h"
 #include "core/refmodel.h"
 #include "memory/system.h"
@@ -26,7 +24,6 @@ static void usage(const char *argv0) {
           "  -t            trace pipeline occupancy every cycle (stderr)\n"
           "  -r            dump registers when the simulation ends\n"
           "  -f            run the functional reference model (no pipeline)\n"
-          "  -i            run the in-order core (default: out-of-order)\n"
           "  -d            differential check: compare the core's commit\n"
           "                stream against the reference model, instruction by\n"
           "                instruction\n"
@@ -90,8 +87,6 @@ int main(int argc, char **argv) {
       cfg.dumpRegs = true;
     else if (!strcmp(argv[i], "-f"))
       cfg.refModel = true;
-    else if (!strcmp(argv[i], "-i"))
-      cfg.inorderCore = true;
     else if (!strcmp(argv[i], "-d"))
       cfg.diffCheck = true;
     else if (!strcmp(argv[i], "-c") && i + 1 < argc)
@@ -134,12 +129,8 @@ int main(int argc, char **argv) {
   }
 
   MemorySystem msys(cfg);
-  std::unique_ptr<Core> core;
-  if (cfg.inorderCore)
-    core = std::make_unique<CPU>(cfg, msys);
-  else
-    core = std::make_unique<OoOCore>(cfg, msys);
-  loadInto(*core);
+  OoOCore core(cfg, msys);
+  loadInto(core);
 
   // Differential check: run the reference model in lockstep as a silent
   // shadow, advancing it one instruction per pipeline commit and
@@ -150,7 +141,7 @@ int main(int argc, char **argv) {
   if (cfg.diffCheck) {
     ref.quiet = true;
     loadInto(ref);
-    core->onCommit = [&](const CommitRecord &pipe) {
+    core.onCommit = [&](const CommitRecord &pipe) {
       CommitRecord refRec;
       if (!ref.step(&refRec)) {
         fprintf(stderr,
@@ -170,7 +161,7 @@ int main(int argc, char **argv) {
     };
   }
 
-  int code = core->run();
+  int code = core.run();
 
   if (cfg.diffCheck && code != 2) { // a blown cycle budget isn't architectural
     if (!ref.halted() || ref.exitCode() != code) {
@@ -187,11 +178,11 @@ int main(int argc, char **argv) {
     // So the settled state is compared too (memory through peek8 —
     // the newest copy of a byte may still be in a cache)
     for (int r = 0; r < 32; r++) {
-      if (core->reg(r) != ref.reg(r)) {
+      if (core.reg(r) != ref.reg(r)) {
         fprintf(stderr,
                 "differential check FAILED: final %s diverges "
                 "(pipeline 0x%08x, reference 0x%08x)\n",
-                kRegName[r], core->reg(r), ref.reg(r));
+                kRegName[r], core.reg(r), ref.reg(r));
         exit(1);
       }
     }
@@ -211,6 +202,6 @@ int main(int argc, char **argv) {
   }
 
   if (cfg.dumpRegs)
-    core->dumpRegs();
+    core.dumpRegs();
   return code;
 }

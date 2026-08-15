@@ -3,8 +3,7 @@ CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra
 CXXFLAGS += -I. -MMD -MP
 
 SRCS := isa/decode.cpp isa/disasm.cpp isa/execute.cpp \
-        core/cpu.cpp core/fu.cpp core/ooo.cpp core/predictor.cpp \
-        core/refmodel.cpp \
+        core/ooo.cpp core/predictor.cpp core/refmodel.cpp \
         memory/dram.cpp memory/cache.cpp memory/system.cpp \
         sim/loader.cpp sim/main.cpp
 OBJS := $(SRCS:.cpp=.o)
@@ -18,10 +17,9 @@ rvsim: $(OBJS)
 
 -include $(DEPS)
 
-# Run every bundled test program under -d on BOTH cores (out-of-order
-# and, via -i, in-order), differentially checking each commit stream
-# against the functional reference model instruction by instruction.
-# Expected program output (stdout):
+# Run every bundled test program under -d, differentially checking the
+# core's commit stream against the functional reference model
+# instruction by instruction. Expected program output (stdout):
 #   cache.hex      -> 42, 50 (dirty eviction, writeback, refill round trip)
 #   divcontend.hex -> 30, 7  (non-pipelined divider contention, WAW block)
 #   divoverlap.hex -> 45     (independent ALU work overlapping a divide)
@@ -39,12 +37,10 @@ rvsim: $(OBJS)
 .PHONY: test
 test: rvsim
 	@for t in tests/*.hex; do \
-		echo "== $$t (ooo)"; ./rvsim -d $$t || exit 1; \
-		echo "== $$t (in-order)"; ./rvsim -i -d $$t || exit 1; \
+		echo "== $$t"; ./rvsim -d $$t || exit 1; \
 	done
 	@if [ -f cdemo/demo.bin ]; then \
-		echo "== cdemo/demo.bin (ooo)"; ./rvsim -d cdemo/demo.bin || exit 1; \
-		echo "== cdemo/demo.bin (in-order)"; ./rvsim -i -d cdemo/demo.bin || exit 1; \
+		echo "== cdemo/demo.bin"; ./rvsim -d cdemo/demo.bin || exit 1; \
 	fi
 
 .PHONY: clean

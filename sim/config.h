@@ -43,11 +43,8 @@ struct SimConfig {
   bool mulPipelined = true;     // one new multiply may start per cycle
   uint32_t divLatency = 12;     // divider occupancy (non-pipelined)
   uint32_t wbPorts = 2;         // completions written back per cycle
-  uint32_t retireQueueSize = 32;
 
-  // Out-of-order core. -i selects the in-order core instead; the OoO
-  // shape below is internal like everything else
-  bool inorderCore = false;
+  // Out-of-order core shape, internal like everything else
   uint32_t width = 2;        // rename/dispatch, issue, and commit width
   uint32_t robSize = 32;
   uint32_t iqSize = 16;      // integer issue queue entries

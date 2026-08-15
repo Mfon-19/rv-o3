@@ -1,15 +1,15 @@
 // Functional units.
 //
-// The single EX stage becomes a set of explicit units, so that an
-// instruction's latency (cycles until its result exists) and a unit's
-// throughput (how often it can start a new op) are separate,
-// configurable properties:
+// Execution is a set of explicit units, so that an instruction's
+// latency (cycles until its result exists) and a unit's throughput
+// (how often it can start a new op) are separate, configurable
+// properties:
 //
 //      N x integer ALU   latency 1, pipelined
 //      1 x branch unit   latency 1, pipelined
 //      1 x multiplier    latency 3, pipelined (one new op per cycle)
 //      1 x divider       latency 12+, non-pipelined (busy throughout)
-//      1 x LSU           address generation + asynchronous cache access
+//      1 x AGU           latency 1; drains to the LSQ, not a WB port
 //
 // The result VALUE is computed by execute() at issue — semantics stay
 // in isa/ — a unit only delays the result's visibility. Every unit ends
@@ -21,37 +21,26 @@
 #pragma once
 
 #include <cstdint>
-#include <optional>
-#include <string>
 #include <vector>
 
-#include "core/commit.h"
 #include "isa/isa.h"
-#include "memory/request.h"
 
-// "No physical register" — used by cores without renaming too
+// "No physical register"
 constexpr uint8_t kNoReg = 0xFF;
 
 // An instruction in flight inside a functional unit
 struct FuOp {
   bool valid = false;
-  uint64_t seq = 0;    // issue order; writeback arbitration picks the oldest
-  uint32_t robIdx = 0; // this op's retire-queue entry
+  uint64_t seq = 0;    // program order; writeback arbitration picks oldest
+  uint32_t robIdx = 0; // this op's reorder-buffer entry
   Instr ins;
   uint32_t pc = 0;
-  uint32_t value = 0; // result / effective address (memory ops)
-  // Out-of-order core extras
+  uint32_t value = 0;    // result / effective address (memory ops)
   uint8_t pdst = kNoReg; // physical destination register
   uint32_t lsqIdx = 0;   // memory ops: the LSQ entry to fill at AGU drain
+  uint32_t storeData = 0; // stores: the data operand, captured at issue
   bool redirect = false; // branches: the RESOLVED direction and target,
   uint32_t target = 0;   // compared against the prediction at writeback
-  // Stores only: the data to write. If the producer was still in
-  // flight at issue, storeDataReady is false and the writeback
-  // broadcast fills the value in before the access starts
-  uint32_t storeData = 0;
-  bool storeDataReady = true;
-  uint8_t storeDataReg = 0;
-  std::optional<MemoryWrite> memWrite; // filled when a store performs
 };
 
 // A fixed-latency unit, pipelined or not. Pipelined: a shift register
@@ -128,37 +117,4 @@ struct FuUnit {
     if (out.valid && out.seq > seq)
       out = FuOp{};
   }
-};
-
-// The load/store unit: one cycle of address generation (the agu slot),
-// then an asynchronous access at the data port (the acc slot). Only
-// dependents and younger memory ops wait on a slow access now — the
-// rest of the core keeps issuing, where the five-stage pipeline froze
-// entirely
-struct LSU {
-  MemPort *dmem = nullptr;
-  FuOp agu, acc, out;
-  bool outstanding = false; // access() issued, response not consumed
-  bool ready = false;       // acc finished, waiting for the output slot
-  uint64_t ops = 0, busyCycles = 0;
-  uint64_t dataStallCycles = 0; // cycles waiting on port or store data
-
-  bool busy() const { return agu.valid || acc.valid; }
-  bool canAccept() const { return !agu.valid; }
-  void accept(const FuOp &op) {
-    ops++;
-    agu = op;
-  }
-
-  // Advance one cycle: finish an outstanding access, drain to the
-  // output slot, move the next op into the access slot, start it
-  void operate(std::vector<std::string> *events);
-
-  // Writeback broadcast: an armed store still waiting for its data
-  // captures the value the moment the producer writes back
-  void capture(uint8_t rd, uint32_t value);
-
-private:
-  void finalize(const MemResponse &resp);
-  void startAccess(std::vector<std::string> *events);
 };
