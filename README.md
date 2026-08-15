@@ -19,31 +19,40 @@ RISC-V binutils.
 ## The machine at a glance
 
 ```text
-            bimodal + BTB + RAS
-                  |
+     pc, steered by the predictor (bimodal + BTB + RAS)
+       |
    +-------+   +--------+   +----------------+   +-------------+
    | fetch |-->| decode |-->|    dispatch    |-->| issue queue |
-   |2/cycle|   | rename |   | ROB, LSQ alloc |   |  16 entries |
+   |8B/cyc |   | rename |   | ROB, LSQ alloc |   | 16 entries  |
    +-------+   +--------+   +----------------+   +------+------+
-                                                        | oldest ready,
-                                                        | 2/cycle
-              +-------+-------+--------+-------+-------++
-              |  ALU  |  ALU  | branch |  mul  |  div  | AGU
-              +-------+-------+--------+-------+-------+  |
-                              |                           v
-                    writeback, 2 ports          load/store queue (16)
-                    wakes the issue queue       + store buffer (8)
-                              |                           |
-                              v                           | loads and
-                    commit, in order, 2/cycle             | committed
-                    the ONLY architectural update         | stores
-                                                          v
-        fetch --> L1I 32K ----+----------------- L1D 32K <--+
-                              |                    |
-                              +---- unified L2 256K
-                                         |          every cache level:
-                                   pipelined DRAM   MSHRs, hit under miss,
-                                   (30 cycles)      writeback queues
+       ^                                            ^    |
+       |                                    wakeup: |    | oldest ready,
+       | redirect: refetch after            results |    | 2/cycle
+       | a mispredict (caught at            ready   |    |
+       | writeback) or a load           +-----------+----+----------------+
+       | replay (caught in the          | ALU  ALU  branch  mul  div  AGU |
+       | LSQ)                           +----+-----------------------+----+
+       |                                     | results               | memory ops
+       |                                     v                       v
+       |                        +---------------------+    +----------------+
+       +------------------------| writeback: 2 ports  |<---| LSQ 16 entries |
+                                | oldest result first |load|                |
+                                +----------+----------+data+--+---------+---+
+                                           |                  |         |
+                                           v           loads  |         | stores, only
+                              commit: in order, 2/cycle       |         | after commit
+                              the ONLY architectural          |         v
+                              update                          |   +--------------+
+                                                              |   | store buffer |
+                                                              |   | 8 entries    |
+                                                              |   +------+-------+
+                                                              v          |
+    fetch ---> L1I 32K -----+----------------- L1D 32K <------+----------+
+                            |                     |
+                            +--- unified L2 256K -+
+                                       |             every cache level:
+                                 pipelined DRAM      MSHRs, hit under miss,
+                                 (30 cycles)         writeback queues
 ```
 
 - **Fetch** reads an aligned 8-byte block each cycle (two instructions), steered by a bimodal
