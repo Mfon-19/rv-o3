@@ -1,4 +1,4 @@
-# hazards.hex — a gauntlet of data hazards; prints 84 and exits with code 0.
+# hazards.hex: a gauntlet of data hazards; prints 84 and exits with code 0.
 # Exercises:
 #   * EX/MEM -> EX forwarding      (addi feeding the sw address base)
 #   * load-use interlock           (lw t3 immediately used by add)

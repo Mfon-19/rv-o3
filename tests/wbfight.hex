@@ -3,7 +3,7 @@
 # cache miss so the trio below runs with deterministic latencies. Then
 # mul (latency 3, issued first), lw (address generation + 1-cycle hit,
 # issued second) and addi (latency 1, issued third) all complete in
-# the same cycle — three results, two writeback ports. The two oldest
+# the same cycle: three results, two writeback ports. The two oldest
 # (mul, lw) write back; the addi holds its ALU's output slot one cycle
 # ("wb port conflict"). Values must still come out right.
 # Expected output: 5 then 27, exit 0.

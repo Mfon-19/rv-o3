@@ -5,7 +5,7 @@
 // Perform the access on the backing store now. Writes take effect
 // immediately (see the header for why that is safe); reads capture
 // their data here, so a later write cannot retroactively change an
-// in-flight read — arrival order is memory order
+// read that is already in flight; arrival order is memory order
 MemResponse DRAM::perform(const MemRequest &req) {
   MemResponse r;
   r.src = req.src;

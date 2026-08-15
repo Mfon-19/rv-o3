@@ -69,7 +69,7 @@ bool RefModel::step(CommitRecord *rec) {
   case Op::EBREAK:
     retired_++;
     if (!quiet)
-      fprintf(stderr, "ebreak at pc=0x%08x — halting\n", pc);
+      fprintf(stderr, "ebreak at pc=0x%08x; halting\n", pc);
     halted_ = true;
     break;
   case Op::ILLEGAL:
@@ -169,6 +169,10 @@ void RefModel::doSyscall() {
     if (!quiet)
       for (uint32_t a = arg; mem.load8(a) != 0; a++)
         putchar(mem.load8(a));
+    break;
+  case 4: // print a0 as 8 hex digits (architectural-test signatures)
+    if (!quiet)
+      printf("%08x\n", arg);
     break;
   case 10:
   case 93:

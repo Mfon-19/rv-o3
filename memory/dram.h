@@ -1,10 +1,10 @@
 // Fixed-latency main memory, the bottom of the hierarchy.
 //
 // Pipelined: it accepts one request per cycle and each completes
-// independently `latency` cycles later — modeling a memory banked
+// independently `latency` cycles later; this models a memory banked
 // enough to sustain the miss-level parallelism the caches above can
 // generate. With latency 1 it answers combinationally, which is
-// exactly the original flat-memory timing — flat mode attaches two of
+// exactly the original flat-memory timing; flat mode attaches two of
 // these directly to the core's fetch and data ports.
 //
 // Writes are applied to the backing store at access() and acknowledged

@@ -23,7 +23,8 @@ MemorySystem::MemorySystem(const SimConfig &cfg)
 // requester above before that requester's own tick. Each routing pass
 // repeats after the requester's tick as well, because a tick can
 // issue a request that a latency-1 level below answers within the
-// call — the same-cycle contract must hold across level boundaries
+// call; the promise that latency 1 answers within the same cycle
+// must hold across level boundaries too
 void MemorySystem::tick() {
   dram.tick();
   if (flat) {
@@ -68,14 +69,16 @@ void MemorySystem::printStats(uint64_t retired) const {
     const double missRate = s.accesses ? 100.0 * s.misses / s.accesses : 0.0;
     const double mpki = retired ? 1000.0 * s.misses / retired : 0.0;
     const double avgLat = s.accesses ? (double)s.latencySum / s.accesses : 0.0;
+    const double avgOut = s.ticks ? (double)s.mshrOccSum / s.ticks : 0.0;
     fprintf(stderr,
             "--- rvsim: %-3s %" PRIu64 " accesses, %" PRIu64
             " misses (%.2f%%, %.2f MPKI), %" PRIu64 " merged, %" PRIu64
             " hit-under-miss, %" PRIu64 " overlap cycles, %" PRIu64
             " dirty evictions, %" PRIu64 " wbq restores, %" PRIu64
-            " B in, %" PRIu64 " B out, avg latency %.2f cycles\n",
+            " B in, %" PRIu64 " B out, avg latency %.2f cycles, "
+            "avg outstanding %.2f\n",
             c->name, s.accesses, s.misses, missRate, mpki, s.mergedMisses,
             s.hitUnderMiss, s.overlapCycles, s.dirtyEvictions,
-            s.wbqRestores, s.bytesRead, s.bytesWritten, avgLat);
+            s.wbqRestores, s.bytesRead, s.bytesWritten, avgLat, avgOut);
   }
 }

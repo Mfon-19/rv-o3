@@ -4,8 +4,8 @@
 // out of order; commit consumes only from the head, up to commit-width
 // per cycle. Architectural state changes nowhere else: the rename
 // map's displaced mapping is freed here, stores are released to the
-// store buffer here, syscalls and traps take effect here — so the
-// machine is precise at every instruction boundary.
+// store buffer here, syscalls and traps take effect here; the
+// machine is therefore precise at every instruction boundary.
 //
 // Recovery walks the tail: entries younger than a mispredicted branch
 // are popped youngest-first, each returning its physical register and
@@ -28,7 +28,8 @@ struct RobEntry {
   bool isMem = false;      // has an LSQ entry
   bool isSystem = false;   // fence/ecall/ebreak/illegal: effect at commit
   // Faults detected speculatively take effect only if the instruction
-  // commits — a wrong-path garbage address must not kill the run
+  // commits; a garbage address from the wrong path must not kill
+  // the run
   uint8_t fault = 0; // 0 none, 1 misaligned, 2 out of bounds
   // Branch bookkeeping: what fetch predicted, what execute resolved,
   // and the predictor snapshot (counter index, pre-shift history) so
@@ -39,7 +40,7 @@ struct RobEntry {
   uint32_t predictedTarget = 0, actualTarget = 0;
   uint32_t predIdx = 0, ghrBefore = 0;
   // Syscall argument registers captured at dispatch (the map is
-  // architectural there — the ROB was empty), read at commit
+  // architectural there because the ROB was empty), read at commit
   uint8_t sysA0 = 0, sysA7 = 0;
 };
 

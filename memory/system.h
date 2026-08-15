@@ -14,9 +14,9 @@
 //
 // Every level is nonblocking and tagged; the MemorySystem's tick
 // routes each level's completions to its requester: DRAM completions
-// to the L2, and the L2's — which carry the src id of the L1 that
-// asked — back to the right L1. Backpressure is MSHR/writeback-queue
-// occupancy (canAccept), not a busy port.
+// go to the L2, and the L2's completions, which carry the src id of
+// the L1 that asked, go back to the right L1. Backpressure is MSHR
+// and writeback-queue occupancy (canAccept), not a busy port.
 
 #pragma once
 
@@ -37,7 +37,7 @@ struct MemorySystem {
   void tick(); // advance the whole hierarchy one cycle, bottom-up
 
   // Functional byte read for the simulator's own use (syscall 3):
-  // newest copy wins — L1D, then L2, then the backing store
+  // newest copy wins: L1D, then L2, then the backing store
   uint8_t peek8(uint32_t addr) const;
 
   void printStats(uint64_t retired) const;

@@ -111,7 +111,7 @@ void Cache::finishHit(MemResponse &&resp) {
 }
 
 // Evict whatever occupies the way lineAddr will live in. Returns false
-// when the victim is dirty and the writeback queue has no room — the
+// when the victim is dirty and the writeback queue has no room; the
 // caller retries later
 bool Cache::claimWay(uint32_t lineAddr, uint32_t &set, uint32_t &way) {
   set = setOf(lineAddr);
@@ -121,8 +121,8 @@ bool Cache::claimWay(uint32_t lineAddr, uint32_t &set, uint32_t &way) {
     if (wbq.size() >= cfg.wbq)
       return false;
     stats.dirtyEvictions++;
-    // bytesWritten is charged when the writeback is actually SENT —
-    // a wbq restore can still cancel this entry
+    // bytesWritten is charged when the writeback is actually SENT;
+    // a restore from the writeback queue can still cancel this entry
     WbEntry wb;
     wb.addr = lineAddrOf(set, way);
     wb.line.assign(lineData(set, way), lineData(set, way) + cfg.lineBytes);
@@ -150,7 +150,7 @@ void Cache::access(const MemRequest &req) {
   }
 
   // A miss whose line is still parked in the writeback queue must NOT
-  // refill from below — the level below is stale until that writeback
+  // refill from below; the level below is stale until that writeback
   // lands, and a refill would overtake it. Pull the line straight back
   // into the arrays (a victim-cache restore) and serve it as a hit
   for (size_t i = 0; i < wbq.size(); i++) {
@@ -173,10 +173,10 @@ void Cache::access(const MemRequest &req) {
   stats.misses++;
   if (req.isWrite && req.size == cfg.lineBytes) {
     // Full-line write (an upper cache's dirty victim): every byte is
-    // overwritten, so install directly, no refill — UNLESS a refill
-    // for this very line is already in flight (the other L1 wants
-    // it): installing now would later be overwritten by the stale
-    // refill. Join the MSHR instead; replay applies this write over
+    // overwritten, so install directly with no refill; UNLESS a
+    // refill for this very line is already in flight (the other L1
+    // wants it), because installing now would later be overwritten
+    // by the stale refill. Join the MSHR instead; replay applies this write over
     // the refilled line in arrival order
     const int inflight = mshrFor(lineAddr);
     if (inflight >= 0) {
@@ -297,6 +297,8 @@ void Cache::tick() {
     pending += m.valid;
   if (pending >= 2)
     stats.overlapCycles++;
+  stats.mshrOccSum += pending;
+  stats.ticks++;
 }
 
 MemResponse Cache::response() {
@@ -319,9 +321,9 @@ bool Cache::peek8(uint32_t addr, uint8_t &out) const {
   }
   // Writes waiting in an MSHR (a merged dirty victim from above, or a
   // scalar store to a missing line) have left every other structure;
-  // until the refill lands they exist only here. Newest-first, a
-  // waiting write covering this byte IS its current value; uncovered
-  // bytes still come from the level below. (A line is never in the
+  // until the refill lands they exist only here. Scanning from the
+  // newest, a waiting write covering this byte IS its current value;
+  // bytes no waiting write covers still come from the level below. (A line is never in the
   // arrays, the wb queue, and an MSHR at once, so order is unambiguous)
   for (const Mshr &m : mshrs) {
     if (!m.valid)

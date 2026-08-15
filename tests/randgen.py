@@ -2,8 +2,8 @@
 """Random memory-soup generator for differential testing.
 
 Emits a straight-line RV32IM program (rvsim .hex format) full of loads
-and stores confined to a few cache lines — maximum aliasing pressure
-for the load/store queue — mixed with ALU ops, multiplies, divides,
+and stores confined to a few cache lines (maximum aliasing pressure
+for the load/store queue), mixed with ALU ops, multiplies, divides,
 and forward branches. The functional reference model is the oracle
 (run the output under -d), so this script needs no knowledge of what
 the program computes; it only guarantees alignment and convergent
@@ -43,8 +43,8 @@ def b_t(imm, rs2, rs1, f3):
         | (((u >> 11) & 1) << 7) | 0x63
 
 
-# Three lines to fight over, parked at 8 KiB — far above any program
-# this generator can emit, so stores can never reach the code image
+# Three lines to fight over, parked at 8 KiB; that is far above any
+# program this generator can emit, so stores can never reach the code
 DATA_REGION = 0x2000
 BASES = [(1, 0x00), (2, 0x40), (3, 0x80)]
 DATA = [4, 5, 6, 7, 8, 9, 11, 12, 13, 14]  # scratch registers
@@ -88,7 +88,7 @@ def mem(is_store):
 
 
 def conflict_store():
-    # 0x3000..0xb000 all map to the same set as the 0x2000 base line —
+    # 0x3000..0xb000 all map to the same set as the 0x2000 base line:
     # nine lines fighting over eight ways, so the dirty base line gets
     # evicted regularly and promptly re-accessed: real pressure on the
     # writeback queue and its ordering against refills
@@ -130,7 +130,7 @@ while n < nops:
     elif r < 0.90:  # eviction pressure: the writeback-queue stressor
         conflict_store()
         n += 1
-    else:  # forward branch skipping one instruction — always convergent
+    else:  # forward branch skipping one instruction; always convergent
         a, b = random.choice(DATA), random.choice(DATA)
         f3, name = random.choice([(0, "beq"), (1, "bne")])
         emit(b_t(8, b, a, f3), f"{name} x{a}, x{b}, +8")

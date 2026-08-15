@@ -5,8 +5,8 @@
 // per source. When a result writes back, its physical register number
 // is broadcast here (wakeup) and matching sources flip ready. The
 // scheduler picks the OLDEST ready entries whose unit can accept, up
-// to issue width — oldest-first keeps long-latency chains moving and
-// makes starvation impossible.
+// to issue width; favoring the oldest keeps long dependency chains
+// moving and makes starvation impossible.
 
 #pragma once
 

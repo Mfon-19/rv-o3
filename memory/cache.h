@@ -1,6 +1,6 @@
 // A nonblocking, write-back, write-allocate set-associative cache.
 //
-// One class serves as L1I, L1D, and L2 — an L1's `below` port is the
+// One class serves as L1I, L1D, and L2; an L1's `below` port is the
 // L2, the L2's is DRAM. Instead of one blocking state machine, the
 // cache is organized around three tables:
 //
@@ -17,7 +17,7 @@
 //
 // Hit-under-miss falls out of the structure: hits never consult the
 // MSHRs. Reads capture their data and writes take effect at access()
-// (a hit) or at line install (a miss) — arrival order at each line is
+// (a hit) or at line install (a miss); arrival order at each line is
 // the order requests take effect, and the core never issues two
 // overlapping requests concurrently, so replay order inside an MSHR
 // cannot matter.
@@ -52,6 +52,9 @@ struct CacheStats {
   uint64_t bytesRead = 0;    // refill traffic from the level below
   uint64_t bytesWritten = 0; // writeback traffic to the level below
   uint64_t latencySum = 0;   // total access-to-response cycles
+  uint64_t mshrOccSum = 0;   // live MSHRs, summed once each tick...
+  uint64_t ticks = 0;        // ...over this many ticks; the ratio is
+                             // the average outstanding misses
 };
 
 class Cache : public MemPort {
@@ -72,8 +75,8 @@ public:
   void deliverBelowResponse(const MemResponse &r);
 
   // Functional read for the simulator's own use (syscall 3 string
-  // reads): returns true and the byte if this cache holds the line —
-  // in the arrays or still parked in the writeback queue
+  // reads): returns true and the byte if this cache holds the line,
+  // whether in the arrays or still parked in the writeback queue
   bool peek8(uint32_t addr, uint8_t &out) const;
 
   const char *name;

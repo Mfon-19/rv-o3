@@ -5,7 +5,7 @@ CXXFLAGS += -I. -MMD -MP
 SRCS := isa/decode.cpp isa/disasm.cpp isa/execute.cpp \
         core/ooo.cpp core/predictor.cpp core/refmodel.cpp \
         memory/dram.cpp memory/cache.cpp memory/system.cpp \
-        sim/loader.cpp sim/main.cpp
+        sim/config.cpp sim/loader.cpp sim/main.cpp
 OBJS := $(SRCS:.cpp=.o)
 DEPS := $(OBJS:.o=.d)
 
@@ -64,6 +64,35 @@ randtest: rvsim
 			     tail -4 $(RANDDIR)/r$$s.err; exit 1; }; \
 	done
 	@echo "randtest: $(SEEDS) random programs verified"
+
+# The directed suite re-run under a spread of configurations (widths,
+# window sizes, memory modes) via -O overrides; see tools/configtest.sh
+.PHONY: configtest
+configtest: rvsim
+	@sh tools/configtest.sh
+
+# Benchmarks: each runs under -d in all three memory-ordering modes AND
+# its output is compared against a natively compiled host build, an
+# oracle that shares no code with the simulator, so it checks the ISA
+# semantics that the (shared) reference model cannot
+.PHONY: bench benchtest
+bench:
+	@$(MAKE) -s -C bench
+benchtest: rvsim bench
+	@for b in ptrchase mlpbench matmul mm64 qsortb rle branchy; do \
+		./bench/$$b.host > /tmp/rvbench-exp.txt; \
+		for mode in conservative bypass speculative; do \
+			./rvsim -d -O memOrder=$$mode bench/$$b.bin \
+				> /tmp/rvbench-got.txt 2>/tmp/rvbench-err.txt \
+				|| { echo "FAIL: $$b ($$mode)"; \
+				     tail -4 /tmp/rvbench-err.txt; exit 1; }; \
+			cmp -s /tmp/rvbench-exp.txt /tmp/rvbench-got.txt \
+				|| { echo "FAIL: $$b ($$mode) differs from host oracle"; \
+				     diff /tmp/rvbench-exp.txt /tmp/rvbench-got.txt | head -4; \
+				     exit 1; }; \
+		done; \
+		echo "== $$b ok (-d x3 modes, host oracle matches)"; \
+	done
 
 .PHONY: clean
 clean:

@@ -1,13 +1,15 @@
-// Simulation configuration, filled in from the command line.
+// Simulation configuration.
 //
-// Every knob a model can be built with lives here, so that future
-// configuration sweeps (cache sizes, ROB sizes, widths...) have one
-// place to plug into.
+// Every knob a model can be built with lives here. Defaults below are
+// the shipped machine; a config file (-C) and command-line overrides
+// (-O key=value) can change any of them by name; see the knob table
+// in sim/config.cpp, or run rvsim -p to list effective values.
 
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 
 struct CacheConfig {
   uint32_t sizeBytes;
@@ -28,12 +30,12 @@ enum class MemOrder {
 struct SimConfig {
   size_t memBytes = 1u << 20;      // 1 MiB
   uint64_t maxCycles = 10'000'000; // cycle budget (instructions for -f)
-  bool trace = false;              // -t: per-cycle pipeline trace
+  bool trace = false;              // -t: pipeline trace, one line per cycle
   bool dumpRegs = false;           // -r: register dump at the end
   bool refModel = false;           // -f: run the functional reference model
   bool diffCheck = false;          // -d: lockstep pipeline-vs-reference check
 
-  // Memory hierarchy. Deliberately not exposed on the CLI — these are
+  // Memory hierarchy. Deliberately not exposed on the CLI; these are
   // the fixed defaults until a proper configuration interface exists
   // (the design-space sweeps will need one). flatMemory reproduces the
   // original dual-ported flat-memory timing exactly and is kept for
@@ -45,8 +47,8 @@ struct SimConfig {
   CacheConfig l1d{32 * 1024, 8, 64, 1, 4, 4};
   CacheConfig l2{256 * 1024, 8, 64, 4, 4, 4};
 
-  // Functional units. Internal like the cache geometry —
-  // the future configuration interface exposes these, not the CLI
+  // Functional units. Internal like the cache geometry; the config
+  // file and -O overrides expose these, not dedicated CLI flags
   uint32_t aluCount = 2;        // 1-cycle pipelined integer ALUs
   uint32_t mulLatency = 3;      // multiplier result latency
   bool mulPipelined = true;     // one new multiply may start per cycle
@@ -59,7 +61,8 @@ struct SimConfig {
   uint32_t iqSize = 16;      // integer issue queue entries
   uint32_t lsqSize = 16;     // load/store queue entries
   uint32_t sbSize = 8;       // store buffer (committed stores)
-  uint32_t physRegs = 64;    // 32 architectural + one per ROB entry
+  uint32_t physRegs = 0;     // 0 = derive 32 + robSize (validateConfig);
+                             // explicit values allow pressure studies
   uint32_t fetchQSize = 8;   // fetched instructions waiting to dispatch
   bool usePredictor = true;  // false: static not-taken (bring-up mode)
   MemOrder memOrder = MemOrder::Speculative; // load aggressiveness
@@ -71,3 +74,10 @@ struct SimConfig {
   uint32_t btbEntries = 64;
   uint32_t rasEntries = 8;
 };
+
+// The named-knob interface (sim/config.cpp). All errors are fatal;
+// a silently ignored typo in a sweep config produces wrong science
+void loadConfigFile(SimConfig &c, const char *path);    // key = value lines
+void applyConfigOverride(SimConfig &c, const char *kv); // "key=value"
+void dumpConfig(const SimConfig &c, FILE *out);
+void validateConfig(SimConfig &c); // bounds checks + derived defaults

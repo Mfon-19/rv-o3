@@ -3,8 +3,8 @@
 // One CommitRecord describes everything an instruction did to
 // architectural state when it retired: which register it wrote, what
 // memory it wrote, and any exception it raised. Every model that
-// executes instructions — the functional reference model and each
-// timing model — emits the same record type, so two models can be
+// executes instructions (the functional reference model and each
+// timing model) emits the same record type, so two models can be
 // compared instruction by instruction: the first mismatching record
 // pinpoints exactly where a timing model corrupted architectural state.
 

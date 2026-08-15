@@ -1,4 +1,4 @@
-# sort.hex — bubble-sorts ten signed integers and prints them in ascending order.
+# sort.hex: bubble-sorts ten signed integers and prints them in ascending order.
 #
 # Input:   7, -3, 42, 0, 15, -8, 23, 5, 1, 9
 # Output: -8, -3, 0, 1, 5, 7, 9, 15, 23, 42 (one integer per line)

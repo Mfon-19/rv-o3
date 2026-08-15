@@ -4,7 +4,7 @@
 // Every instruction that writes an architectural register is given a
 // fresh physical register at rename; the map records which physical
 // register currently speaks for each architectural one. Renaming is
-// what deletes WAW and WAR hazards — two writers of the same
+// what deletes WAW and WAR hazards; two writers of the same
 // architectural register write different physical registers, so only
 // true RAW dependencies remain, tracked by the per-physical-register
 // ready bits.

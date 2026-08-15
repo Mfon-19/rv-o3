@@ -1,5 +1,5 @@
-// The load/store queue and the store buffer — conservative memory
-// ordering.
+// The load/store queue and the store buffer; together they carry the
+// memory-ordering rules.
 //
 // Memory ops allocate an LSQ entry at dispatch, in program order. The
 // AGU fills in the address (and, for stores, the data captured at
@@ -15,7 +15,7 @@
 //     to the store buffer, which drains to the data port in order.
 //
 // No memory-dependence speculation, no load reordering past unknown
-// store addresses — memory bugs must not be able to hide behind
+// store addresses; memory bugs must not be able to hide behind
 // renaming bugs while the out-of-order engine is being proven.
 
 #pragma once
@@ -44,8 +44,8 @@ struct LsqEntry {
   bool done = false; // loads: value produced (forwarded or from cache)
   bool issued = false;   // loads: access in flight at the cache
   bool reported = false; // loads: handed to the writeback arbiter
-  uint16_t gen = 0;      // slot generation, embedded in the access tag —
-                         // a squashed load's response fails the match
+  uint16_t gen = 0;      // slot generation, embedded in the access tag
+                         // so a squashed load's response fails the match
   uint32_t value = 0;
 };
 

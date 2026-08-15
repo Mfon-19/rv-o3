@@ -1,4 +1,4 @@
-# Directed cache test: hit, miss, dirty eviction, writeback, refill —
+# Directed cache test: hit, miss, dirty eviction, writeback, refill;
 # against the default hierarchy (32 KiB 8-way L1D, 64-byte lines, so 64
 # sets and a 4096-byte stride between addresses that share a set).
 #
@@ -6,7 +6,7 @@
 # 0x9000. All nine map to L1D set 0; the set holds 8 ways, so the ninth
 # store evicts the least-recently-used line (0x1000, dirty) and writes
 # it back to L2. Loading 0x1000 afterwards misses and refills the line
-# from L2 — printing 42 proves the dirty data survived the round trip.
+# from L2; printing 42 proves the dirty data survived the round trip.
 # Loading 0x9000 hits (still resident) and prints 50.
 # Expected output: 42 then 50, exit 0.
 000010B7   # lui  x1, 0x1         x1 = 0x1000, walking store pointer

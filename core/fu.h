@@ -11,8 +11,8 @@
 //      1 x divider       latency 12+, non-pipelined (busy throughout)
 //      1 x AGU           latency 1; drains to the LSQ, not a WB port
 //
-// The result VALUE is computed by execute() at issue — semantics stay
-// in isa/ — a unit only delays the result's visibility. Every unit ends
+// The result VALUE is computed by execute() at issue (semantics stay
+// in isa/); a unit only delays the result's visibility. Every unit ends
 // in a one-entry output slot holding a completed op that has not yet
 // won a writeback port; an occupied slot backpressures the unit
 // (a pipelined unit's whole pipe holds, a non-pipelined unit stays

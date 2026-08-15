@@ -2,7 +2,7 @@
 //
 // A plain fetch-decode-execute-commit interpreter. One instruction at a
 // time, in program order, each fully completed before the next begins.
-// No pipeline, no latches, no forwarding, no stalls — nothing here can
+// No pipeline, no latches, no forwarding, no stalls; nothing here can
 // be subtly wrong about *when*, because there is no when. It answers
 // only what each instruction does to architectural state.
 //
@@ -57,7 +57,7 @@ public:
   uint32_t reg(int i) const { return regs[i]; }
 
 private:
-  // architectural state — this is all of it
+  // architectural state; this is all of it
   uint32_t regs[32];
   uint32_t pc = 0;
 

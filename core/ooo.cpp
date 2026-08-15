@@ -15,7 +15,9 @@ OoOCore::OoOCore(const SimConfig &cfg, MemorySystem &msys)
       alus(cfg.aluCount, FuUnit("alu", 1, true)), brUnit("br", 1, true),
       mulUnit("mul", cfg.mulLatency, cfg.mulPipelined),
       divUnit("div", cfg.divLatency, false), agu("agu", 1, true),
-      loadOuts(2), depTable(cfg.depTableSize, 0), trace(cfg.trace) {
+      loadOuts(cfg.width > 2 ? cfg.width : 2), depTable(cfg.depTableSize, 0),
+      trace(cfg.trace) {
+  fBytes = cfg.width * 4 > 8 ? cfg.width * 4 : 8;
   rmap.reset(); // arch reg i starts in physical reg i...
   for (uint32_t p = 32; p < cfg.physRegs; p++)
     freeList.push((uint8_t)p); // ...the rest are free
@@ -54,15 +56,50 @@ int OoOCore::run() {
           stats.dsRobFull, stats.dsIqFull, stats.dsLsqFull, stats.dsNoPreg,
           stats.dsSerialize, stats.dsFetchEmpty);
   fprintf(stderr, "--- rvsim: %" PRIu64 " branches, %" PRIu64
-          " mispredicted (%.1f%%), %" PRIu64 " flushes; avg issue %.2f"
-          "; wb-port holds %" PRIu64 "\n",
+          " mispredicted (%.1f%%, %.2f MPKI), %" PRIu64
+          " flushes; avg issue %.2f; wb-port holds %" PRIu64 "\n",
           stats.branches, stats.mispredicts,
           stats.branches ? 100.0 * (double)stats.mispredicts /
                                (double)stats.branches
                          : 0.0,
+          stats.retired ? 1000.0 * (double)stats.mispredicts /
+                              (double)stats.retired
+                        : 0.0,
           stats.flushes,
           stats.cycles ? (double)stats.issuedOps / (double)stats.cycles : 0.0,
           stats.wbConflicts);
+  fprintf(stderr, "--- rvsim: %" PRIu64 " dispatched, %" PRIu64
+          " wrong-path (%.1f%%); recovery loss %" PRIu64
+          " cycles; retire blocked on loads %" PRIu64 " cycles\n",
+          seqCtr, seqCtr - stats.retired,
+          seqCtr ? 100.0 * (double)(seqCtr - stats.retired) / (double)seqCtr
+                 : 0.0,
+          stats.recoveryLossCycles, stats.memRetireStallCycles);
+  const double occDiv = stats.cycles ? (double)stats.cycles : 1.0;
+  fprintf(stderr, "--- rvsim: occupancy: rob %.1f/%u, iq %.1f/%u, "
+          "lsq %.1f/%u, sb %.1f/%u, pregs %.1f/%u\n",
+          (double)stats.robOccSum / occDiv, cfg.robSize,
+          (double)stats.iqOccSum / occDiv, cfg.iqSize,
+          (double)stats.lsqOccSum / occDiv, cfg.lsqSize,
+          (double)stats.sbOccSum / occDiv, cfg.sbSize,
+          (double)stats.pregsUsedSum / occDiv, cfg.physRegs - 32);
+  fprintf(stderr, "--- rvsim: fu busy:");
+  auto fuLine = [&](const char *name, uint64_t busy, uint64_t ops) {
+    fprintf(stderr, " %s %.1f%% (%" PRIu64 " ops)", name,
+            stats.cycles ? 100.0 * (double)busy / (double)stats.cycles : 0.0,
+            ops);
+  };
+  uint64_t aluBusy = 0, aluOps = 0;
+  for (const FuUnit &u : alus) {
+    aluBusy += u.busyCycles;
+    aluOps += u.ops;
+  }
+  fuLine("alu", aluBusy, aluOps);
+  fuLine("br", brUnit.busyCycles, brUnit.ops);
+  fuLine("mul", mulUnit.busyCycles, mulUnit.ops);
+  fuLine("div", divUnit.busyCycles, divUnit.ops);
+  fuLine("agu", agu.busyCycles, agu.ops);
+  fputc('\n', stderr);
   fprintf(stderr, "--- rvsim: %" PRIu64 " loads forwarded from stores, %"
           PRIu64 " speculative loads, %" PRIu64 " replays, %" PRIu64
           " store-buffer commit stalls\n",
@@ -87,7 +124,7 @@ void OoOCore::dumpRegs() const {
 }
 
 // Commit: up to width instructions per cycle from the ROB head, in
-// program order — the only place architectural state changes
+// program order; this is the only place architectural state changes
 void OoOCore::commitStage() {
   uint32_t done = 0;
   while (done < cfg.width && !rob.empty() && rob.head().done && !halted) {
@@ -122,7 +159,7 @@ void OoOCore::commitStage() {
         break;
       case Op::EBREAK:
         stats.retired++;
-        fprintf(stderr, "ebreak at pc=0x%08x — halting\n", e.pc);
+        fprintf(stderr, "ebreak at pc=0x%08x; halting\n", e.pc);
         halted = true;
         break;
       case Op::ILLEGAL:
@@ -187,13 +224,20 @@ void OoOCore::commitStage() {
     rob.popHead();
     done++;
   }
+  // Attribution: nothing committed and the machine's oldest work is a
+  // load still waiting on the cache, so this cycle is memory's fault
+  if (done == 0 && !halted && !rob.empty() && !rob.head().done &&
+      rob.head().isMem && isLoad(rob.head().ins.op) && !lsq.empty() &&
+      !lsq.head().done)
+    stats.memRetireStallCycles++;
 }
 
-// Writeback: oldest-first over the units' output slots plus the load
-// completion slot, up to wbPorts per cycle. Winners write the physical
-// register file, wake the issue queue, and mark their ROB entry done.
-// Branches resolve here — a mispredict triggers recovery and stops the
-// (younger) rest of the cycle's writebacks, whose slots are flushed
+// Writeback: oldest first over the units' output slots plus the load
+// completion slots, up to wbPorts per cycle. Winners write the
+// physical register file, wake the issue queue, and mark their ROB
+// entry done. Branches resolve here; a mispredict triggers recovery
+// and stops the rest of the cycle's (younger) writebacks, whose slots
+// are flushed
 void OoOCore::writebackStage() {
   std::vector<FuOp *> cands;
   for (FuUnit &u : alus)
@@ -251,9 +295,9 @@ void OoOCore::writebackStage() {
 }
 
 // Squash everything younger than seq: issue queue, functional units,
-// in-flight load, LSQ tail, and the ROB tail — walking youngest-first
-// so each entry restores the mapping it displaced and returns its
-// physical register. The frontend queue empties too; the pc itself is
+// loads in flight, LSQ tail, and the ROB tail. The walk goes from
+// youngest to oldest so each entry restores the mapping it displaced
+// and returns its physical register. The frontend queue empties too; the pc itself is
 // steered at the clock edge like every redirect
 void OoOCore::recover(uint64_t seq) {
   stats.flushes++;
@@ -285,6 +329,10 @@ void OoOCore::recover(uint64_t seq) {
   // would land wrong-path words in the queue we just cleared
   if (fOutstanding)
     fStale = true;
+  // Attribution: everything from here until dispatch resumes is the
+  // price of this flush (a newer flush restarts the clock)
+  recTimerArmed = true;
+  recTimerStart = stats.cycles;
 }
 
 // The AGU's output feeds the LSQ, not a writeback port: fill in the
@@ -353,9 +401,9 @@ void OoOCore::violationScan(const LsqEntry &store) {
   pendTarget = vpc;
 }
 
-// L1D completions: loads match through their {slot, generation} tag —
-// a mismatch means the load was squashed and the response just dies —
-// and store acks mark their store-buffer entry
+// L1D completions. Loads match through their {slot, generation} tag;
+// a mismatch means the load was squashed and the response just dies.
+// Store acknowledgements mark their store-buffer entry
 void OoOCore::drainDataResponses() {
   while (dmem->hasResponse()) {
     MemResponse r = dmem->response();
@@ -427,8 +475,8 @@ void OoOCore::lsqOperate() {
     }
   }
 
-  // Find the oldest load allowed to execute this cycle. Walking
-  // oldest-first, an older store with an unknown address is a wall in
+  // Find the oldest load allowed to execute this cycle. Walking from
+  // the oldest, an older store with an unknown address is a wall in
   // Conservative and Bypass modes (and, in Speculative mode, for
   // loads the dependence predictor has flagged); Speculative mode
   // walks straight past it and pays with a replay when wrong
@@ -462,7 +510,7 @@ void OoOCore::lsqOperate() {
         (cfg.depPredictor && depTable[(le.pc >> 2) % depTable.size()] >= 2);
     if (wall && cautious)
       continue;
-    // Scan older stores newest-first: LSQ entries before k, then the
+    // Scan older stores from the newest: LSQ entries before k, then the
     // store buffer (all committed, hence older). The nearest older
     // store to a matching address decides; a partial overlap waits
     bool blocked = false, forwarded = false;
@@ -561,7 +609,7 @@ void OoOCore::lsqOperate() {
 
 // Issue: oldest-ready-first from the issue queue, up to width per
 // cycle, gated on functional-unit availability. Operand values come
-// from the physical register file — writeback ran earlier this cycle,
+// from the physical register file; writeback ran earlier this cycle,
 // so a ready bit set today is readable today
 void OoOCore::issueStage() {
   std::vector<IqEntry *> ready;
@@ -626,7 +674,7 @@ void OoOCore::issueStage() {
   }
 }
 
-// Dispatch: up to width per cycle, in program order — decode, rename,
+// Dispatch: up to width per cycle, in program order: decode, rename,
 // allocate ROB (and LSQ) entries, drop into the issue queue. Any
 // missing resource stalls this instruction and everything younger
 void OoOCore::dispatchStage() {
@@ -649,6 +697,10 @@ void OoOCore::dispatchStage() {
             events.push_back("serialize wait");
         }
         return;
+      }
+      if (recTimerArmed) { // dispatch resumed: close the flush window
+        stats.recoveryLossCycles += stats.cycles - recTimerStart;
+        recTimerArmed = false;
       }
       fetchQ.pop_front();
       RobEntry &e = rob.at(rob.alloc());
@@ -686,6 +738,10 @@ void OoOCore::dispatchStage() {
       return;
     }
 
+    if (recTimerArmed) { // dispatch resumed: close the flush window
+      stats.recoveryLossCycles += stats.cycles - recTimerStart;
+      recTimerArmed = false;
+    }
     fetchQ.pop_front();
     const uint64_t seq = seqCtr++;
     const uint32_t robIdx = rob.alloc();
@@ -698,8 +754,8 @@ void OoOCore::dispatchStage() {
     // rewind the speculative GHR to before the squashed branches
     e.ghrBefore = f.ghrBefore;
 
-    // Sources rename through the CURRENT map — including updates made
-    // by the older instruction dispatched this same cycle — and before
+    // Sources rename through the CURRENT map, including updates made
+    // by the older instruction dispatched this same cycle, and before
     // the destination displaces anything (rs may equal rd)
     const uint8_t ps1 = rmap.map[I.rs1];
     const uint8_t ps2 = rmap.map[I.rs2];
@@ -747,16 +803,18 @@ void OoOCore::dispatchStage() {
     q->ps1 = ps1;
     q->ps2 = ps2;
     q->ready1 = !usesRs1(I.op) || prf.ready[ps1];
-    // Stores don't wait for their data to issue — only the address
-    // operand gates them; the LSQ captures the data when it appears
+    // Stores don't wait for their data to issue; only the address
+    // operand gates them, and the LSQ captures the data when it
+    // appears
     q->ready2 = !usesRs2(I.op) || isStore(I.op) || prf.ready[ps2];
     note(vDS, I);
   }
 }
 
-// Fetch: an aligned 8-byte pair per cycle, steered by the predictor.
-// pc advances when the pair arrives (the predictor may redirect it
-// mid-pair); a squash marks the in-flight fetch stale
+// Fetch: an aligned block of width instructions (minimum an 8-byte
+// pair) per cycle, steered by the predictor. pc advances when the
+// block arrives (the predictor may redirect it mid-block); a squash
+// marks the in-flight fetch stale
 void OoOCore::fetchStage() {
   if (fOutstanding && imem->hasResponse()) {
     MemResponse r = imem->response();
@@ -767,18 +825,18 @@ void OoOCore::fetchStage() {
       processFetch(r);
   }
   if (!fOutstanding && !pendRedirect &&
-      fetchQ.size() + 2 <= (size_t)cfg.fetchQSize) {
+      fetchQ.size() + fBytes / 4 <= (size_t)cfg.fetchQSize) {
     if (pc % 4 != 0) {
       fprintf(stderr, "fatal: misaligned fetch at pc=0x%8x\n", pc);
       exit(1);
     }
     if (imem->canAccept()) {
       MemRequest req;
-      req.addr = pc & ~7u;
-      req.size = 8;
+      req.addr = pc & ~(fBytes - 1);
+      req.size = fBytes;
       imem->access(req);
       fOutstanding = true;
-      fBlock = pc & ~7u;
+      fBlock = req.addr;
       fFetchPc = pc;
       if (imem->hasResponse()) { // 1-cycle port: complete this cycle
         MemResponse r = imem->response();
@@ -792,24 +850,23 @@ void OoOCore::fetchStage() {
 }
 
 void OoOCore::processFetch(const MemResponse &r) {
-  uint32_t w[2];
-  for (int i = 0; i < 2; i++)
-    w[i] = (uint32_t)r.rline[i * 4] | (uint32_t)r.rline[i * 4 + 1] << 8 |
-           (uint32_t)r.rline[i * 4 + 2] << 16 |
-           (uint32_t)r.rline[i * 4 + 3] << 24;
-  for (uint32_t idx = (fFetchPc - fBlock) / 4; idx < 2; idx++) {
+  for (uint32_t idx = (fFetchPc - fBlock) / 4; idx < fBytes / 4; idx++) {
+    const uint32_t raw = (uint32_t)r.rline[idx * 4] |
+                         (uint32_t)r.rline[idx * 4 + 1] << 8 |
+                         (uint32_t)r.rline[idx * 4 + 2] << 16 |
+                         (uint32_t)r.rline[idx * 4 + 3] << 24;
     const uint32_t wpc = fBlock + idx * 4;
     Predictor::Pred p;
     if (cfg.usePredictor)
       p = pred.predict(wpc);
     fetchQ.push_back(
-        Fetched{wpc, w[idx], p.taken, p.target, p.phtIdx, p.ghrBefore});
+        Fetched{wpc, raw, p.taken, p.target, p.phtIdx, p.ghrBefore});
     if (p.taken) {
       pc = p.target;
       return;
     }
   }
-  pc = fBlock + 8;
+  pc = fBlock + fBytes;
 }
 
 void OoOCore::tickUnits() {
@@ -822,7 +879,7 @@ void OoOCore::tickUnits() {
 }
 
 // Minimal syscall interface (a7 = number, a0 = argument), acting on
-// the architectural values captured at dispatch — the machine was
+// the architectural values captured at dispatch; the machine was
 // drained, so they are final
 void OoOCore::doSyscall(const RobEntry &e) {
   const uint32_t num = prf.val[e.sysA7];
@@ -837,6 +894,9 @@ void OoOCore::doSyscall(const RobEntry &e) {
   case 3:
     for (uint32_t a = arg; msys.peek8(a) != 0; a++)
       putchar(msys.peek8(a));
+    break;
+  case 4: // print a0 as 8 hex digits (architectural-test signatures)
+    printf("%08x\n", arg);
     break;
   case 10:
   case 93:
@@ -855,6 +915,12 @@ void OoOCore::doSyscall(const RobEntry &e) {
 // the clock edge, units and memory ticking last
 void OoOCore::stepCycle() {
   stats.cycles++;
+  // start-of-cycle occupancy sampling (averages in the final report)
+  stats.robOccSum += rob.count();
+  stats.iqOccSum += iq.count();
+  stats.lsqOccSum += lsq.count();
+  stats.sbOccSum += sb.count();
+  stats.pregsUsedSum += (cfg.physRegs - 32) - freeList.count();
   events.clear();
   vDS = vIS = vWB = vCT = "";
   if (trace)

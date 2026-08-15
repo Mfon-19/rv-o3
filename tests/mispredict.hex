@@ -1,6 +1,6 @@
 # Directed OoO test: mispredict recovery under register reuse. The
 # beq depends on the parity of a multiplicative sequence, which
-# alternates — the worst case for a bimodal counter, so roughly every
+# alternates, the worst case for a bimodal counter, so roughly every
 # other iteration flushes: rename-map restoration and physical-
 # register reclaim run constantly while x1/x3/x4 are re-renamed every
 # iteration. Any leak or misrestore corrupts the count.

@@ -32,6 +32,13 @@ struct Stats {
   uint64_t fetchStallCycles = 0; // cycles dispatch had nothing fetched
   uint64_t dataStallCycles = 0;  // cycles the LSQ waited on the data port
 
+  // Per-cycle occupancy sums, divided by cycles at print time
+  uint64_t robOccSum = 0, iqOccSum = 0, lsqOccSum = 0, sbOccSum = 0;
+  uint64_t pregsUsedSum = 0; // physical registers held by in-flight dests
+  // Attribution (definitions in doc/phase-5-validation.md):
+  uint64_t recoveryLossCycles = 0;    // recover() -> next successful dispatch
+  uint64_t memRetireStallCycles = 0;  // commit blocked on an unfinished load
+
   void printMemStalls() const {
     fprintf(stderr, "--- rvsim: %" PRIu64 " ifetch stall cycles, %" PRIu64
             " data stall cycles\n",

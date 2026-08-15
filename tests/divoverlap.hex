@@ -1,6 +1,6 @@
 # Directed FU test: independent ALU work overlapping a divide.
 # The three addi's don't touch the divide's registers, so they issue
-# and retire while the divider grinds — the whole point of splitting
+# and retire while the divider grinds; that is the whole point of splitting
 # EX into units. The add then waits for the quotient (raw stall).
 # Expected output: 45, exit 0.
 05400093   # addi x1, x0, 84

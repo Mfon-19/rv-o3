@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 #include "core/ooo.h"
 #include "core/refmodel.h"
@@ -29,8 +30,11 @@ static void usage(const char *argv0) {
           "                instruction\n"
           "  -c <cycles>   cycle budget (default 10000000)\n"
           "  -m <bytes>    memory size (default 1 MiB)\n"
-          "The memory hierarchy (32K 8-way L1I/L1D, 256K 8-way L2, 64 B\n"
-          "lines, 30-cycle DRAM) is fixed; see SimConfig in sim/config.h.\n"
+          "  -C <file>     load configuration ('key = value' lines, # comments)\n"
+          "  -O key=value  override one knob (repeatable; applied after -C)\n"
+          "  -p            print the effective configuration and exit\n"
+          "Defaults are the shipped machine (see SimConfig in sim/config.h);\n"
+          "rvsim -p lists every knob.\n"
           "Hex format: whitespace-separated 32-bit hex words, '#' comments.\n",
           argv0);
 }
@@ -75,6 +79,9 @@ static bool sameCommit(const CommitRecord &a, const CommitRecord &b) {
 int main(int argc, char **argv) {
   SimConfig cfg;
   const char *file = nullptr;
+  const char *cfgFile = nullptr;
+  std::vector<const char *> overrides;
+  bool printConfig = false;
 
   auto numArg = [&](int &i) -> uint64_t {
     return strtoull(argv[++i], nullptr, 0);
@@ -93,6 +100,12 @@ int main(int argc, char **argv) {
       cfg.maxCycles = numArg(i);
     else if (!strcmp(argv[i], "-m") && i + 1 < argc)
       cfg.memBytes = numArg(i);
+    else if (!strcmp(argv[i], "-C") && i + 1 < argc)
+      cfgFile = argv[++i];
+    else if (!strcmp(argv[i], "-O") && i + 1 < argc)
+      overrides.push_back(argv[++i]);
+    else if (!strcmp(argv[i], "-p"))
+      printConfig = true;
     else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
       usage(argv[0]);
       return 0;
@@ -101,6 +114,17 @@ int main(int argc, char **argv) {
       return 1;
     } else
       file = argv[i];
+  }
+
+  // Precedence: defaults, then the file, then -O overrides in order
+  if (cfgFile)
+    loadConfigFile(cfg, cfgFile);
+  for (const char *kv : overrides)
+    applyConfigOverride(cfg, kv);
+  validateConfig(cfg);
+  if (printConfig) {
+    dumpConfig(cfg, stdout);
+    return 0;
   }
 
   if (!file) {
@@ -175,8 +199,8 @@ int main(int argc, char **argv) {
     // everything once results complete out of order: a WAW violation
     // produces per-instruction records that are all individually
     // correct while the stale result lands in the register file last.
-    // So the settled state is compared too (memory through peek8 —
-    // the newest copy of a byte may still be in a cache)
+    // So the settled state is compared too; memory is read through
+    // peek8, since the newest copy of a byte may still be in a cache
     for (int r = 0; r < 32; r++) {
       if (core.reg(r) != ref.reg(r)) {
         fprintf(stderr,

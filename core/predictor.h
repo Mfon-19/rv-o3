@@ -2,7 +2,7 @@
 // buffer, and a return-address stack.
 //
 // At fetch, each instruction address is looked up in the BTB. A miss
-// predicts not-taken (fall through) — the BTB is what tells fetch
+// predicts not-taken (fall through); the BTB is what tells fetch
 // both that this IS a control instruction and where it goes, before
 // decode. On a hit, the entry's kind decides: unconditional jumps and
 // calls are taken; returns pop the RAS; conditional branches consult
@@ -15,8 +15,8 @@
 // iteration to iteration. Every prediction carries the pre-shift
 // history and its table index; a mispredicting branch restores from
 // that snapshot (with the actual outcome shifted in), and training at
-// commit uses the carried index — predict and train always touch the
-// same counter. The RAS is speculative too, without repair: a squash
+// commit uses the carried index, so predict and train always touch
+// the same counter. The RAS is speculative too, without repair: a squash
 // can corrupt it, which costs only extra mispredicts.
 
 #pragma once

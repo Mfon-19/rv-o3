@@ -26,7 +26,7 @@
 //        Values are read from the physical register file at issue;
 //        execute() computes results immediately and the units delay
 //        their visibility
-//      - Writeback (2 ports, oldest-first arbitration): writes the
+//      - Writeback (2 ports, arbitration favors the oldest): writes the
 //        physical register, broadcasts the register number to wake the
 //        issue queue, marks the ROB entry done. Branches resolve here:
 //        a mispredict flushes everything younger and restores the
@@ -36,7 +36,7 @@
 //        state changes. Displaced mappings are freed, stores are
 //        released to the store buffer, syscalls/traps take effect,
 //        the predictor trains. Faults detected on the wrong path are
-//        carried to commit and only then become fatal — the machine
+//        carried to commit and only then become fatal; the machine
 //        is precise at every instruction boundary
 //      - Memory (conservative, core/lsq.h): loads wait for all older
 //        store addresses; exact-match stores forward; stores write the
@@ -49,9 +49,9 @@
 //      writeback, LSQ, issue, dispatch, fetch), so each consumes what
 //      the stage behind it produced in an earlier cycle; units tick
 //      at the clock edge, and
-//      writeback-before-issue makes a value written back in cycle N
-//      issueable in cycle N — the wakeup path needs no forwarding
-//      network.
+//      because writeback runs before issue, a value written back in
+//      cycle N is issueable in cycle N; the wakeup path needs no
+//      forwarding network.
 
 #pragma once
 
@@ -88,7 +88,7 @@ public:
   void dumpRegs() const;
 
   // The architectural value of register i, read through the rename
-  // map — the differential checker compares final state with this
+  // map; the differential checker compares final state with this
   uint32_t reg(int i) const { return prf.val[rmap.map[i]]; }
 
   // Called once per committed instruction with its CommitRecord, in
@@ -121,7 +121,8 @@ private:
   FuUnit agu; // address generation; drains to the LSQ, not a WB port
 
   // fetch state
-  uint32_t pc = 0; // next address fetch will request
+  uint32_t pc = 0;     // next address fetch will request
+  uint32_t fBytes = 8; // aligned fetch-block size: max(8, width*4)
   struct Fetched {
     uint32_t pc = 0, raw = 0;
     bool predTaken = false;
@@ -146,6 +147,8 @@ private:
   uint64_t seqCtr = 0;
   bool pendRedirect = false;
   uint32_t pendTarget = 0;
+  bool recTimerArmed = false; // attributes cycles lost to recovery:
+  uint64_t recTimerStart = 0; // recover() to the next real dispatch
   bool halted = false;
   int exitCode = 0;
   bool trace;

@@ -2,7 +2,7 @@
 //
 // Every level of the hierarchy (caches, DRAM) implements MemPort. The
 // interface is nonblocking and TAGGED: a requester may have several
-// transactions in flight, and completions can come back in any order —
+// transactions in flight, and completions can come back in any order;
 // a miss overtakes nothing, a hit overtakes a miss. Each request
 // carries a `tag` chosen by the requester (echoed verbatim in the
 // response) so completions can be matched to whoever asked, and a

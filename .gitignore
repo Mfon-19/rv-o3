@@ -43,3 +43,7 @@
 # OS metadata
 .DS_Store
 Thumbs.db
+bench/*.o
+bench/*.elf
+bench/*.bin
+bench/*.host

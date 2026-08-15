@@ -1,6 +1,6 @@
 # Directed memory test: speculative load replay. The second store's
 # address hides behind a divide and turns out to ALIAS the younger
-# load's address. In Speculative mode the load doesn't wait — it reads
+# load's address. In Speculative mode the load doesn't wait; it reads
 # the parked 55, and when the store's address resolves the ordering
 # violation is detected: the load and everything younger flush and
 # refetch (1 replay in the stats), re-reading 99 by forwarding. In the
