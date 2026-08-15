@@ -232,12 +232,13 @@ void OoOCore::commitStage() {
     stats.memRetireStallCycles++;
 }
 
-// Writeback: oldest first over the units' output slots plus the load
-// completion slots, up to wbPorts per cycle. Winners write the
-// physical register file, wake the issue queue, and mark their ROB
-// entry done. Branches resolve here; a mispredict triggers recovery
-// and stops the rest of the cycle's (younger) writebacks, whose slots
-// are flushed
+// Writeback: up to wbPorts results per cycle, taken oldest first from
+// the units' output slots plus the load completion slots. Each winner
+// writes the physical register file, announces its register so
+// instructions waiting on it become ready, and marks its ROB entry
+// done. A branch is checked against its prediction here, the moment
+// its real outcome exists; a wrong prediction triggers recovery,
+// which also flushes the rest of this cycle's (younger) writebacks
 void OoOCore::writebackStage() {
   std::vector<FuOp *> cands;
   for (FuUnit &u : alus)
@@ -431,10 +432,11 @@ void OoOCore::drainDataResponses() {
 }
 
 // The memory engine. Several loads and committed stores can be in
-// flight at the L1D at once (MSHRs below absorb the misses); one new
-// access starts per cycle. Load eligibility depends on the memory-
-// ordering mode; committed stores stream from the store buffer, which
-// takes priority only when full (it backpressures commit)
+// flight at the L1D at once (the cache's MSHRs absorb the misses);
+// one new access starts per cycle. Which loads may go depends on the
+// memory-ordering mode; committed stores stream from the store
+// buffer, which gets priority only when full, because a full store
+// buffer stalls commit and must always be able to drain
 void OoOCore::lsqOperate() {
   drainDataResponses();
   while (!sb.empty() && sb.head().acked)
@@ -607,10 +609,11 @@ void OoOCore::lsqOperate() {
   }
 }
 
-// Issue: oldest-ready-first from the issue queue, up to width per
-// cycle, gated on functional-unit availability. Operand values come
-// from the physical register file; writeback ran earlier this cycle,
-// so a ready bit set today is readable today
+// Issue: up to width instructions per cycle leave the issue queue,
+// oldest first among those whose operands are ready and whose
+// functional unit can accept. Operand values come from the physical
+// register file; writeback ran earlier this cycle, so a ready bit set
+// today is readable today
 void OoOCore::issueStage() {
   std::vector<IqEntry *> ready;
   for (IqEntry &q : iq.e)
@@ -649,7 +652,7 @@ void OoOCore::issueStage() {
       break;
     }
     if (!unit)
-      continue; // structural: try a younger ready op
+      continue; // the unit is busy; try a younger ready op instead
 
     const uint32_t a = usesRs1(I.op) ? prf.val[q->ps1] : 0;
     const uint32_t b = usesRs2(I.op) ? prf.val[q->ps2] : 0;
@@ -688,8 +691,9 @@ void OoOCore::dispatchStage() {
     const Instr I = decode(f.raw);
 
     if (fuKindOf(I.op) == FuKind::NONE) {
-      // System ops serialize: alone, into an empty machine (all older
-      // work committed AND drained), taking effect at commit
+      // System ops wait for the machine to empty completely (all
+      // older work committed AND the store buffer drained), then run
+      // alone and take effect at commit
       if (w != 0 || !rob.empty() || !sb.empty()) {
         if (w == 0) {
           stats.dsSerialize++;

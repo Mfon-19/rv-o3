@@ -1,9 +1,9 @@
 # hazards.hex: a gauntlet of data hazards; prints 84 and exits with code 0.
-# Exercises:
-#   * EX/MEM -> EX forwarding      (addi feeding the sw address base)
-#   * load-use interlock           (lw t3 immediately used by add)
-#   * MEM/WB -> MEM store-data fwd (lw t5 immediately stored by sw)
-# Data lives at 4096 (0x1000), well clear of the code at 0.
+# Exercises back-to-back dependent instructions, a load whose value is
+# needed immediately by the next instruction, and a loaded value that
+# is immediately stored again (the store must pick up the load's data,
+# not a stale register). Data lives at 4096 (0x1000), well clear of
+# the code at 0.
 # Run with -t to watch the stall and the forwards happen.
 
 00001137   # 0x00  lui  sp, 0x1        ; sp = 0x1000, data area

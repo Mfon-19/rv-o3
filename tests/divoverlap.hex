@@ -1,7 +1,8 @@
 # Directed FU test: independent ALU work overlapping a divide.
 # The three addi's don't touch the divide's registers, so they issue
-# and retire while the divider grinds; that is the whole point of splitting
-# EX into units. The add then waits for the quotient (raw stall).
+# and finish while the divider grinds through its 12 cycles; a long
+# operation only holds up work that needs its result. The final add
+# does need the quotient, so it alone waits.
 # Expected output: 45, exit 0.
 05400093   # addi x1, x0, 84
 00200113   # addi x2, x0, 2

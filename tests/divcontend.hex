@@ -1,9 +1,10 @@
-# Directed FU test: functional-unit contention and WAW blocking.
-# The divider is non-pipelined: the second divu stalls at issue
-# (structural hazard) until the first one's quotient drains. Then a
-# div into x8 immediately overwritten by "addi x8, x0, 7" forces the
-# WAW interlock: the addi must wait for the divide's writeback or the
-# register file would end up holding the stale quotient.
+# Directed FU test: divider contention, and two writers of one
+# register. The divider is non-pipelined, so the second divu must
+# wait at issue until the first one's quotient comes out. Then a div
+# into x8 is immediately overwritten by "addi x8, x0, 7": both write
+# x8 while the divide is still running, and renaming must keep them
+# apart so the final value of x8 is 7, not the divide's quotient
+# landing afterwards.
 # Expected output: 30 then 7, exit 0.
 06400093   # addi x1, x0, 100
 00400113   # addi x2, x0, 4

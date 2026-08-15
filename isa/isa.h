@@ -3,7 +3,8 @@
 // ==============================================================
 //
 // RV32I base integer ISA plus the M extension for mul/div, little-endian.
-// FENCE is executed as a NOP, ECALL provides a tiny syscall interface so
+// FENCE has nothing to order on a single core and executes as a
+// serializing no-op, ECALL provides a tiny syscall interface so
 // programs can print and exit, EBREAK stops the simulation.
 //
 // Everything in isa/ is timing-free: pure decode, pure execute semantics,
@@ -79,7 +80,7 @@ inline bool isStore(Op op) { return op >= Op::SB && op <= Op::SW; }
 
 inline bool isBranch(Op op) { return op >= Op::BEQ && op <= Op::BGEU; }
 
-// Does this instruction write a destination register in WB?
+// Does this instruction write a destination register when it completes?
 inline bool writesRd(Op op) {
   if (isBranch(op) || isStore(op))
     return false;
@@ -118,9 +119,9 @@ inline bool usesRs2(Op op) {
   return isBranch(op) || isStore(op) || (op >= Op::ADD && op <= Op::REMU);
 }
 
-// Which functional unit executes each op. System ops (fence,
-// ecall, ebreak, illegal) need no unit: they serialize the machine and
-// take effect at retirement
+// Which functional unit executes each op. System ops (fence, ecall,
+// ebreak, illegal) need no unit: they wait for the machine to empty,
+// run alone, and take effect at retirement
 enum class FuKind : uint8_t { ALU, BRANCH, MUL, DIV, LSU, NONE };
 
 inline FuKind fuKindOf(Op op) {

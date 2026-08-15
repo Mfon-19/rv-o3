@@ -33,7 +33,8 @@ struct SimConfig {
   bool trace = false;              // -t: pipeline trace, one line per cycle
   bool dumpRegs = false;           // -r: register dump at the end
   bool refModel = false;           // -f: run the functional reference model
-  bool diffCheck = false;          // -d: lockstep pipeline-vs-reference check
+  bool diffCheck = false;          // -d: run the reference model alongside
+                                   // and compare every retired instruction
 
   // Memory hierarchy. Deliberately not exposed on the CLI; these are
   // the fixed defaults until a proper configuration interface exists
@@ -65,9 +66,11 @@ struct SimConfig {
                              // explicit values allow pressure studies
   uint32_t fetchQSize = 8;   // fetched instructions waiting to dispatch
   bool usePredictor = true;  // false: static not-taken (bring-up mode)
-  MemOrder memOrder = MemOrder::Speculative; // load aggressiveness
-  bool depPredictor = false; // remember conflicting loads, issue them
-  uint32_t depTableSize = 64; // conservatively (Speculative mode only)
+  MemOrder memOrder = MemOrder::Speculative; // how far loads may run
+                             // ahead of older stores (see enum above)
+  bool depPredictor = false; // remember loads that caused replays and
+                             // make them wait next time (Speculative
+  uint32_t depTableSize = 64; // mode only)
   uint32_t phtBits = 10;     // gshare: 2^10 two-bit counters
   uint32_t ghrBits = 0;      // history bits; 0 = plain bimodal (these
                              // kernels end before history would warm up)

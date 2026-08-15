@@ -14,9 +14,10 @@
 // The result VALUE is computed by execute() at issue (semantics stay
 // in isa/); a unit only delays the result's visibility. Every unit ends
 // in a one-entry output slot holding a completed op that has not yet
-// won a writeback port; an occupied slot backpressures the unit
-// (a pipelined unit's whole pipe holds, a non-pipelined unit stays
-// busy), which is how limited writeback bandwidth propagates upstream.
+// won a writeback port. While that slot is occupied the unit cannot
+// finish its next op (a pipelined unit's whole pipe holds, a
+// non-pipelined unit stays busy), which is how a shortage of
+// writeback ports slows everything upstream of it.
 
 #pragma once
 
@@ -38,8 +39,9 @@ struct FuOp {
   uint32_t value = 0;    // result / effective address (memory ops)
   uint8_t pdst = kNoReg; // physical destination register
   uint32_t lsqIdx = 0;   // memory ops: the LSQ entry to fill at AGU drain
-  bool redirect = false; // branches: the RESOLVED direction and target,
-  uint32_t target = 0;   // compared against the prediction at writeback
+  bool redirect = false; // branches: the true direction and target,
+  uint32_t target = 0;   // computed at issue; writeback compares them
+                         // against what fetch predicted
 };
 
 // A fixed-latency unit, pipelined or not. Pipelined: a shift register
@@ -84,9 +86,10 @@ struct FuUnit {
     }
   }
 
-  // Clock edge: advance one cycle. A blocked output slot freezes a
-  // pipelined unit entirely (no internal compression), and keeps a
-  // non-pipelined unit's completion parked in the unit
+  // Clock edge: advance one cycle. While the output slot is occupied
+  // a pipelined unit freezes entirely (nothing shifts, bubbles
+  // included), and a non-pipelined unit keeps its finished result
+  // parked inside
   void tick() {
     if (busy())
       busyCycles++;

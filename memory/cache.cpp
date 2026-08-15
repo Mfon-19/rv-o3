@@ -5,7 +5,8 @@
 #include <cstring>
 
 // Tag values for this cache's own traffic to the level below
-static constexpr uint64_t kWbTag = UINT64_MAX; // fire-and-forget ack
+static constexpr uint64_t kWbTag = UINT64_MAX; // writeback; the reply
+                                               // will just be dropped
 
 Cache::Cache(const char *name, const CacheConfig &cfg, MemPort *below,
              uint8_t srcId)
@@ -176,8 +177,8 @@ void Cache::access(const MemRequest &req) {
     // overwritten, so install directly with no refill; UNLESS a
     // refill for this very line is already in flight (the other L1
     // wants it), because installing now would later be overwritten
-    // by the stale refill. Join the MSHR instead; replay applies this write over
-    // the refilled line in arrival order
+    // by the stale refill. Join the MSHR's waiting list instead; the
+    // install will apply this write over the refilled line
     const int inflight = mshrFor(lineAddr);
     if (inflight >= 0) {
       stats.mergedMisses++;
@@ -215,9 +216,9 @@ void Cache::access(const MemRequest &req) {
   m.waiting.push_back(Waiting{req, tickCount});
 }
 
-// A refill has arrived: claim a way, install the line, and replay the
-// whole waiting list in arrival order. False if the victim couldn't be
-// evicted yet (writeback queue full)
+// A refill has arrived: claim a way, install the line, and re-apply
+// every request that was waiting for it, in arrival order. Returns
+// false if the victim couldn't be evicted yet (writeback queue full)
 bool Cache::tryInstall(uint32_t mshrIdx, const std::vector<uint8_t> &line) {
   Mshr &m = mshrs[mshrIdx];
   uint32_t set, way;
@@ -239,7 +240,7 @@ bool Cache::tryInstall(uint32_t mshrIdx, const std::vector<uint8_t> &line) {
 
 void Cache::deliverBelowResponse(const MemResponse &r) {
   if (r.tag == kWbTag)
-    return; // writeback ack: fire-and-forget
+    return; // a writeback acknowledgement; nothing waits for it
   if (!tryInstall((uint32_t)r.tag, r.rline))
     pendingInstalls.push_back(PendingInstall{(uint32_t)r.tag, r.rline});
 }

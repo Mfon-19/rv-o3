@@ -21,16 +21,20 @@ struct Stats {
   uint64_t dsRobFull = 0, dsIqFull = 0, dsLsqFull = 0, dsNoPreg = 0,
            dsSerialize = 0, dsFetchEmpty = 0;
 
-  uint64_t branches = 0, mispredicts = 0; // committed / of those, wrong
-  uint64_t flushes = 0;                   // recovery events
-  uint64_t wbConflicts = 0; // completions held a cycle by port arbitration
-  uint64_t loadsForwarded = 0;   // store->load forwards
-  uint64_t specLoads = 0;        // loads issued past unknown store addrs
-  uint64_t loadReplays = 0;      // ordering violations, flush-and-refetch
-  uint64_t sbCommitStalls = 0;   // store-buffer-full commit stalls
-  uint64_t issuedOps = 0;        // total ops issued (avg issue width)
+  uint64_t branches = 0;    // branches committed...
+  uint64_t mispredicts = 0; // ...and how many of them were predicted wrong
+  uint64_t flushes = 0;     // recoveries (mispredicts plus load replays)
+  uint64_t wbConflicts = 0; // finished results that waited a cycle because
+                            // every writeback port was already taken
+  uint64_t loadsForwarded = 0; // loads served directly by an older store
+  uint64_t specLoads = 0;      // loads that ran ahead of an older store
+                               // whose address was not known yet
+  uint64_t loadReplays = 0;    // such guesses that were wrong: the load
+                               // was flushed and re-executed
+  uint64_t sbCommitStalls = 0; // cycles commit stalled on a full store buffer
+  uint64_t issuedOps = 0;      // total ops issued (for average issue width)
   uint64_t fetchStallCycles = 0; // cycles dispatch had nothing fetched
-  uint64_t dataStallCycles = 0;  // cycles the LSQ waited on the data port
+  uint64_t dataStallCycles = 0;  // cycles some load waited on the cache
 
   // Per-cycle occupancy sums, divided by cycles at print time
   uint64_t robOccSum = 0, iqOccSum = 0, lsqOccSum = 0, sbOccSum = 0;

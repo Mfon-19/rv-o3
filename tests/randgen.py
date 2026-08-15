@@ -130,7 +130,8 @@ while n < nops:
     elif r < 0.90:  # eviction pressure: the writeback-queue stressor
         conflict_store()
         n += 1
-    else:  # forward branch skipping one instruction; always convergent
+    else:  # forward branch over one instruction; both paths rejoin,
+           # so the program is valid whichever way it goes
         a, b = random.choice(DATA), random.choice(DATA)
         f3, name = random.choice([(0, "beq"), (1, "bne")])
         emit(b_t(8, b, a, f3), f"{name} x{a}, x{b}, +8")

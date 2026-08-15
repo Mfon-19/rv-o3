@@ -8,8 +8,9 @@
 // machine is therefore precise at every instruction boundary.
 //
 // Recovery walks the tail: entries younger than a mispredicted branch
-// are popped youngest-first, each returning its physical register and
-// restoring the mapping it displaced.
+// are popped one by one, from the youngest back toward the branch,
+// each returning its physical register and restoring the mapping it
+// displaced.
 
 #pragma once
 

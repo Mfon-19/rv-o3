@@ -2,21 +2,23 @@
 // memory-ordering rules.
 //
 // Memory ops allocate an LSQ entry at dispatch, in program order. The
-// AGU fills in the address (and, for stores, the data captured at
-// issue) when the operands are ready. The ordering rules, deliberately
-// conservative for now:
+// AGU fills in the address when the address operand is ready; a
+// store's data arrives separately, whenever its producer writes back.
+// The rules every mode shares:
 //
-//   - A load may access the cache only when EVERY older store in the
-//     queue has a known address.
-//   - An older store to exactly the load's address and size forwards
-//     its data; a partial overlap makes the load wait until that
-//     store has drained to the cache.
+//   - An older store to exactly the load's address and size hands the
+//     load its data directly (a forward); a partial overlap makes the
+//     load wait until that store has drained to the cache.
 //   - Stores touch memory only after they commit: commit moves them
 //     to the store buffer, which drains to the data port in order.
 //
-// No memory-dependence speculation, no load reordering past unknown
-// store addresses; memory bugs must not be able to hide behind
-// renaming bugs while the out-of-order engine is being proven.
+// How far a load may run ahead of older stores whose addresses are
+// not known yet is the configurable part (SimConfig::memOrder): wait
+// for all of them (Conservative), pass only stores proven not to
+// overlap (Bypass), or guess that unknown addresses will not overlap
+// and re-execute the load if the guess was wrong (Speculative, the
+// default; the re-execution is called a replay and reuses the branch
+// recovery machinery).
 
 #pragma once
 

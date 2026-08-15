@@ -7,7 +7,9 @@
 //   - MSHRs (miss-status holding registers): one per outstanding
 //     missed LINE. A second access to a line already being fetched
 //     MERGES into the existing entry's waiting list instead of
-//     issuing a duplicate refill. MSHRs-full is the backpressure.
+//     issuing a duplicate refill. When every MSHR is occupied the
+//     cache refuses new work (canAccept returns false), which is how
+//     miss pressure slows the requesters above it.
 //   - a writeback queue: dirty victims park here and drain to the
 //     level below opportunistically, off the refill critical path.
 //     Lines here have left the arrays, so peek8 scans this queue too.
@@ -15,19 +17,21 @@
 //     and every waiting request when its refill lands) ready for the
 //     requester to pop, tagged, in completion order.
 //
-// Hit-under-miss falls out of the structure: hits never consult the
-// MSHRs. Reads capture their data and writes take effect at access()
-// (a hit) or at line install (a miss); arrival order at each line is
-// the order requests take effect, and the core never issues two
-// overlapping requests concurrently, so replay order inside an MSHR
-// cannot matter.
+// Hits keep being served while misses are pending, simply because
+// hits never consult the MSHRs. Reads capture their data and writes
+// take effect at access() (a hit) or at line install (a miss);
+// requests to a line take effect in the order they arrived, and the
+// core never has two overlapping requests in flight at once, so the
+// order in which an MSHR's waiting list is re-applied at install
+// cannot change any value.
 //
 // Deliberate simplifications: canAccept() conservatively requires a
 // free MSHR and writeback-queue room even for what turns out to be a
 // hit; a full-line write that misses installs immediately without a
 // refill (every byte is overwritten); accepted accesses per cycle are
 // not limited (the port above already rations itself); writebacks to
-// the level below are fire-and-forget (the level below applies them
+// the level below are sent without waiting for a reply (the level
+// below applies them
 // on arrival).
 
 #pragma once

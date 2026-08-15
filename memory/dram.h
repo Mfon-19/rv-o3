@@ -1,9 +1,9 @@
 // Fixed-latency main memory, the bottom of the hierarchy.
 //
 // Pipelined: it accepts one request per cycle and each completes
-// independently `latency` cycles later; this models a memory banked
-// enough to sustain the miss-level parallelism the caches above can
-// generate. With latency 1 it answers combinationally, which is
+// independently `latency` cycles later; this models a memory with
+// enough independent banks that several cache misses can be serviced
+// at the same time. With latency 1 it answers combinationally, which is
 // exactly the original flat-memory timing; flat mode attaches two of
 // these directly to the core's fetch and data ports.
 //

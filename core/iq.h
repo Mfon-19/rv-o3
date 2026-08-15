@@ -3,10 +3,11 @@
 //
 // Each entry tracks its two source physical registers and a ready bit
 // per source. When a result writes back, its physical register number
-// is broadcast here (wakeup) and matching sources flip ready. The
-// scheduler picks the OLDEST ready entries whose unit can accept, up
-// to issue width; favoring the oldest keeps long dependency chains
-// moving and makes starvation impossible.
+// is announced to every entry here (the "wakeup"); any source waiting
+// on that register flips to ready. The scheduler picks the OLDEST
+// fully ready entries whose unit can accept, up to issue width;
+// favoring the oldest keeps long dependency chains moving and makes
+// starvation impossible.
 
 #pragma once
 

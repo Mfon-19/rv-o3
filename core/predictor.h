@@ -10,14 +10,17 @@
 // array). ghrBits = 0 degenerates gshare into a plain bimodal
 // predictor.
 //
-// The global history is SPECULATIVE: each predicted conditional shifts
-// its prediction in at fetch, so a loop's history is stable from
-// iteration to iteration. Every prediction carries the pre-shift
-// history and its table index; a mispredicting branch restores from
-// that snapshot (with the actual outcome shifted in), and training at
-// commit uses the carried index, so predict and train always touch
-// the same counter. The RAS is speculative too, without repair: a squash
-// can corrupt it, which costs only extra mispredicts.
+// The global history is updated at PREDICTION time, before the branch
+// actually executes: each predicted conditional shifts its guessed
+// direction into the history register at fetch, so a loop sees the
+// same history pattern every iteration. Since guesses can be wrong,
+// every prediction carries a snapshot of the history before its shift
+// plus its table index; a mispredicting branch restores the history
+// from that snapshot (with the true outcome shifted in), and training
+// at commit uses the carried index, so predict and train always touch
+// the same counter. The return-address stack is also updated on
+// guesses, and is NOT repaired after a flush; a squash can corrupt
+// it, which costs only extra mispredictions later.
 
 #pragma once
 

@@ -156,10 +156,11 @@ int main(int argc, char **argv) {
   OoOCore core(cfg, msys);
   loadInto(core);
 
-  // Differential check: run the reference model in lockstep as a silent
-  // shadow, advancing it one instruction per pipeline commit and
-  // comparing the two commit records. The first mismatch pinpoints the
-  // exact instruction where the pipeline corrupted architectural state
+  // Differential check: the reference model runs alongside the core,
+  // silently, advancing exactly one instruction each time the core
+  // commits one, and the two commit records are compared. The first
+  // mismatch pinpoints the exact instruction where the core corrupted
+  // architectural state
   RefModel ref(cfg);
   uint64_t verified = 0;
   if (cfg.diffCheck) {

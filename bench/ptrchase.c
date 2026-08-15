@@ -19,7 +19,8 @@ static struct {
 int main(void) {
     for (u32 i = 0; i < N; i++)
         nodes[i].next = i;
-    /* Sattolo's shuffle: exactly one cycle covering every node */
+    /* Sattolo's shuffle: links the nodes into a single ring that
+     * visits every one of them before returning to the start */
     for (u32 i = N - 1; i > 0; i--) {
         u32 j = lcg() % i;
         u32 t = nodes[i].next;

@@ -11,47 +11,62 @@
 //                                      commit (2/cycle, in order)
 //
 // Microarchitecture
-//      - Fetch: an aligned 8-byte pair per cycle from the L1I port,
-//        steered by the branch predictor (gshare + BTB + RAS), into a
-//        small fetch queue
-//      - Decode/rename (2/cycle, in order): architectural sources map
-//        to physical registers; each destination gets a fresh physical
-//        register from the free list. WAW and WAR hazards cease to
-//        exist here; only true RAW dependencies remain
+//      - Fetch reads an aligned 8-byte pair per cycle from the L1I
+//        port into a small queue. The branch predictor (a direction
+//        table, a branch target buffer, and a return-address stack)
+//        decides each cycle where fetch continues, so taken branches
+//        cost nothing when predicted correctly
+//      - Decode/rename (2/cycle, in order): each source register is
+//        mapped to the physical register currently holding its value,
+//        and each destination gets a fresh physical register from the
+//        free list. Because no physical register is ever written
+//        twice, two writers of the same architectural register can no
+//        longer conflict; the only waiting left in the machine is for
+//        values that genuinely do not exist yet
 //      - Dispatch allocates a ROB entry (and an LSQ entry for memory
 //        ops) in program order and drops the instruction into the
 //        issue queue
-//      - Issue (2/cycle, OUT of order): oldest-ready-first among
-//        entries whose operands and functional unit are available.
-//        Values are read from the physical register file at issue;
-//        execute() computes results immediately and the units delay
-//        their visibility
-//      - Writeback (2 ports, arbitration favors the oldest): writes the
-//        physical register, broadcasts the register number to wake the
-//        issue queue, marks the ROB entry done. Branches resolve here:
-//        a mispredict flushes everything younger and restores the
-//        rename map by walking the ROB tail, reclaiming physical
-//        registers
+//      - Issue (2/cycle, OUT of order): each cycle the oldest
+//        instructions whose operands are ready and whose functional
+//        unit is free leave the queue, regardless of program order.
+//        Operand values are read from the physical register file at
+//        issue; execute() computes the result immediately and the
+//        unit only delays when that result becomes visible
+//      - Writeback (2 ports; when more results finish than ports
+//        exist, the oldest go first): writes the physical register,
+//        announces the register number so waiting instructions in the
+//        issue queue become ready, and marks the ROB entry done. A
+//        branch is checked against its prediction here, the moment
+//        the branch unit produces the real outcome; on a wrong
+//        prediction everything younger is flushed, the rename map is
+//        restored by walking the ROB from youngest to oldest, and the
+//        squashed physical registers are returned
 //      - Commit (2/cycle, in order): the only place architectural
 //        state changes. Displaced mappings are freed, stores are
-//        released to the store buffer, syscalls/traps take effect,
-//        the predictor trains. Faults detected on the wrong path are
-//        carried to commit and only then become fatal; the machine
-//        is precise at every instruction boundary
-//      - Memory (conservative, core/lsq.h): loads wait for all older
-//        store addresses; exact-match stores forward; stores write the
-//        cache only after commit via the store buffer
-//      - System ops serialize: they dispatch only into an empty
-//        machine (ROB and store buffer drained) and act at commit
+//        released to the store buffer, syscalls take effect, the
+//        predictor trains. A fault detected on a speculative path is
+//        only carried along, and becomes fatal only if its
+//        instruction commits; stopped at any commit boundary, the
+//        machine shows a state that a plain one-instruction-at-a-time
+//        execution could have produced
+//      - Memory ordering is configurable (core/lsq.h). By default
+//        loads may run ahead of older stores whose addresses are not
+//        known yet; if such a store later turns out to overlap, the
+//        load re-executes (a replay). Stores write the cache only
+//        after commit, through the store buffer
+//      - System ops (ecall, ebreak, fence) wait until the whole
+//        machine has emptied, run alone, and take effect at commit,
+//        so they always observe fully settled state
 //
 // Simulation technique
 //      Stages run in reverse pipeline order each cycle (commit,
-//      writeback, LSQ, issue, dispatch, fetch), so each consumes what
-//      the stage behind it produced in an earlier cycle; units tick
-//      at the clock edge, and
-//      because writeback runs before issue, a value written back in
-//      cycle N is issueable in cycle N; the wakeup path needs no
-//      forwarding network.
+//      writeback, LSQ, issue, dispatch, fetch), so each stage
+//      consumes what the stage behind it produced in an earlier
+//      cycle; the functional units advance at the end of the cycle,
+//      like a clock edge. One ordering is deliberate: writeback runs
+//      before issue, so a value written back in cycle N can already
+//      be read by an instruction issuing in cycle N. That single rule
+//      plays the role a forwarding network plays in hardware.
 
 #pragma once
 

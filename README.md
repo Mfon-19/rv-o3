@@ -1,106 +1,186 @@
-# RISC-V Simulator
+# rv-o3
 
-This is a cycle-level simulator of the classic five-stage RISC-V pipeline
-(`IF -> ID -> EX -> MEM -> WB`), implementing the base RV32I ISA plus the M
-extension for multiplication and division. The simulator is a small,
-readable C++ codebase with no dependencies, split into components (ISA,
-core, memory, sim driver). It exists to make pipeline
-behavior *visible*: forwarding, load-use stalls, branch squashes, and
-control-flow redirects can all be watched happening cycle by cycle.
+This is a cycle-level simulator of a superscalar, out-of-order RISC-V processor that implements RV32IM. The machine is currently a 2-wide superscalar with register renaming, a reorder buffer, oldest-ready issue, branch prediction with full misprediction recovery, a nonblocking cache hierarchy with memory-level parallelism, and speculative load reordering with replay. I made this after studying computer architecture as a learning exercise.
 
-## Quick start
+## Build and run
 
 ```sh
 make
-./rvsim tests/sum.hex
+./rvsim tests/sum.hex        # runs; prints 55 plus a stats report
+./rvsim -d tests/sum.hex     # same, differentially checked (see below)
+make test                    # the full directed suite under -d
 ```
+
+The program's output goes to standard output; statistics and traces
+go to standard error. No libraries are needed beyond a C++17
+compiler; the C demo and benchmarks additionally want clang and GNU
+RISC-V binutils.
+
+## The machine at a glance
 
 ```text
---- rvsim: 61 cycles, 39 instructions retired, CPI = 1.564
---- rvsim: 0 load-use stalls, 9 taken branches/jumps (18 squashed instructions)
---- rvsim: exit code 0
-55
+            bimodal + BTB + RAS
+                  |
+   +-------+   +--------+   +----------------+   +-------------+
+   | fetch |-->| decode |-->|    dispatch    |-->| issue queue |
+   |2/cycle|   | rename |   | ROB, LSQ alloc |   |  16 entries |
+   +-------+   +--------+   +----------------+   +------+------+
+                                                        | oldest ready,
+                                                        | 2/cycle
+              +-------+-------+--------+-------+-------++
+              |  ALU  |  ALU  | branch |  mul  |  div  | AGU
+              +-------+-------+--------+-------+-------+  |
+                              |                           v
+                    writeback, 2 ports          load/store queue (16)
+                    wakes the issue queue       + store buffer (8)
+                              |                           |
+                              v                           | loads and
+                    commit, in order, 2/cycle             | committed
+                    the ONLY architectural update         | stores
+                                                          v
+        fetch --> L1I 32K ----+----------------- L1D 32K <--+
+                              |                    |
+                              +---- unified L2 256K
+                                         |          every cache level:
+                                   pipelined DRAM   MSHRs, hit under miss,
+                                   (30 cycles)      writeback queues
 ```
 
-The program's own output (`55`, the sum of 1..10) goes to standard output;
-statistics go to standard error.
+- **Fetch** reads an aligned 8-byte block each cycle (two instructions), steered by a bimodal
+  direction table, a branch target buffer, and a return-address
+  stack.
+- **Rename** gives every writer a fresh physical register (32
+  architectural plus one per ROB entry). Write-after-write and
+  write-after-read hazards cease to exist at this line; the issue
+  queue only ever waits on true dependences.
+- **Execution units**: two 1-cycle ALUs, a 1-cycle branch unit, a
+  3-cycle pipelined multiplier, a 12-cycle non-pipelined divider, and
+  a 1-cycle address-generation unit feeding the memory system.
+- **Branches** are checked against their prediction the moment the branch unit produces the real outcome; a mispredict flushes everything
+  younger, restores the rename map by walking the reorder buffer
+  backwards, and returns the squashed physical registers. Recovery is
+  also reused for memory replays.
+- **Memory ordering** is a policy configuration (`memOrder`). In
+  `conservative` mode loads wait until every older store address is
+  known; `bypass` lets loads pass stores proven not to overlap;
+  `speculative` (the default) lets loads pass unknown addresses too,
+  and when an older store later resolves to the same address, the
+  load and everything younger flush and re-execute. Store-to-load
+  forwarding and a post-commit store buffer work in every mode.
+- **Commit** is the only place architectural state changes. Stores
+  reach memory only after commit; syscalls execute against a drained
+  machine; a fault on a speculative path becomes fatal only if its
+  instruction commits. The machine is precise at every boundary.
+- **Caches** track outstanding misses in MSHRs, so independent misses
+  overlap, duplicate requests merge, and hits keep flowing under a
+  miss; dirty victims wait in writeback queues; DRAM is pipelined.
 
-## Watching the pipeline
+## Three demonstrations
 
-The `-t` flag prints the occupancy of every stage each cycle, with
-annotations when something interesting happens. Here is
-`./rvsim -t tests/hazards.hex` catching a load-use hazard: `add tp,gp,gp`
-needs the result of `lw gp,0(sp)` one cycle before forwarding can deliver
-it, so the pipeline injects a single bubble and replays the `add`:
+**Out-of-order execution** Two interleaved independent
+dependency chains sustain more than one instruction per cycle, which
+no in-order machine can do:
 
 ```text
-cyc  5 | IF 0x00000010 | ID lw gp,0(sp)    | EX sw ra,0(sp)    | MEM addi ra,zero,42 | WB lui sp,0x1
-cyc  6 | IF 0x00000014 | ID add tp,gp,gp   | EX lw gp,0(sp)    | MEM sw ra,0(sp)     | WB addi ra,zero,42   ! load-use stall (bubble -> EX)
-cyc  7 | IF 0x00000014 | ID add tp,gp,gp   | EX -              | MEM lw gp,0(sp)     | WB sw ra,0(sp)
-cyc  8 | IF 0x00000018 | ID sw tp,4(sp)    | EX add tp,gp,gp   | MEM -               | WB lw gp,0(sp)
+$ ./rvsim tests/ilp.hex
+--- rvsim: 216 cycles, 249 instructions retired, IPC = 1.153 (CPI = 0.867)
 ```
 
-The `-r` flag additionally dumps all 32 registers (with ABI names) and the
-final `pc` when the simulation ends.
+**Memory-level parallelism, measured with a config override.** Two
+independent loads miss all the way to DRAM. With the default four
+MSHRs the misses overlap; with one MSHR they serialize, and the run
+gets exactly one miss latency slower:
 
-## Pipeline model
+```text
+$ ./rvsim tests/mlp.hex                                   ...77 cycles
+$ ./rvsim -O l1d.mshrs=1 -O l2.mshrs=1 tests/mlp.hex      ...107 cycles
+```
 
-The pipeline is in-order and single-issue:
+**A speculative load being caught out.** In `tests/replay.hex` a
+store's address hides behind a divide while a younger load to the
+same address runs early and reads stale data. The `-t` trace shows
+the moment the divide resolves and the machine notices (DS/IS/WB/CT are dispatch, issue, writeback, commit):
 
-- **IF (Instruction Fetch)** reads the next instruction word from memory.
-- **ID (Instruction Decode)** decodes it, reads source registers, and
-  detects load-use hazards.
-- **EX (Execute)** performs ALU and M-extension operations, computes
-  addresses, and resolves branches and jumps.
-- **MEM (Memory)** performs loads and stores.
-- **WB (Write Back)** commits results to the register file and handles
-  system instructions.
+```text
+cyc 48 | fq5 rob 6 iq 1 lsq 2 sb1 | IS sw s0,0(sp)  | WB divu sp,t2,t0 ...
+cyc 49 | fq5 rob 6 iq 0 lsq 2 sb1 | CT divu sp,t2,t0; addi s0,zero,99   ! load replay @0x00000020
+```
 
-Hazards are handled the way a textbook five-stage machine handles them:
+The load and everything younger flush, refetch, and this time forward
+the correct value; the program prints 100 either way.
 
-| Hazard | Resolution | Cost |
-| --- | --- | --- |
-| ALU result needed by the next instruction | EX/MEM -> EX forwarding | none |
-| Result needed two instructions later | MEM/WB -> EX forwarding | none |
-| Load result needed by the next instruction | One-cycle interlock, then forwarding | 1 stall cycle |
-| `lw` immediately followed by `sw` of the same register | MEM/WB -> MEM store-data forwarding | none |
-| Taken branch or jump | Resolved in EX (static predict-not-taken); the wrong-path instructions in IF and ID are squashed | 2 squashed instructions |
+## Verification
 
-## Supported instructions
+`core/refmodel.cpp` is a fetch-decode-execute interpreter with no
+timing at all. It shares the decode and execute semantics with the
+core, so the two can only diverge in what the timing model adds:
+operand routing, speculation, recovery, memory ordering. Under `-d`,
+both run in lockstep and every retired instruction's effects (pc,
+register written, memory written) are compared record by record; at
+exit the full register file and all of memory are compared as well,
+because out-of-order completion can produce a commit stream that is
+correct record by record while still leaving a stale value in a
+register.
 
-| Category | Instructions |
+Four make targets build on the checker:
+
+| Target | What it does |
 | --- | --- |
-| Upper immediate | `lui`, `auipc` |
-| Jumps | `jal`, `jalr` |
-| Branches | `beq`, `bne`, `blt`, `bge`, `bltu`, `bgeu` |
-| Loads | `lb`, `lh`, `lw`, `lbu`, `lhu` |
-| Stores | `sb`, `sh`, `sw` |
-| Immediate ALU | `addi`, `slti`, `sltiu`, `xori`, `ori`, `andi`, `slli`, `srli`, `srai` |
-| Register ALU | `add`, `sub`, `sll`, `slt`, `sltu`, `xor`, `srl`, `sra`, `or`, `and` |
-| RV32M | `mul`, `mulh`, `mulhsu`, `mulhu`, `div`, `divu`, `rem`, `remu` |
-| System | `fence`, `ecall`, `ebreak` |
+| `make test` | 18 directed programs, each aimed at one mechanism, plus the compiled C demo |
+| `make randtest` | Generated load/store soups over a few contested cache lines, with late-resolving addresses and eviction pressure; the reference model is the oracle |
+| `make configtest` | The directed suite under twelve configurations: widths 1 and 4, ROB 16 and 128, one MSHR, all three ordering modes, flat memory, tiny caches, and more |
+| `make benchtest` | Every benchmark is also compiled natively for the host; simulator output must match the native binary byte for byte, in all three ordering modes. The host build shares no code with the simulator, so it checks the one layer the shared reference model cannot |
 
-`fence` is a no-op (there is nothing to order in a single flat memory).
-`ecall` invokes the simulator's syscall interface below, and `ebreak` halts
-execution.
+## Benchmarks
 
-## Command line
+Seven small C programs in `bench/`, each stressing one behavior, and
+with a native host build as its oracle. At the default configuration:
+
+| Benchmark | IPC | What it shows |
+| --- | --- | --- |
+| `ptrchase` | 0.44 | serial pointer chasing over 512 KiB; about 0.9 misses outstanding, and no window size can help a serial chain |
+| `mlpbench` | 1.00 | independent gathers over 512 KiB; 1.5 misses outstanding, scaling with ROB size and MSHR count |
+| `matmul` | 1.67 | 24x24 integer matrix multiply; instruction-level parallelism with quiet caches |
+| `mm64` | 1.70 | 48 KiB working set; the L1-capacity knee (8% L1D misses at 16 KiB, 0.4% at 64 KiB) |
+| `qsortb` | 1.20 | recursive quicksort; 49 branch MPKI of data-dependent compares |
+| `rle` | 1.63 | encode/decode round trip; byte traffic in short loops |
+| `branchy` | 0.85 | genuinely unpredictable branches; 77 MPKI and constant recovery |
+
+`tools/sweep.py` runs them across one axis of the design space
+(`rob`, `width`, `l1`, `mshr`, `pred`) and prints markdown tables of
+IPC plus the metric that axis is supposed to move.
+
+## Configuration
+
+Every config lives in one struct and is settable by name.
+
+```sh
+./rvsim -p                                  # list every config and value
+./rvsim -O robSize=128 -O memOrder=bypass prog.bin
+./rvsim -C experiment.txt prog.bin          # key = value lines, # comments
+```
+
+Sizes take `k`/`m` suffixes (`l1d.size=64k`). `physRegs=0` (the
+default) derives 32 plus the ROB size. The full command line:
 
 ```text
 usage: ./rvsim [options] [program.hex|program.bin]
   -t            trace pipeline occupancy every cycle (stderr)
   -r            dump registers when the simulation ends
   -f            run the functional reference model (no pipeline)
-  -c <cycles>   cycle budget (default 10000000; instructions with -f)
+  -d            differential check against the reference model
+  -c <cycles>   cycle budget (default 10000000)
   -m <bytes>    memory size (default 1 MiB)
+  -C <file>     load configuration
+  -O key=value  override one knob (repeatable; applied after -C)
+  -p            print the effective configuration and exit
 ```
 
 ## Writing programs
 
-Programs are plain text files of whitespace-separated 32-bit instruction
-words in hex, loaded sequentially starting at address zero (which is also
-the reset `pc`). Both `#` and `//` start line comments, so programs can be
-annotated like a listing:
+Hex programs are plain text: whitespace-separated 32-bit instruction
+words, loaded from address zero, which is also the reset `pc`. Both
+`#` and `//` start comments, so a program reads like a listing:
 
 ```text
 00500093   # addi ra, zero, 5
@@ -111,272 +191,54 @@ annotated like a listing:
 00000073   # ecall
 ```
 
-Files ending in `.bin` are instead loaded as raw little-endian binaries,
-also at address zero — so output from a real assembler (e.g.
-`riscv64-unknown-elf-objcopy -O binary`) works too.
-
-### Syscalls
-
-`ecall` reads the syscall number from `a7` and the argument from `a0`:
+Files ending in `.bin` load as raw little-endian binaries instead, so
+assembler or compiler output works too. `ecall` reads a syscall
+number from `a7` and an argument from `a0`; system instructions
+drain the machine first and execute at commit, so they always see
+settled state.
 
 | `a7` | Operation |
 | --- | --- |
-| `1` | Print `a0` as a signed decimal integer followed by a newline |
-| `2` | Print the low byte of `a0` as an ASCII character |
-| `3` | Print the NUL-terminated string at memory address `a0` |
-| `10`, `93` | Exit with the low byte of `a0` as the status code |
+| `1` | print `a0` as a signed decimal integer |
+| `2` | print the low byte of `a0` as a character |
+| `3` | print the NUL-terminated string at address `a0` |
+| `4` | print `a0` as eight hex digits |
+| `10`, `93` | exit with the low byte of `a0` as the status |
 
-This is a small testing convenience, not the Linux ABI — but `93` matches
-the real Linux `exit` number, so simple assembler programs carry over.
+### Running real C
 
-## Compiling and running a C program
+`cdemo/` compiles a freestanding C program (sorting, GCD, string
+output) with clang for bare-metal RV32IM and runs it on the
+simulator: `make -C cdemo run`. There is no operating system or libc
+underneath, so the directory supplies the pieces needed:
+`start.S` (entry point and stack setup), `runtime.c` (`memcpy` and
+`memset` for compiler-generated calls), and `linker.ld` (final
+addresses, code at zero).`make -C cdemo disassemble`
+shows the exact instructions your compiler produced. The benchmarks
+in `bench/` reuse the same runtime.
 
-The `cdemo/` directory shows that the simulator can run code produced by a
-real C compiler, rather than only hand-written hex files. The demo sorts ten
-integers, prints them, computes `gcd(84, 30)`, and exits successfully.
-
-It is important to distinguish this from running an ordinary Linux program.
-When a program runs on Linux, several layers do work before `main` begins:
-
-- the executable loader maps an ELF file into memory;
-- startup code initializes registers and calls `main`;
-- the C library provides functions such as `printf` and `memcpy`;
-- the operating system implements files, processes, and system calls.
-
-This simulator intentionally provides none of those layers. It models a CPU, flat
-memory, and a few simple output syscalls. The demo is therefore a
-**freestanding C program**: normal C control flow and data structures work,
-but the small amount of machine-level setup normally hidden by an OS and C
-library is included explicitly in `cdemo/`.
-
-### Demo files and why they exist
-
-| File | Purpose |
-| --- | --- |
-| [`cdemo/demo.c`](cdemo/demo.c) | The application: sorting, GCD, strings, stack variables, and wrappers around the simulator's syscalls |
-| [`cdemo/start.S`](cdemo/start.S) | Supplies the `_start` entry point, initializes the stack pointer, calls `main`, and exits with its return value |
-| [`cdemo/runtime.c`](cdemo/runtime.c) | Supplies `memcpy` and `memset`, since there is no C library to provide compiler helper routines |
-| [`cdemo/linker.ld`](cdemo/linker.ld) | Assigns final memory addresses, places `_start` at address zero, and defines the top of the stack |
-| [`cdemo/Makefile`](cdemo/Makefile) | Runs the cross-compilation, linking, binary extraction, and simulator commands reproducibly |
-
-Each supporting file contains comments explaining the less familiar parts.
-Generated objects, `demo.elf`, and `demo.bin` are ignored by the repository's
-root `.gitignore` because they can always be rebuilt.
-
-### Prerequisites
-
-The demo uses:
-
-- Clang with its RISC-V backend;
-- GNU RISC-V binutils (`riscv64-linux-gnu-ld`, `objcopy`, and `objdump`);
-- Make.
-
-Build and run everything from the repository root with:
-
-```sh
-make -C cdemo run
-```
-
-The program prints:
+## Layout
 
 ```text
-sorted:
--8
--3
-0
-1
-5
-7
-9
-15
-23
-42
-gcd(84, 30):
-6
-```
-
-### From source code to simulated instructions
-
-The complete path looks like this:
-
-```text
-demo.c + runtime.c + start.S
-             |
-             |  Clang compiles each source file
-             v
-       demo.o + runtime.o + start.o
-             |
-             |  GNU ld applies linker.ld
-             v
-          demo.elf
-             |
-             |  objcopy extracts loadable bytes
-             v
-          demo.bin
-             |
-             |  rvsim loads it at address 0
-             v
-       simulated RV32IM execution
-```
-
-Here is what each step means.
-
-1. **Clang translates source into object files.**
-
-   `demo.c` and `runtime.c` are translated from C into RV32IM machine
-   instructions. `start.S` is assembled into instructions as well. The `.o`
-   files contain code and data, but their final addresses are not known yet,
-   so they cannot be loaded directly into the simulator.
-
-2. **The compiler flags describe the simulated machine.**
-
-   | Flag | Reason |
-   | --- | --- |
-   | `--target=riscv32-none-elf` | Generate bare-metal RISC-V code instead of code for the host computer |
-   | `-march=rv32im` | Use only the 32-bit integer and multiply/divide instructions implemented by `rvsim` |
-   | `-mabi=ilp32` | Use 32-bit integers, pointers, registers, and the standard RISC-V calling convention |
-   | `-ffreestanding` | Tell Clang that there is no hosted OS or complete standard library |
-   | `-fno-builtin` | Prevent ordinary C calls from being silently replaced with unavailable library builtins |
-   | `-fno-stack-protector` | Avoid references to stack-protection runtime functions that are not present |
-   | `-fno-pic -fno-pie` | Generate a fixed-address image for the simulator's flat memory |
-   | `-mno-relax` | Keep the assembler/linker from rewriting instruction sequences into forms that depend on extra runtime setup |
-   | `-msmall-data-limit=0` | Avoid global-pointer-relative data accesses, so startup only needs to initialize `sp` |
-   | `-O2` | Optimize the C program while still producing ordinary RV32IM instructions |
-
-   The Makefile invokes the linker directly, so no host startup files or libc
-   are linked accidentally.
-
-3. **`runtime.c` supplies compiler support that libc normally provides.**
-
-   The array in `main` has ten initial values. In the current optimized build,
-   Clang stores those 40 constant bytes in the read-only-data section and
-   emits a call to `memcpy` to copy them into `main`'s stack frame. Without
-   `runtime.c`, the link fails with an undefined `memcpy` reference.
-
-   This can happen even in freestanding mode: freestanding tells the compiler
-   that a complete C library is unavailable, but generated code may still need
-   fundamental memory helpers. `memset` is included for the same reason even
-   though this particular build currently uses only `memcpy`.
-
-4. **The linker turns separate pieces into one addressed program.**
-
-   `riscv64-linux-gnu-ld` combines the three object files according to
-   `linker.ld`. The script lays out:
-
-   - `.text`, containing executable instructions, starting at address `0`;
-   - `.rodata`, containing string literals and the initial array values;
-   - `.data`, for writable initialized global data;
-   - `.bss`, for zero-initialized global data;
-   - `__stack_top` at `0x00100000`, the end of the default 1 MiB memory.
-
-   The result is `demo.elf`. ELF is a structured executable format containing
-   section addresses, symbols, permissions, and other metadata. It is useful
-   to linkers, debuggers, and disassemblers, but `rvsim` does not currently
-   parse that structure.
-
-5. **`objcopy` creates the flat image understood by the simulator.**
-
-   `riscv64-linux-gnu-objcopy -O binary` extracts the loadable code and data
-   bytes from `demo.elf` into `demo.bin`. The raw file has no section names or
-   symbols; it is just the bytes that need to appear in simulated memory.
-
-6. **`rvsim` loads the bytes and begins at `_start`.**
-
-   Because the input filename ends in `.bin`, the simulator copies the file's
-   bytes into its zero-initialized memory beginning at address `0`. The reset
-   program counter is also `0`, and the linker deliberately placed `_start`
-   there, so the first fetched instruction is startup code rather than `main`.
-
-7. **`start.S` creates the environment expected by compiled C.**
-
-   The startup instructions set `sp` to `0x00100000`. The stack grows toward
-   lower addresses, so the first function prologue subtracts space before
-   writing anything. The address is 16-byte aligned as required by the RISC-V
-   calling convention. `_start` then calls `main`, which also puts the return
-   address in `ra` so execution can come back afterward.
-
-   The simulator initializes memory to zero, so this demo does not need the
-   `.bss` clearing loop that startup code would usually perform on physical
-   bare-metal hardware.
-
-8. **The compiler-generated `main` runs through the pipeline.**
-
-   In the current build, `main` reserves 48 bytes on the stack, copies the
-   40-byte initial array there, and calls the sorting function. All of the
-   generated loads, stores, comparisons, branches, calls, and returns are
-   ordinary instructions flowing through IF, ID, EX, MEM, and WB. The GCD
-   calculation uses an M-extension remainder instruction.
-
-9. **Output crosses the CPU/simulator boundary with `ecall`.**
-
-   The wrappers in `demo.c` put an argument in `a0` and a syscall number in
-   `a7`. An `ecall` then travels through the pipeline like another instruction.
-   When it reaches WB, `rvsim` handles it: syscall `1` prints an integer and
-   syscall `3` follows a simulated-memory address and prints a string.
-
-10. **Returning from `main` stops the simulation.**
-
-    RISC-V convention places `main`'s return value in `a0`. After `main`
-    returns, `_start` puts `93` in `a7` and executes one final `ecall`. The
-    simulator records the low byte of `a0` as the exit status, halts, and
-    prints its cycle, CPI, stall, and branch statistics.
-
-Use the following command to inspect the exact instructions emitted by your
-installed compiler:
-
-```sh
-make -C cdemo disassemble
-```
-
-Compiler versions and optimization choices can change the exact instruction
-sequence and cycle count while preserving the program's output.
-
-## Tests
-
-`make test` builds the simulator and runs every bundled program:
-
-| Program | Exercises | Expected output |
-| --- | --- | --- |
-| `tests/sum.hex` | Looping and backward branches | `55` |
-| `tests/hazards.hex` | Forwarding, load-use stall, `lw`;`sw` forwarding | `84` |
-| `tests/jump.hex` | Jump redirects and wrong-path squashing | `5` |
-| `tests/sort.hex` | Bubble sort: nested loops plus memory traffic | `-8 -3 0 1 5 7 9 15 23 42`, one per line |
-
-Each test is self-checking in the loose sense that its output is easy to
-verify by eye; the statistics on standard error (cycles, instructions
-retired, CPI, stalls, redirects, squashes) show *how* it ran.
-
-## Project layout
-
-```text
-isa/               Timing-free ISA layer: decode, execute semantics, disassembly
-  isa.h            Opcodes, decoded-instruction record, classification helpers
-  decode.cpp       Instruction word -> Instr, immediate extraction
-  execute.cpp      Pure execute semantics (ALU, branches, M extension)
-  disasm.cpp       Disassembler for traces and error messages
-core/              Execution models and architectural state
-  cpu.{h,cpp}      The five-stage pipeline: latches, hazards, forwarding, syscalls
-  refmodel.{h,cpp} Functional reference model: fetch-decode-execute, no timing
-  commit.h         CommitRecord: what one retired instruction did to arch state
-memory/            Memory system
-  memory.h         Flat little-endian main memory (caches will layer on top)
-sim/               Simulation infrastructure
-  config.h         All configuration knobs in one struct
-  stats.h          Statistics counters and end-of-run report
-  loader.{h,cpp}   .hex and .bin program-image loaders
-  main.cpp         CLI driver
-tests/             Annotated test programs (.hex)
-cdemo/             Freestanding C demo and its startup/linker support
-Makefile           Build (`make`) and test (`make test`) targets
-compile_flags.txt  Project flags used by clangd
+isa/        decode, execute semantics, disassembly; timing-free and
+            shared by the core and the reference model, so their
+            architectural behavior cannot diverge
+core/       ooo.{h,cpp} (the machine), predictor, rename, rob, iq,
+            lsq, fu, refmodel, commit records
+memory/     tagged nonblocking ports, cache (MSHRs, writeback
+            queues), pipelined DRAM, hierarchy assembly
+sim/        config (struct + file/override interface), stats, program
+            loaders, CLI driver with the differential checker
+tests/      18 annotated directed tests plus randgen.py
+bench/      benchmarks with native-build oracles
+tools/      configtest.sh, sweep.py
+cdemo/      freestanding C demo and its runtime
 ```
 
 ## Limitations
 
-Deliberately out of scope, to keep the model small and readable:
-
-- No caches, MMU, interrupts, privileged modes, or trap handlers.
-- No compressed (C) or floating-point (F/D) instructions.
-- Memory is a fixed-size flat byte array; misaligned instruction fetches
-  and data accesses are fatal simulation errors rather than traps.
-- Branch prediction is always not-taken; there is no BTB or history.
+Out-of-scope features: no
+MMU, interrupts, privileged modes, or trap handling (misaligned and
+out-of-bounds accesses are precise fatal errors); no compressed,
+atomic, or floating-point extensions; `fence` is a serializing no-op;
+one core.

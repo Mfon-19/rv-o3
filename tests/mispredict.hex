@@ -1,9 +1,10 @@
 # Directed OoO test: mispredict recovery under register reuse. The
 # beq depends on the parity of a multiplicative sequence, which
 # alternates, the worst case for a bimodal counter, so roughly every
-# other iteration flushes: rename-map restoration and physical-
-# register reclaim run constantly while x1/x3/x4 are re-renamed every
-# iteration. Any leak or misrestore corrupts the count.
+# other iteration flushes: the rename map is restored and squashed
+# physical registers are reclaimed constantly, while x1/x3/x4 get
+# fresh physical registers every iteration. Any register leaked or
+# any mapping restored wrongly corrupts the count.
 # Expected output: 28 (4 odd iterations x 5, plus 8 x 1), exit 0.
 00700093   # addi x1, x0, 7       seed
 00800113   # addi x2, x0, 8       iterations

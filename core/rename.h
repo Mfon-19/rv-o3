@@ -3,11 +3,13 @@
 //
 // Every instruction that writes an architectural register is given a
 // fresh physical register at rename; the map records which physical
-// register currently speaks for each architectural one. Renaming is
-// what deletes WAW and WAR hazards; two writers of the same
-// architectural register write different physical registers, so only
-// true RAW dependencies remain, tracked by the per-physical-register
-// ready bits.
+// register currently speaks for each architectural one. Because no
+// physical register is ever written twice, the hazards caused by
+// REUSING a register name (a write racing an older write, or a write
+// racing an older read) simply cannot occur. The only dependence left
+// is the real one: an instruction waiting for a value that has not
+// been produced yet, tracked by the ready bit on each physical
+// register.
 //
 // Reclaim discipline (the part that grows bugs): allocating pdst for
 // architectural rd displaces the previous mapping prevPhys. prevPhys
