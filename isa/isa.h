@@ -149,6 +149,38 @@ inline FuKind fuKindOf(Op op) {
   }
 }
 
+// Memory access width in bytes
+inline uint32_t accessSize(Op op) {
+  switch (op) {
+  case Op::LB:
+  case Op::LBU:
+  case Op::SB:
+    return 1;
+  case Op::LH:
+  case Op::LHU:
+  case Op::SH:
+    return 2;
+  default:
+    return 4;
+  }
+}
+
+// Sub-word loads sign- or zero-extended into 32 bits as per the ISA
+inline uint32_t extendLoad(Op op, uint32_t raw) {
+  switch (op) {
+  case Op::LB:
+    return (uint32_t)(int32_t)(int8_t)raw;
+  case Op::LBU:
+    return raw & 0xFF;
+  case Op::LH:
+    return (uint32_t)(int32_t)(int16_t)raw;
+  case Op::LHU:
+    return raw & 0xFFFF;
+  default:
+    return raw;
+  }
+}
+
 // ABI register names, indexed by register number
 extern const char *const kRegName[32];
 

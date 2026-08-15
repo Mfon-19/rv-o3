@@ -20,7 +20,7 @@
 
 struct MemRequest {
   uint32_t addr = 0;
-  uint32_t size = 0; // 1, 2, 4, or lineBytes (a whole-line transfer)
+  uint32_t size = 0; // 1, 2, 4, 8 (aligned read pair), or lineBytes
   bool isWrite = false;
   uint32_t wdata = 0;          // scalar store data (size <= 4)
   std::vector<uint8_t> wline;  // line-write payload (size == lineBytes)
@@ -28,7 +28,7 @@ struct MemRequest {
 
 struct MemResponse {
   uint32_t rdata = 0;          // scalar load data, zero-extended
-  std::vector<uint8_t> rline;  // line-read payload (size == lineBytes)
+  std::vector<uint8_t> rline;  // multi-word payload (size > 4 reads)
 };
 
 struct MemPort {

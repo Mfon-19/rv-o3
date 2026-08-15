@@ -29,6 +29,9 @@
 #include "isa/isa.h"
 #include "memory/request.h"
 
+// "No physical register" — used by cores without renaming too
+constexpr uint8_t kNoReg = 0xFF;
+
 // An instruction in flight inside a functional unit
 struct FuOp {
   bool valid = false;
@@ -37,6 +40,11 @@ struct FuOp {
   Instr ins;
   uint32_t pc = 0;
   uint32_t value = 0; // result / effective address (memory ops)
+  // Out-of-order core extras
+  uint8_t pdst = kNoReg; // physical destination register
+  uint32_t lsqIdx = 0;   // memory ops: the LSQ entry to fill at AGU drain
+  bool redirect = false; // branches: the RESOLVED direction and target,
+  uint32_t target = 0;   // compared against the prediction at writeback
   // Stores only: the data to write. If the producer was still in
   // flight at issue, storeDataReady is false and the writeback
   // broadcast fills the value in before the access starts
@@ -105,6 +113,20 @@ struct FuUnit {
       out = cur; // canAccept() kept out empty while cur ran
       cur = FuOp{};
     }
+  }
+
+  // Squash recovery: kill every in-flight op younger than the
+  // mispredicted branch. Their results must never write back
+  void flushYounger(uint64_t seq) {
+    for (FuOp &s : stages)
+      if (s.valid && s.seq > seq)
+        s = FuOp{};
+    if (cur.valid && cur.seq > seq) {
+      cur = FuOp{};
+      remaining = 0;
+    }
+    if (out.valid && out.seq > seq)
+      out = FuOp{};
   }
 };
 

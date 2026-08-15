@@ -44,4 +44,21 @@ struct SimConfig {
   uint32_t divLatency = 12;     // divider occupancy (non-pipelined)
   uint32_t wbPorts = 2;         // completions written back per cycle
   uint32_t retireQueueSize = 32;
+
+  // Out-of-order core. -i selects the in-order core instead; the OoO
+  // shape below is internal like everything else
+  bool inorderCore = false;
+  uint32_t width = 2;        // rename/dispatch, issue, and commit width
+  uint32_t robSize = 32;
+  uint32_t iqSize = 16;      // integer issue queue entries
+  uint32_t lsqSize = 16;     // load/store queue entries
+  uint32_t sbSize = 8;       // store buffer (committed stores)
+  uint32_t physRegs = 64;    // 32 architectural + one per ROB entry
+  uint32_t fetchQSize = 8;   // fetched instructions waiting to dispatch
+  bool usePredictor = true;  // false: static not-taken (bring-up mode)
+  uint32_t phtBits = 10;     // gshare: 2^10 two-bit counters
+  uint32_t ghrBits = 0;      // history bits; 0 = plain bimodal (these
+                             // kernels end before history would warm up)
+  uint32_t btbEntries = 64;
+  uint32_t rasEntries = 8;
 };

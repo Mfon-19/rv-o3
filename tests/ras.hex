@@ -1,0 +1,23 @@
+# Directed OoO test: calls and returns through the return-address
+# stack. main calls A twice; A saves ra, calls B, and both return via
+# the standard "jalr x0, 0(ra)" idiom the RAS predicts. First
+# encounters mispredict (cold BTB); the second call chain should
+# predict cleanly, including the two different return targets for B's
+# and A's returns.
+# Expected output: 260 (2 x (30 + 100)), exit 0.
+00000293   # addi x5, x0, 0
+020000EF   # jal  x1, +32         call A
+01C000EF   # jal  x1, +28         call A again
+00028513   # addi x10, x5, 0
+00100893   # addi x17, x0, 1      syscall 1: print integer
+00000073   # ecall                prints 260
+00000513   # addi x10, x0, 0
+05D00893   # addi x17, x0, 93     syscall 93: exit
+00000073   # ecall
+00008313   # A: addi x6, x1, 0    save ra
+010000EF   # jal  x1, +16         call B
+06428293   # addi x5, x5, 100
+00030093   # addi x1, x6, 0       restore ra
+00008067   # jalr x0, 0(x1)       return to main
+01E28293   # B: addi x5, x5, 30
+00008067   # jalr x0, 0(x1)       return to A

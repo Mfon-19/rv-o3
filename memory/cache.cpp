@@ -186,8 +186,10 @@ void Cache::finishOnLine() {
     }
     dirty[curSet * cfg.ways + curWay] = 1;
   } else {
-    if (cur.size == cfg.lineBytes) {
-      resp.rline.assign(line, line + cfg.lineBytes);
+    if (cur.size > 4) {
+      // Whole-line transfer, or an aligned multi-word read (the
+      // two-wide fetch pair) — both stay within one line
+      resp.rline.assign(line + off, line + off + cur.size);
     } else {
       uint32_t v = 0;
       for (uint32_t b = 0; b < cur.size; b++)

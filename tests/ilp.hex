@@ -1,0 +1,27 @@
+# Directed OoO test: instruction-level parallelism. Two independent
+# accumulator chains interleaved inside a 20-iteration loop (looped so
+# the caches warm up and steady state dominates). In-order issue caps
+# at 1 IPC; the out-of-order core issues from both chains at once and
+# should approach 2.
+# Expected output: 1100 (20 x 25 + 20 x 30), exit 0.
+00000093   # addi x1, x0, 0       chain A
+00000113   # addi x2, x0, 0       chain B
+01400313   # addi x6, x0, 20      loop counter
+00108093   # loop: addi x1, x1, 1
+00210113   # addi x2, x2, 2
+00308093   # addi x1, x1, 3
+00410113   # addi x2, x2, 4
+00508093   # addi x1, x1, 5
+00610113   # addi x2, x2, 6
+00708093   # addi x1, x1, 7
+00810113   # addi x2, x2, 8
+00908093   # addi x1, x1, 9
+00A10113   # addi x2, x2, 10
+FFF30313   # addi x6, x6, -1
+FC031AE3   # bne  x6, x0, -44
+00208533   # add  x10, x1, x2     500 + 600
+00100893   # addi x17, x0, 1      syscall 1: print integer
+00000073   # ecall                prints 1100
+00000513   # addi x10, x0, 0
+05D00893   # addi x17, x0, 93     syscall 93: exit
+00000073   # ecall

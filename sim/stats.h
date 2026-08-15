@@ -31,6 +31,15 @@ struct Stats {
   uint64_t fetchStallCycles = 0; // cycles issue had no instruction at all
   uint64_t dataStallCycles = 0;  // cycles the LSU waited on the data port
 
+  // Out-of-order core counters. Dispatch-stall cycles by cause:
+  uint64_t dsRobFull = 0, dsIqFull = 0, dsLsqFull = 0, dsNoPreg = 0,
+           dsSerialize = 0, dsFetchEmpty = 0;
+  uint64_t branches = 0, mispredicts = 0; // resolved / of those, wrong
+  uint64_t flushes = 0;                   // recovery events
+  uint64_t loadsForwarded = 0;            // store->load forwards
+  uint64_t sbCommitStalls = 0;            // store-buffer-full commit stalls
+  uint64_t issuedOps = 0;                 // total ops issued (avg width)
+
   void printCore() const {
     fprintf(stderr, "--- rvsim: %" PRIu64 " cycles, %" PRIu64
             " instructions retired, CPI = %.3f\n",

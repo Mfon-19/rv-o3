@@ -1,0 +1,25 @@
+# Directed OoO test: mispredict recovery under register reuse. The
+# beq depends on the parity of a multiplicative sequence, which
+# alternates — the worst case for a bimodal counter, so roughly every
+# other iteration flushes: rename-map restoration and physical-
+# register reclaim run constantly while x1/x3/x4 are re-renamed every
+# iteration. Any leak or misrestore corrupts the count.
+# Expected output: 28 (4 odd iterations x 5, plus 8 x 1), exit 0.
+00700093   # addi x1, x0, 7       seed
+00800113   # addi x2, x0, 8       iterations
+00000213   # addi x4, x0, 0       accumulator
+00D00293   # addi x5, x0, 13
+0010F193   # loop: andi x3, x1, 1
+00018463   # beq  x3, x0, +8      skip the +5 on even seeds
+00520213   # addi x4, x4, 5
+00120213   # addi x4, x4, 1
+025080B3   # mul  x1, x1, x5      next seed = seed * 13 + 7
+00708093   # addi x1, x1, 7
+FFF10113   # addi x2, x2, -1
+FE0112E3   # bne  x2, x0, -28
+00020513   # addi x10, x4, 0
+00100893   # addi x17, x0, 1      syscall 1: print integer
+00000073   # ecall                prints 28
+00000513   # addi x10, x0, 0
+05D00893   # addi x17, x0, 93     syscall 93: exit
+00000073   # ecall

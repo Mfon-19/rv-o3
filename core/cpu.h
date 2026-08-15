@@ -71,11 +71,10 @@
 #pragma once
 
 #include <cstdint>
-#include <functional>
 #include <string>
 #include <vector>
 
-#include "core/commit.h"
+#include "core/core.h"
 #include "core/fu.h"
 #include "core/retireq.h"
 #include "core/scoreboard.h"
@@ -103,25 +102,15 @@ struct IssueSlot {
 
 // The CPU
 
-class CPU {
+class CPU : public Core {
 public:
   CPU(const SimConfig &cfg, MemorySystem &msys);
 
-  // Load a program image (vector of 32-bit words) at address 0
-  void loadWords(const std::vector<uint32_t> &words);
-  void loadBytes(const std::vector<uint8_t> &bytes);
-
-  // Run until an exit syscall / ebreak / error, or the cycle budget runs out
-  int run();
-
-  void dumpRegs() const;
-
-  uint32_t reg(int i) const { return regs[i]; }
-
-  // Called once per retired instruction with its CommitRecord, in
-  // retirement order. Null by default; a differential checker plugs in
-  // here to compare the pipeline against the functional reference model
-  std::function<void(const CommitRecord &)> onCommit;
+  void loadWords(const std::vector<uint32_t> &words) override;
+  void loadBytes(const std::vector<uint8_t> &bytes) override;
+  int run() override;
+  void dumpRegs() const override;
+  uint32_t reg(int i) const override { return regs[i]; }
 
 private:
   // memory system

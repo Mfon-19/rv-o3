@@ -1,0 +1,23 @@
+# Directed OoO test: conservative memory ordering. The second store's
+# address comes out of a divide, so it resolves late; the younger load
+# to the same address (known immediately) is ready long before. The
+# LSQ must hold the load until the store's address is known, then
+# forward 99 — a load that sneaks past the unresolved store would read
+# the stale 77 parked there earlier.
+# Expected output: 99, exit 0.
+40000213   # addi x4, x0, 1024    the load's address, known early
+00200293   # addi x5, x0, 2
+00020313   # addi x6, x4, 0
+00630333   # add  x6, x6, x6      2048
+04D00393   # addi x7, x0, 77
+00722023   # sw   x7, 0(x4)       park a stale 77 at 1024
+02535133   # divu x2, x6, x5      1024, slowly
+06300413   # addi x8, x0, 99
+00812023   # sw   x8, 0(x2)       address depends on the divide
+00022483   # lw   x9, 0(x4)       same address; must wait, sees 99
+00048513   # addi x10, x9, 0
+00100893   # addi x17, x0, 1      syscall 1: print integer
+00000073   # ecall                prints 99
+00000513   # addi x10, x0, 0
+05D00893   # addi x17, x0, 93     syscall 93: exit
+00000073   # ecall
