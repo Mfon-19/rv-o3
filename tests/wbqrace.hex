@@ -1,0 +1,48 @@
+# Directed memory test: writeback-queue ordering. A dirty line at
+# 0x2000 is evicted by a stream of same-set conflict stores while a
+# delayed load reloads it. A refill for a line still parked in the
+# writeback queue would read the STALE copy below (found in review);
+# the cache must instead restore the line from the queue. The race
+# window is only a few cycles in default timing, so this mainly
+# guards the reload round trip; the window itself was verified by
+# temporarily widening it (see doc/phase-4-ooo-memory.md).
+# Expected output: 42, exit 0.
+000020B7   # lui x1,0x2
+02A00113   # addi x2,x0,42
+0020A023   # sw x2,0(x1)
+000031B7   # lui x3,0x3
+0021A023   # sw x2,0(x3)
+000041B7   # lui x3,0x4
+0021A023   # sw x2,0(x3)
+000051B7   # lui x3,0x5
+0021A023   # sw x2,0(x3)
+000061B7   # lui x3,0x6
+0021A023   # sw x2,0(x3)
+000071B7   # lui x3,0x7
+0021A023   # sw x2,0(x3)
+000081B7   # lui x3,0x8
+0021A023   # sw x2,0(x3)
+000091B7   # lui x3,0x9
+0021A023   # sw x2,0(x3)
+0000A1B7   # lui x3,0xa
+0021A023   # sw x2,0(x3)
+0000B1B7   # lui x3,0xb
+0021A023   # sw x2,0(x3)
+0000C1B7   # lui x3,0xc
+0021A023   # sw x2,0(x3)
+0000D1B7   # lui x3,0xd
+0021A023   # sw x2,0(x3)
+0000E1B7   # lui x3,0xe
+0021A023   # sw x2,0(x3)
+0000F1B7   # lui x3,0xf
+0021A023   # sw x2,0(x3)
+000023B7   # lui x7,0x2
+00200293   # addi x5,x0,2
+00038393   # addi x7,x7,0
+0003A303   # lw x6,0(x7)
+00030513   # addi x10,x6,0
+00100893   # addi x17,x0,1
+00000073   # ecall
+00000513   # addi x10,x0,0
+05D00893   # addi x17,x0,93
+00000073   # ecall

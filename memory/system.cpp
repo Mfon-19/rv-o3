@@ -20,22 +20,33 @@ MemorySystem::MemorySystem(const SimConfig &cfg)
 }
 
 // Bottom-up: advance each level, then route its completions to the
-// requester above before that requester's own tick
+// requester above before that requester's own tick. Each routing pass
+// repeats after the requester's tick as well, because a tick can
+// issue a request that a latency-1 level below answers within the
+// call — the same-cycle contract must hold across level boundaries
 void MemorySystem::tick() {
   dram.tick();
   if (flat) {
     flatI->tick();
     return;
   }
-  while (dram.hasResponse())
-    l2->deliverBelowResponse(dram.response());
-  l2->tick();
-  while (l2->hasResponse()) {
-    MemResponse r = l2->response();
-    (r.src == SRC_L1I ? l1i : l1d)->deliverBelowResponse(r);
-  }
-  l1i->tick();
+  auto drainDram = [&] {
+    while (dram.hasResponse())
+      l2->deliverBelowResponse(dram.response());
+  };
+  auto drainL2 = [&] {
+    while (l2->hasResponse()) {
+      MemResponse r = l2->response();
+      (r.src == SRC_L1I ? l1i : l1d)->deliverBelowResponse(r);
+    }
+  };
+  drainDram();
+  l2->tick(); // may access a latency-1 DRAM combinationally
+  drainDram();
+  drainL2();
+  l1i->tick(); // may access a latency-1 L2 combinationally
   l1d->tick();
+  drainL2();
 }
 
 uint8_t MemorySystem::peek8(uint32_t addr) const {
@@ -61,10 +72,10 @@ void MemorySystem::printStats(uint64_t retired) const {
             "--- rvsim: %-3s %" PRIu64 " accesses, %" PRIu64
             " misses (%.2f%%, %.2f MPKI), %" PRIu64 " merged, %" PRIu64
             " hit-under-miss, %" PRIu64 " overlap cycles, %" PRIu64
-            " dirty evictions, %" PRIu64 " B in, %" PRIu64
-            " B out, avg latency %.2f cycles\n",
+            " dirty evictions, %" PRIu64 " wbq restores, %" PRIu64
+            " B in, %" PRIu64 " B out, avg latency %.2f cycles\n",
             c->name, s.accesses, s.misses, missRate, mpki, s.mergedMisses,
-            s.hitUnderMiss, s.overlapCycles, s.dirtyEvictions, s.bytesRead,
-            s.bytesWritten, avgLat);
+            s.hitUnderMiss, s.overlapCycles, s.dirtyEvictions,
+            s.wbqRestores, s.bytesRead, s.bytesWritten, avgLat);
   }
 }

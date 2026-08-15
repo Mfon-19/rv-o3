@@ -344,6 +344,10 @@ void OoOCore::violationScan(const LsqEntry &store) {
     snprintf(b, sizeof b, "load replay @0x%08x", vpc);
     events.push_back(b);
   }
+  // Squashed conditionals shifted the speculative history at fetch;
+  // rewind to the replaying load's snapshot, just like a mispredict
+  if (cfg.usePredictor)
+    pred.restore(rob.at(victim->robIdx).ghrBefore, false, false);
   recover(vseq - 1); // the load itself flushes too
   pendRedirect = true;
   pendTarget = vpc;
@@ -689,6 +693,10 @@ void OoOCore::dispatchStage() {
     e.seq = seq;
     e.pc = f.pc;
     e.ins = I;
+    // Every entry keeps its fetch-time history snapshot: a flush from
+    // ANY point (branch mispredict or load replay) must be able to
+    // rewind the speculative GHR to before the squashed branches
+    e.ghrBefore = f.ghrBefore;
 
     // Sources rename through the CURRENT map — including updates made
     // by the older instruction dispatched this same cycle — and before
@@ -727,7 +735,6 @@ void OoOCore::dispatchStage() {
       e.predictedTaken = f.predTaken;
       e.predictedTarget = f.predTarget;
       e.predIdx = f.predIdx;
-      e.ghrBefore = f.ghrBefore;
     }
 
     IqEntry *q = iq.allocate();

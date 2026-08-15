@@ -38,6 +38,7 @@ rvsim: $(OBJS)
 #   sort.hex       -> -8, -3, 0, 1, 5, 7, 9, 15, 23, 42 (one per line)
 #   sum.hex        -> 55     (loop + branch)
 #   wbfight.hex    -> 5, 27  (3 same-cycle completions, 2 writeback ports)
+#   wbqrace.hex    -> 42     (dirty evict + reload: wbq/refill ordering)
 .PHONY: test
 test: rvsim
 	@for t in tests/*.hex; do \
@@ -57,7 +58,7 @@ RANDDIR ?= /tmp/rvsim-randtest
 randtest: rvsim
 	@mkdir -p $(RANDDIR)
 	@for s in $$(seq 1 $(SEEDS)); do \
-		python3 tests/randgen.py $$s 60 > $(RANDDIR)/r$$s.hex; \
+		python3 tests/randgen.py $$s 120 > $(RANDDIR)/r$$s.hex; \
 		./rvsim -d $(RANDDIR)/r$$s.hex >/dev/null 2>$(RANDDIR)/r$$s.err \
 			|| { echo "FAIL seed $$s ($(RANDDIR)/r$$s.hex)"; \
 			     tail -4 $(RANDDIR)/r$$s.err; exit 1; }; \

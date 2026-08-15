@@ -45,6 +45,7 @@ struct CacheStats {
   uint64_t hits = 0;
   uint64_t misses = 0;
   uint64_t mergedMisses = 0;   // misses absorbed by an existing MSHR
+  uint64_t wbqRestores = 0;    // lines pulled back from the wb queue
   uint64_t hitUnderMiss = 0;   // hits served while a miss was pending
   uint64_t overlapCycles = 0;  // cycles with 2+ misses outstanding
   uint64_t dirtyEvictions = 0;

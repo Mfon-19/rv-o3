@@ -43,11 +43,16 @@ def b_t(imm, rs2, rs1, f3):
         | (((u >> 11) & 1) << 7) | 0x63
 
 
-BASES = [(1, 0x200), (2, 0x240), (3, 0x280)]  # three lines to fight over
-DATA = [4, 5, 6, 7, 8, 9, 11, 12, 13, 14]     # scratch registers
+# Three lines to fight over, parked at 8 KiB — far above any program
+# this generator can emit, so stores can never reach the code image
+DATA_REGION = 0x2000
+BASES = [(1, 0x00), (2, 0x40), (3, 0x80)]
+DATA = [4, 5, 6, 7, 8, 9, 11, 12, 13, 14]  # scratch registers
 
-for reg, addr in BASES:
-    emit(i_t(addr, 0, 0, reg, 0x13), f"addi x{reg}, x0, {addr}")
+for reg, off in BASES:
+    emit((2 << 12) | (reg << 7) | 0x37, f"lui x{reg}, 0x2")  # 0x2000
+    if off:
+        emit(i_t(off, reg, 0, reg, 0x13), f"addi x{reg}, x{reg}, {off}")
 for k, reg in enumerate(DATA):
     v = random.randint(1, 200)
     emit(i_t(v, 0, 0, reg, 0x13), f"addi x{reg}, x0, {v}")
@@ -82,6 +87,17 @@ def mem(is_store):
         emit(i_t(off, base, f3, reg, 0x03), f"{name} x{reg}, {off}(x{base})")
 
 
+def conflict_store():
+    # 0x3000..0xb000 all map to the same set as the 0x2000 base line —
+    # nine lines fighting over eight ways, so the dirty base line gets
+    # evicted regularly and promptly re-accessed: real pressure on the
+    # writeback queue and its ordering against refills
+    k = random.randint(3, 11)
+    reg = random.choice(DATA)
+    emit((k << 12) | (15 << 7) | 0x37, f"lui x15, {k:#x}")
+    emit(s_t(0, reg, 15, 2), f"sw x{reg}, 0(x15)")
+
+
 def slow_mem(is_store):
     # An address that resolves LATE: derived from a divide, masked back
     # into a base line. This is what forces load speculation (and
@@ -102,15 +118,18 @@ def slow_mem(is_store):
 n = 0
 while n < nops:
     r = random.random()
-    if r < 0.28:
+    if r < 0.25:
         alu()
-    elif r < 0.50:
+    elif r < 0.45:
         mem(is_store=True)
-    elif r < 0.72:
+    elif r < 0.67:
         mem(is_store=False)
-    elif r < 0.84:  # late-resolving address: the speculation stressor
+    elif r < 0.76:  # late-resolving address: the speculation stressor
         slow_mem(is_store=random.random() < 0.7)
         n += 3
+    elif r < 0.90:  # eviction pressure: the writeback-queue stressor
+        conflict_store()
+        n += 1
     else:  # forward branch skipping one instruction — always convergent
         a, b = random.choice(DATA), random.choice(DATA)
         f3, name = random.choice([(0, "beq"), (1, "bne")])
@@ -128,6 +147,10 @@ emit(0x73, "ecall")
 emit(i_t(0, 0, 0, 10, 0x13), "addi x10, x0, 0")
 emit(i_t(93, 0, 0, 17, 0x13), "addi x17, x0, 93")
 emit(0x73, "ecall")
+
+if 4 * len(out) >= DATA_REGION:
+    sys.exit(f"randgen: {len(out)} instructions would overlap the "
+             f"data region at {DATA_REGION:#x}; lower NOPS")
 
 print(f"# random memory soup, seed {seed}, {nops} ops (tests/randgen.py)")
 print("\n".join(out))

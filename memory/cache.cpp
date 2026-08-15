@@ -148,11 +148,42 @@ void Cache::access(const MemRequest &req) {
     return;
   }
 
+  // A miss whose line is still parked in the writeback queue must NOT
+  // refill from below — the level below is stale until that writeback
+  // lands, and a refill would overtake it. Pull the line straight back
+  // into the arrays (a victim-cache restore) and serve it as a hit
+  for (size_t i = 0; i < wbq.size(); i++) {
+    if (wbq[i].addr == lineAddr) {
+      uint32_t s, w;
+      claimWay(lineAddr, s, w); // canAccept() guaranteed queue room
+      const uint32_t li = s * cfg.ways + w;
+      memcpy(lineData(s, w), wbq[i].line.data(), cfg.lineBytes);
+      tags[li] = tagOf(req.addr);
+      valid[li] = 1;
+      dirty[li] = 1; // it was queued below precisely because it was dirty
+      wbq.erase(wbq.begin() + i);
+      stats.hits++;
+      stats.wbqRestores++;
+      finishHit(performOnLine(req, s, w));
+      return;
+    }
+  }
+
   stats.misses++;
   if (req.isWrite && req.size == cfg.lineBytes) {
     // Full-line write (an upper cache's dirty victim): every byte is
-    // overwritten, so install directly, no refill. canAccept()
-    // guaranteed writeback-queue room for our own victim
+    // overwritten, so install directly, no refill — UNLESS a refill
+    // for this very line is already in flight (the other L1 wants
+    // it): installing now would later be overwritten by the stale
+    // refill. Join the MSHR instead; replay applies this write over
+    // the refilled line in arrival order
+    const int inflight = mshrFor(lineAddr);
+    if (inflight >= 0) {
+      stats.mergedMisses++;
+      mshrs[inflight].waiting.push_back(Waiting{req, tickCount});
+      return;
+    }
+    // canAccept() guaranteed writeback-queue room for our own victim
     uint32_t s, w;
     claimWay(lineAddr, s, w);
     const uint32_t i = s * cfg.ways + w;
