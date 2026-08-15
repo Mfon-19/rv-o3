@@ -1,13 +1,9 @@
 // Main memory: flat, byte addressable, little-endian, zero-initialized
 //
-// A single unified memory that holds both instructions and data. The
-// current five-stage core pretends IF and MEM use separate ports, so
-// there is never a structural hazard between fetch and load, and every
-// access completes in the cycle it is issued.
-//
-// This directory will grow the timed memory system (request/response
-// ports, caches, DRAM models); this flat array will remain at the
-// bottom of that hierarchy as the backing store.
+// A single unified memory that holds both instructions and data. It
+// sits at the bottom of the timed memory system (request/response
+// ports, caches, DRAM) as the backing store, and is what the
+// functional reference model executes against directly.
 
 #pragma once
 

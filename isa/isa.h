@@ -7,8 +7,8 @@
 // programs can print and exit, EBREAK stops the simulation.
 //
 // Everything in isa/ is timing-free: pure decode, pure execute semantics,
-// and disassembly. Any timing model (the five-stage core today, other
-// cores later) and the functional reference model all build on these
+// and disassembly. Any timing model (the out-of-order core today,
+// others later) and the functional reference model all build on these
 // same definitions, so their architectural behavior cannot diverge.
 
 #pragma once

@@ -5,7 +5,7 @@
 // it produces and any control transfer it causes. Where the operands
 // come from (the register file, a forwarding network, a physical
 // register file...) and how long it takes are the timing model's
-// business, not this file's. The five-stage core's EX stage and the
+// business, not this file's. The core's issue stage and the
 // functional reference model both call this same function.
 
 #pragma once

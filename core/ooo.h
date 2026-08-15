@@ -25,7 +25,7 @@
 //        entries whose operands and functional unit are available.
 //        Values are read from the physical register file at issue;
 //        execute() computes results immediately and the units delay
-//        their visibility, exactly as in the in-order core
+//        their visibility
 //      - Writeback (2 ports, oldest-first arbitration): writes the
 //        physical register, broadcasts the register number to wake the
 //        issue queue, marks the ROB entry done. Branches resolve here:
@@ -45,9 +45,10 @@
 //        machine (ROB and store buffer drained) and act at commit
 //
 // Simulation technique
-//      Same discipline as the in-order core: stages run in reverse
-//      pipeline order each cycle (commit, writeback, LSQ, issue,
-//      dispatch, fetch), units tick at the clock edge, and
+//      Stages run in reverse pipeline order each cycle (commit,
+//      writeback, LSQ, issue, dispatch, fetch), so each consumes what
+//      the stage behind it produced in an earlier cycle; units tick
+//      at the clock edge, and
 //      writeback-before-issue makes a value written back in cycle N
 //      issueable in cycle N — the wakeup path needs no forwarding
 //      network.
@@ -56,10 +57,11 @@
 
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <string>
 #include <vector>
 
-#include "core/core.h"
+#include "core/commit.h"
 #include "core/fu.h"
 #include "core/iq.h"
 #include "core/lsq.h"
@@ -71,16 +73,28 @@
 #include "sim/config.h"
 #include "sim/stats.h"
 
-class OoOCore : public Core {
+class OoOCore {
 public:
   OoOCore(const SimConfig &cfg, MemorySystem &msys);
 
-  void loadWords(const std::vector<uint32_t> &words) override;
-  void loadBytes(const std::vector<uint8_t> &bytes) override;
-  int run() override;
-  void dumpRegs() const override;
-  // Architectural registers live behind the rename map
-  uint32_t reg(int i) const override { return prf.val[rmap.map[i]]; }
+  // Load a program image at address 0
+  void loadWords(const std::vector<uint32_t> &words);
+  void loadBytes(const std::vector<uint8_t> &bytes);
+
+  // Run until an exit syscall / ebreak / error, or the cycle budget
+  // runs out; returns the exit code
+  int run();
+
+  void dumpRegs() const;
+
+  // The architectural value of register i, read through the rename
+  // map — the differential checker compares final state with this
+  uint32_t reg(int i) const { return prf.val[rmap.map[i]]; }
+
+  // Called once per committed instruction with its CommitRecord, in
+  // commit order. Null by default; the differential checker plugs in
+  // here to compare the core against the functional reference model
+  std::function<void(const CommitRecord &)> onCommit;
 
 private:
   const SimConfig cfg;
@@ -101,7 +115,7 @@ private:
   StoreBuffer sb;
   Predictor pred;
 
-  // functional units (shared FuUnit model with the in-order core)
+  // functional units
   std::vector<FuUnit> alus;
   FuUnit brUnit, mulUnit, divUnit;
   FuUnit agu; // address generation; drains to the LSQ, not a WB port
