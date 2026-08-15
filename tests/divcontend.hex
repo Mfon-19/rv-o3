@@ -1,0 +1,25 @@
+# Directed FU test: functional-unit contention and WAW blocking.
+# The divider is non-pipelined: the second divu stalls at issue
+# (structural hazard) until the first one's quotient drains. Then a
+# div into x8 immediately overwritten by "addi x8, x0, 7" forces the
+# WAW interlock: the addi must wait for the divide's writeback or the
+# register file would end up holding the stale quotient.
+# Expected output: 30 then 7, exit 0.
+06400093   # addi x1, x0, 100
+00400113   # addi x2, x0, 4
+01E00193   # addi x3, x0, 30
+00600213   # addi x4, x0, 6
+0220D2B3   # divu x5, x1, x2      25, occupies the divider
+0241D333   # divu x6, x3, x4      5, waits for the divider
+006283B3   # add  x7, x5, x6      30
+00038513   # addi x10, x7, 0
+00100893   # addi x17, x0, 1      syscall 1: print integer
+00000073   # ecall                prints 30
+0220C433   # div  x8, x1, x2      25 in flight...
+00700413   # addi x8, x0, 7       ...WAW: waits, then makes x8 = 7
+00040513   # addi x10, x8, 0
+00100893   # addi x17, x0, 1
+00000073   # ecall                prints 7
+00000513   # addi x10, x0, 0
+05D00893   # addi x17, x0, 93     syscall 93: exit
+00000073   # ecall

@@ -8,7 +8,7 @@
 // response has been consumed.
 //
 // Latency convention: latency 1 means the response is ready in the same
-// cycle access() is called (a combinational answer, like the phase-0
+// cycle access() is called (a combinational answer, like the original
 // flat memory). Latency L makes the response ready after L-1 further
 // tick()s. tick() advances a device by one clock cycle; the simulator
 // ticks the whole hierarchy bottom-up once per core cycle.

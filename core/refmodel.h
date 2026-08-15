@@ -54,6 +54,7 @@ public:
   bool halted() const { return halted_; }
   int exitCode() const { return exitCode_; }
   uint64_t retired() const { return retired_; }
+  uint32_t reg(int i) const { return regs[i]; }
 
 private:
   // architectural state — this is all of it

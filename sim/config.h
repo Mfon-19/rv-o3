@@ -24,10 +24,10 @@ struct SimConfig {
   bool refModel = false;           // -f: run the functional reference model
   bool diffCheck = false;          // -d: lockstep pipeline-vs-reference check
 
-  // Memory hierarchy (phase 1). Deliberately not exposed on the CLI —
-  // these are the fixed defaults until a proper configuration interface
-  // exists (phase 5's sweeps will need one). flatMemory reproduces the
-  // phase-0 dual-ported flat-memory timing exactly and is kept for
+  // Memory hierarchy. Deliberately not exposed on the CLI — these are
+  // the fixed defaults until a proper configuration interface exists
+  // (the design-space sweeps will need one). flatMemory reproduces the
+  // original dual-ported flat-memory timing exactly and is kept for
   // regression debugging
   bool flatMemory = false;   // no caches, direct fixed-latency ports
   uint32_t flatLatency = 1;  // flat-mode access latency
@@ -35,4 +35,13 @@ struct SimConfig {
   CacheConfig l1i{32 * 1024, 8, 64, 1};
   CacheConfig l1d{32 * 1024, 8, 64, 1};
   CacheConfig l2{256 * 1024, 8, 64, 4};
+
+  // Functional units. Internal like the cache geometry —
+  // the future configuration interface exposes these, not the CLI
+  uint32_t aluCount = 2;        // 1-cycle pipelined integer ALUs
+  uint32_t mulLatency = 3;      // multiplier result latency
+  bool mulPipelined = true;     // one new multiply may start per cycle
+  uint32_t divLatency = 12;     // divider occupancy (non-pipelined)
+  uint32_t wbPorts = 2;         // completions written back per cycle
+  uint32_t retireQueueSize = 32;
 };

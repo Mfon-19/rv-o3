@@ -118,10 +118,36 @@ inline bool usesRs2(Op op) {
   return isBranch(op) || isStore(op) || (op >= Op::ADD && op <= Op::REMU);
 }
 
-// Is the rs2 value needed in the EX stage? Stores are the exception
-// since they only need the data in MEM, and the MEM/WB -> MEM forwarding
-// path covers them, so a load feeding a store's data never has to stall
-inline bool rs2NeededInEX(Op op) { return usesRs2(op) && !isStore(op); }
+// Is the rs2 value needed at issue time? Stores are the exception:
+// they only need the data when the memory access starts, one cycle
+// later, and the writeback broadcast delivers it if it is still in
+// flight — so a load feeding a store's data never has to stall
+inline bool rs2NeededAtIssue(Op op) { return usesRs2(op) && !isStore(op); }
+
+// Which functional unit executes each op. System ops (fence,
+// ecall, ebreak, illegal) need no unit: they serialize the machine and
+// take effect at retirement
+enum class FuKind : uint8_t { ALU, BRANCH, MUL, DIV, LSU, NONE };
+
+inline FuKind fuKindOf(Op op) {
+  if (isLoad(op) || isStore(op))
+    return FuKind::LSU;
+  if (isBranch(op) || op == Op::JAL || op == Op::JALR)
+    return FuKind::BRANCH;
+  if (op >= Op::MUL && op <= Op::MULHU)
+    return FuKind::MUL;
+  if (op >= Op::DIV && op <= Op::REMU)
+    return FuKind::DIV;
+  switch (op) {
+  case Op::FENCE:
+  case Op::ECALL:
+  case Op::EBREAK:
+  case Op::ILLEGAL:
+    return FuKind::NONE;
+  default:
+    return FuKind::ALU; // U-type and all ALU ops
+  }
+}
 
 // ABI register names, indexed by register number
 extern const char *const kRegName[32];

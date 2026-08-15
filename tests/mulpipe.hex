@@ -1,0 +1,20 @@
+# Directed FU test: multiple multiplies in flight.
+# The pipelined multiplier accepts a new op every cycle, so three
+# back-to-back independent muls have all three stages occupied at
+# once; results emerge one per cycle in order.
+# Expected output: 38, exit 0.
+00200093   # addi x1, x0, 2
+00300113   # addi x2, x0, 3
+00400193   # addi x3, x0, 4
+00500213   # addi x4, x0, 5
+022082B3   # mul  x5, x1, x2      6   \
+02310333   # mul  x6, x2, x3      12   } three in flight together
+024183B3   # mul  x7, x3, x4      20  /
+00628433   # add  x8, x5, x6      18
+00740433   # add  x8, x8, x7      38
+00040513   # addi x10, x8, 0
+00100893   # addi x17, x0, 1      syscall 1: print integer
+00000073   # ecall                prints 38
+00000513   # addi x10, x0, 0
+05D00893   # addi x17, x0, 93     syscall 93: exit
+00000073   # ecall

@@ -1,0 +1,27 @@
+# Directed FU test: simultaneous completion on limited writeback ports.
+# The first print serializes the machine, draining the warm-up store's
+# cache miss so the trio below runs with deterministic latencies. Then
+# mul (latency 3, issued first), lw (address generation + 1-cycle hit,
+# issued second) and addi (latency 1, issued third) all complete in
+# the same cycle — three results, two writeback ports. The two oldest
+# (mul, lw) write back; the addi holds its ALU's output slot one cycle
+# ("wb port conflict"). Values must still come out right.
+# Expected output: 5 then 27, exit 0.
+00300093   # addi x1, x0, 3
+00500113   # addi x2, x0, 5
+10000313   # addi x6, x0, 256
+00232023   # sw   x2, 0(x6)       park 5 in memory (cold miss, warms the line)
+00010513   # addi x10, x2, 0
+00100893   # addi x17, x0, 1      syscall 1: print integer
+00000073   # ecall                prints 5; serializes, miss fully drained
+022081B3   # mul  x3, x1, x2      15, completes in 3 cycles
+00032203   # lw   x4, 0(x6)       5, hit: completes 2 cycles after issue
+00700293   # addi x5, x0, 7       completes 1 cycle after issue
+004183B3   # add  x7, x3, x4      20
+005383B3   # add  x7, x7, x5      27
+00038513   # addi x10, x7, 0
+00100893   # addi x17, x0, 1
+00000073   # ecall                prints 27
+00000513   # addi x10, x0, 0
+05D00893   # addi x17, x0, 93     syscall 93: exit
+00000073   # ecall

@@ -2,9 +2,9 @@
 //
 // Wraps the flat backing Memory behind a MemPort: any request (scalar
 // or whole-line) is answered after a fixed number of cycles. With
-// latency 1 it answers combinationally, which is exactly the phase-0
-// flat-memory timing — the --flat mode attaches two of these directly
-// to the core's fetch and data ports.
+// latency 1 it answers combinationally, which is exactly the original
+// flat-memory timing — flat mode attaches two of these directly to
+// the core's fetch and data ports.
 
 #pragma once
 

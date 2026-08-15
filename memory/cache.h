@@ -1,7 +1,7 @@
 // A blocking, write-back, write-allocate set-associative cache.
 //
 // One class serves as L1I, L1D, and L2 — an L1's `below` port is the
-// L2, the L2's is DRAM. The phase-1 simplifications, on purpose:
+// L2, the L2's is DRAM. The deliberate first-version simplifications:
 //
 //   - blocking: exactly one access in flight, no MSHRs, no
 //     hit-under-miss; canAccept() is the backpressure

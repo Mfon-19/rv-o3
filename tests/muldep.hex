@@ -1,0 +1,15 @@
+# Directed FU test: dependent instruction after a multiply.
+# The addi needs the mul's result, so it waits out the multiplier's
+# full result latency (2 issue bubbles at the default latency of 3,
+# where an ALU producer would cost none).
+# Expected output: 43, exit 0.
+00700093   # addi x1, x0, 7
+00600113   # addi x2, x0, 6
+022081B3   # mul  x3, x1, x2      42
+00118213   # addi x4, x3, 1       dependent: 43
+00020513   # addi x10, x4, 0
+00100893   # addi x17, x0, 1      syscall 1: print integer
+00000073   # ecall                prints 43
+00000513   # addi x10, x0, 0
+05D00893   # addi x17, x0, 93     syscall 93: exit
+00000073   # ecall

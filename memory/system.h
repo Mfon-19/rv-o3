@@ -7,9 +7,10 @@
 //                          +--> unified L2 --> DRAM --> backing Memory
 //   core MEM port -> L1D --+
 //
-// Flat mode (--flat): two independent fixed-latency ports straight to
-// the backing store, which at latency 1 reproduces the phase-0 timing
-// model exactly (dual-ported flat memory, no structural hazards).
+// Flat mode (SimConfig::flatMemory): two independent fixed-latency
+// ports straight to the backing store, which at latency 1 reproduces
+// the original timing model exactly (dual-ported flat memory, no
+// structural hazards).
 //
 // The L2 is single-ported: when both L1s want it in the same cycle,
 // one sees canAccept() == false and retries — that is the explicit

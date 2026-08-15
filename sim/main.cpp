@@ -171,8 +171,33 @@ int main(int argc, char **argv) {
               code, ref.halted() ? "halted" : "still running", ref.exitCode());
       exit(1);
     }
+    // Final architectural state. The commit stream alone cannot catch
+    // everything once results complete out of order: a WAW violation
+    // produces per-instruction records that are all individually
+    // correct while the stale result lands in the register file last.
+    // So the settled state is compared too (memory through peek8 —
+    // the newest copy of a byte may still be in a cache)
+    for (int r = 0; r < 32; r++) {
+      if (cpu.reg(r) != ref.reg(r)) {
+        fprintf(stderr,
+                "differential check FAILED: final %s diverges "
+                "(pipeline 0x%08x, reference 0x%08x)\n",
+                kRegName[r], cpu.reg(r), ref.reg(r));
+        exit(1);
+      }
+    }
+    for (uint32_t a = 0; a < (uint32_t)cfg.memBytes; a++) {
+      if (msys.peek8(a) != ref.mem.bytes[a]) {
+        fprintf(stderr,
+                "differential check FAILED: final mem[0x%08x] diverges "
+                "(pipeline 0x%02x, reference 0x%02x)\n",
+                a, msys.peek8(a), ref.mem.bytes[a]);
+        exit(1);
+      }
+    }
     fprintf(stderr,
-            "--- rvsim: differential check: %" PRIu64 " commits verified\n",
+            "--- rvsim: differential check: %" PRIu64
+            " commits verified, final state matches\n",
             verified);
   }
 

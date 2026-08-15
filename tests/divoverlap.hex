@@ -1,0 +1,18 @@
+# Directed FU test: independent ALU work overlapping a divide.
+# The three addi's don't touch the divide's registers, so they issue
+# and retire while the divider grinds — the whole point of splitting
+# EX into units. The add then waits for the quotient (raw stall).
+# Expected output: 45, exit 0.
+05400093   # addi x1, x0, 84
+00200113   # addi x2, x0, 2
+0220C1B3   # div  x3, x1, x2      42, occupies the divider
+00100213   # addi x4, x0, 1       independent work
+00120213   # addi x4, x4, 1       ...flows past the divide
+00120213   # addi x4, x4, 1       x4 = 3
+004182B3   # add  x5, x3, x4      45, waits for the quotient
+00028513   # addi x10, x5, 0
+00100893   # addi x17, x0, 1      syscall 1: print integer
+00000073   # ecall                prints 45
+00000513   # addi x10, x0, 0
+05D00893   # addi x17, x0, 93     syscall 93: exit
+00000073   # ecall
