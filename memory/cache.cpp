@@ -121,7 +121,8 @@ bool Cache::claimWay(uint32_t lineAddr, uint32_t &set, uint32_t &way) {
     if (wbq.size() >= cfg.wbq)
       return false;
     stats.dirtyEvictions++;
-    stats.bytesWritten += cfg.lineBytes;
+    // bytesWritten is charged when the writeback is actually SENT —
+    // a wbq restore can still cancel this entry
     WbEntry wb;
     wb.addr = lineAddrOf(set, way);
     wb.line.assign(lineData(set, way), lineData(set, way) + cfg.lineBytes);
@@ -279,6 +280,7 @@ void Cache::tick() {
       wb.src = srcId;
       wb.tag = kWbTag;
       wbq.pop_front();
+      stats.bytesWritten += cfg.lineBytes; // the transfer really happens
       below->access(wb);
     } else if (refillIdx >= 0) {
       MemRequest rd;
@@ -312,6 +314,24 @@ bool Cache::peek8(uint32_t addr, uint8_t &out) const {
   for (const WbEntry &wb : wbq) { // evicted but not yet written below
     if (addr >= wb.addr && addr < wb.addr + cfg.lineBytes) {
       out = wb.line[addr - wb.addr];
+      return true;
+    }
+  }
+  // Writes waiting in an MSHR (a merged dirty victim from above, or a
+  // scalar store to a missing line) have left every other structure;
+  // until the refill lands they exist only here. Newest-first, a
+  // waiting write covering this byte IS its current value; uncovered
+  // bytes still come from the level below. (A line is never in the
+  // arrays, the wb queue, and an MSHR at once, so order is unambiguous)
+  for (const Mshr &m : mshrs) {
+    if (!m.valid)
+      continue;
+    for (size_t j = m.waiting.size(); j-- > 0;) {
+      const MemRequest &r = m.waiting[j].req;
+      if (!r.isWrite || addr < r.addr || addr >= r.addr + r.size)
+        continue;
+      out = (r.size > 4) ? r.wline[addr - r.addr]
+                         : (uint8_t)(r.wdata >> (8 * (addr - r.addr)));
       return true;
     }
   }
