@@ -7,24 +7,26 @@
 // The rules every mode shares:
 //
 //   - An older store to exactly the load's address and size hands the
-//     load its data directly (a forward); a partial overlap makes the
-//     load wait until that store has drained to the cache.
+//     load its data directly (a forward). A partial overlap makes the
+//     load wait until that store has drained to the cache; there is no
+//     byte merging across stores.
 //   - Stores touch memory only after they commit: commit moves them
 //     to the store buffer, which drains to the data port in order.
 //
 // How far a load may run ahead of older stores whose addresses are
 // not known yet is the configurable part (SimConfig::memOrder): wait
-// for all of them (Conservative), pass only stores proven not to
-// overlap (Bypass), or guess that unknown addresses will not overlap
-// and re-execute the load if the guess was wrong (Speculative, the
-// default; the re-execution is called a replay and reuses the branch
-// recovery machinery).
+// for all of them (Conservative, which also issues loads one at a
+// time), pass only stores proven not to overlap (Bypass), or guess
+// that unknown addresses will not overlap and re-execute the load if
+// the guess was wrong (Speculative, the default). The re-execution is
+// called a replay and reuses the branch recovery machinery.
 
 #pragma once
 
 #include <cstdint>
 #include <vector>
 
+#include "core/ring.h"
 #include "isa/isa.h"
 
 struct LsqEntry {
@@ -38,12 +40,13 @@ struct LsqEntry {
   uint32_t addr = 0;
   uint8_t size = 4;
   // Stores: address and data resolve independently. The data operand's
-  // physical register is watched until it's ready (its producer writes
-  // it exactly once, so a late capture is always safe)
+  // physical register is watched until it is ready; it is written
+  // exactly once while this store is live, so a late capture is
+  // always safe
   uint32_t data = 0;
   uint8_t dataPreg = 0xFF;
   bool dataReady = true;
-  bool done = false; // loads: value produced (forwarded or from cache)
+  bool done = false;     // loads: value produced (forwarded or from cache)
   bool issued = false;   // loads: access in flight at the cache
   bool reported = false; // loads: handed to the writeback arbiter
   uint16_t gen = 0;      // slot generation, embedded in the access tag
@@ -51,55 +54,33 @@ struct LsqEntry {
   uint32_t value = 0;
 };
 
-class LSQ {
-public:
-  explicit LSQ(uint32_t size) : e(size), genCtr(size, 0) {}
+// Do two accesses touch any byte in common?
+inline bool overlaps(uint32_t a, uint32_t aSize, uint32_t b, uint32_t bSize) {
+  return a + aSize > b && b + bSize > a;
+}
 
-  bool empty() const { return n == 0; }
-  bool full() const { return n == e.size(); }
-  uint32_t count() const { return n; }
+// A ring of LsqEntry whose slots carry a generation number, so the
+// response to a squashed load's cache access cannot be mistaken for
+// the slot's next occupant's
+class LSQ : public Ring<LsqEntry> {
+public:
+  explicit LSQ(uint32_t size) : Ring(size), genCtr(size, 0) {}
 
   uint32_t alloc() {
-    uint32_t idx = (headIdx + n) % (uint32_t)e.size();
-    e[idx] = LsqEntry{};
-    e[idx].gen = ++genCtr[idx]; // stale responses to this slot die here
-    n++;
+    const uint32_t idx = Ring::alloc();
+    at(idx).gen = ++genCtr[idx]; // stale responses to this slot die here
     return idx;
   }
 
-  // Is this ring slot currently occupied by a live entry?
-  bool live(uint32_t idx) const {
-    return (idx + (uint32_t)e.size() - headIdx) % (uint32_t)e.size() < n;
-  }
-
-  LsqEntry &at(uint32_t idx) { return e[idx]; }
-  LsqEntry &head() { return e[headIdx]; }
-  LsqEntry &tail() { return e[(headIdx + n - 1) % (uint32_t)e.size()]; }
-  // k-th oldest, 0 = head
-  LsqEntry &nth(uint32_t k) { return e[(headIdx + k) % (uint32_t)e.size()]; }
-  // the stable ring index of the k-th oldest entry (what FuOps carry)
-  uint32_t indexOf(uint32_t k) const {
-    return (headIdx + k) % (uint32_t)e.size();
-  }
-
-  void popHead() {
-    headIdx = (headIdx + 1) % (uint32_t)e.size();
-    n--;
-  }
-  void popTail() { n--; }
-
 private:
-  std::vector<LsqEntry> e;
   std::vector<uint16_t> genCtr;
-  uint32_t headIdx = 0;
-  uint32_t n = 0;
 };
 
-// Committed stores waiting to be written to the cache, issued in
-// order, several in flight at once; entries stay (visible to load
+// Committed stores waiting to be written to the cache: issued in
+// order, several in flight at once. Entries stay (visible to load
 // forwarding) until the cache acknowledges, and pop in order. A full
-// store buffer stalls commit (and gets priority for the data port, so
-// it always drains eventually)
+// store buffer stalls commit and gets priority for the data port, so
+// it always drains eventually
 struct StoreBufEntry {
   uint32_t addr = 0;
   uint8_t size = 4;
@@ -109,25 +90,4 @@ struct StoreBufEntry {
   uint32_t txn = 0;      // matches the ack to this entry
 };
 
-class StoreBuffer {
-public:
-  explicit StoreBuffer(uint32_t size) : e(size) {}
-  bool empty() const { return n == 0; }
-  bool full() const { return n == e.size(); }
-  uint32_t count() const { return n; }
-  void push(const StoreBufEntry &s) {
-    e[(headIdx + n) % (uint32_t)e.size()] = s;
-    n++;
-  }
-  StoreBufEntry &head() { return e[headIdx]; }
-  StoreBufEntry &nth(uint32_t k) { return e[(headIdx + k) % (uint32_t)e.size()]; }
-  void popHead() {
-    headIdx = (headIdx + 1) % (uint32_t)e.size();
-    n--;
-  }
-
-private:
-  std::vector<StoreBufEntry> e;
-  uint32_t headIdx = 0;
-  uint32_t n = 0;
-};
+using StoreBuffer = Ring<StoreBufEntry>;

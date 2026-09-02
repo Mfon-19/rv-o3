@@ -1,11 +1,10 @@
 # Directed memory test: writeback-queue ordering. A dirty line at
 # 0x2000 is evicted by a stream of same-set conflict stores while a
 # delayed load reloads it. A refill for a line still parked in the
-# writeback queue would read the STALE copy below (found in review);
-# the cache must instead restore the line from the queue. The race
-# window is only a few cycles in default timing, so this mainly
-# guards the reload round trip; the window itself was verified by
-# temporarily widening it (see doc/phase-4-ooo-memory.md).
+# writeback queue would read the STALE copy below; the cache must
+# instead restore the line from the queue. The race window is only a
+# few cycles in default timing, so this mainly guards the reload
+# round trip.
 # Expected output: 42, exit 0.
 000020B7   # lui x1,0x2
 02A00113   # addi x2,x0,42

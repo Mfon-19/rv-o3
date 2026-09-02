@@ -8,7 +8,7 @@
 #   * signed comparisons
 #   * repeated loads and stores
 #   * load-use stalls in the compare loop
-#   * forwarding into stores
+#   * load-to-store data dependencies captured through the LSQ
 #   * early termination when a pass performs no swaps
 #   * repeated print syscalls
 #

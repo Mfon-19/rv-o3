@@ -4,7 +4,7 @@
 # the parked 55, and when the store's address resolves the ordering
 # violation is detected: the load and everything younger flush and
 # refetch (1 replay in the stats), re-reading 99 by forwarding. In the
-# conservative modes the load simply waits. Either way: 100.
+# non-speculative modes the load waits for the address. Either way: 100.
 # Expected output: 100, exit 0.
 10000213   # addi x4, x0, 256     the aliased address
 00400293   # addi x5, x0, 4

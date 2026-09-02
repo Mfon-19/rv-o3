@@ -6,7 +6,7 @@ ExecResult execute(const Instr &I, uint32_t pc, uint32_t a, uint32_t b) {
   const uint32_t imm = (uint32_t)I.imm;
 
   switch (I.op) {
-  // upper-immediate
+  // upper immediate
   case Op::LUI:
     out.value = imm;
     break;
@@ -26,36 +26,24 @@ ExecResult execute(const Instr &I, uint32_t pc, uint32_t a, uint32_t b) {
     out.target = (a + imm) & ~1u; // ISA clears bit 0
     break;
 
-  // conditional branches: compare, redirect only if taken
+  // conditional branches: redirect only if taken (target below)
   case Op::BEQ:
-    if (a == b) {
-      out.redirect = true;
-    }
+    out.redirect = a == b;
     break;
   case Op::BNE:
-    if (a != b) {
-      out.redirect = true;
-    }
+    out.redirect = a != b;
     break;
   case Op::BLT:
-    if (sa < sb) {
-      out.redirect = true;
-    }
+    out.redirect = sa < sb;
     break;
   case Op::BGE:
-    if (sa >= sb) {
-      out.redirect = true;
-    }
+    out.redirect = sa >= sb;
     break;
   case Op::BLTU:
-    if (a < b) {
-      out.redirect = true;
-    }
+    out.redirect = a < b;
     break;
   case Op::BGEU:
-    if (a >= b) {
-      out.redirect = true;
-    }
+    out.redirect = a >= b;
     break;
 
   // memory: execute only computes the effective address
@@ -131,9 +119,8 @@ ExecResult execute(const Instr &I, uint32_t pc, uint32_t a, uint32_t b) {
     out.value = a & b;
     break;
 
-  // M extension. The results follow the ISA exactly, including the
-  // divide-by-zero and overflow special cases, which RISC-V defines
-  // instead of trapping
+  // M extension. RISC-V defines results for divide-by-zero and signed
+  // overflow instead of trapping; C does not, so they are spelled out
   case Op::MUL:
     out.value = a * b;
     break;
@@ -169,7 +156,7 @@ ExecResult execute(const Instr &I, uint32_t pc, uint32_t a, uint32_t b) {
     out.value = (b == 0) ? a : a % b;
     break;
 
-  // pass-through: no execute work; handled at commit or nowhere
+  // no execute work; these take effect at commit or not at all
   case Op::FENCE:
   case Op::ECALL:
   case Op::EBREAK:
@@ -177,7 +164,7 @@ ExecResult execute(const Instr &I, uint32_t pc, uint32_t a, uint32_t b) {
     break;
   }
 
-  // Branch targets are pc-relative
+  // Branch targets are pc-relative (jumps formed theirs above)
   if (isBranch(I.op) && out.redirect)
     out.target = pc + imm;
 

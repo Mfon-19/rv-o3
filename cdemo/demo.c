@@ -24,7 +24,7 @@ static __attribute__((noinline)) void print_string(const char* text) {
     __asm__ volatile("ecall" : "+r"(a0) : "r"(a7) : "memory");
 }
 
-/* noinline makes the demo exercise an ordinary function call and stack ABI. */
+/* noinline makes the demo exercise a real function call and stack frame. */
 static __attribute__((noinline)) void insertion_sort(int* values,
                                                      unsigned count) {
     for (unsigned i = 1; i < count; ++i) {
@@ -39,7 +39,7 @@ static __attribute__((noinline)) void insertion_sort(int* values,
     }
 }
 
-/* Variable remainder compiles to an RV32M rem instruction. */
+/* A variable remainder compiles to an RV32M rem instruction. */
 static __attribute__((noinline)) int gcd(int a, int b) {
     while (b != 0) {
         int remainder = a % b;
@@ -55,7 +55,7 @@ int main(void) {
 
     insertion_sort(values, count);
 
-    /* String literals demonstrate that the linker also places .rodata. */
+    /* String literals check that the linker also places .rodata. */
     print_string("sorted:\n");
     for (unsigned i = 0; i < count; ++i) {
         print_int(values[i]);

@@ -1,7 +1,7 @@
 // Instruction decode: raw 32-bit words -> Instr records.
 //
-// The immediate helpers extract the immediate fields from each
-// instruction type.
+// One helper per immediate format; each diagram shows where the
+// immediate's bits live in the encoding.
 
 #include "isa/isa.h"
 
@@ -35,9 +35,8 @@ static int32_t immS(uint32_t w) {
 
 // B-type format:
 // +---------+-----------+-------+---------+--------+----------+---------+--------+
-// | 31      | 30     25 | 24 20 | 19   15 | 14  12 | 11     8 | 7       | 6 0 |
-// | imm[12] | imm[10:5] |  rs2  |   rs1   | funct3 | imm[4:1] | imm[11] |
-// opcode |
+// | 31      | 30     25 | 24 20 | 19   15 | 14  12 | 11     8 | 7       | 6    0 |
+// | imm[12] | imm[10:5] |  rs2  |   rs1   | funct3 | imm[4:1] | imm[11] | opcode |
 // +---------+-----------+-------+---------+--------+----------+---------+--------+
 // Immediate represents a signed branch offset, sign-extended from bit 31,
 // and is split into:
@@ -77,17 +76,37 @@ static int32_t immJ(uint32_t w) {
          (int32_t)((w >> 9) & 0x800) | (int32_t)((w >> 20) & 0x7FE);
 }
 
+namespace {
+
+// Opcode groups indexed by funct3; ILLEGAL marks unused encodings
+constexpr Op kBranch[8] = {Op::BEQ, Op::BNE, Op::ILLEGAL, Op::ILLEGAL,
+                           Op::BLT, Op::BGE, Op::BLTU,    Op::BGEU};
+constexpr Op kLoad[8] = {Op::LB,  Op::LH,  Op::LW,      Op::ILLEGAL,
+                         Op::LBU, Op::LHU, Op::ILLEGAL, Op::ILLEGAL};
+constexpr Op kStore[8] = {Op::SB,      Op::SH,      Op::SW,      Op::ILLEGAL,
+                          Op::ILLEGAL, Op::ILLEGAL, Op::ILLEGAL, Op::ILLEGAL};
+constexpr Op kOpImm[8] = {Op::ADDI, Op::SLLI, Op::SLTI, Op::SLTIU,
+                          Op::XORI, Op::SRLI, Op::ORI,  Op::ANDI};
+constexpr Op kOp[8] = {Op::ADD, Op::SLL, Op::SLT, Op::SLTU,
+                       Op::XOR, Op::SRL, Op::OR,  Op::AND};
+constexpr Op kOpAlt[8] = {Op::SUB,     Op::ILLEGAL, Op::ILLEGAL, Op::ILLEGAL,
+                          Op::ILLEGAL, Op::SRA,     Op::ILLEGAL, Op::ILLEGAL};
+constexpr Op kMulDiv[8] = {Op::MUL, Op::MULH, Op::MULHSU, Op::MULHU,
+                           Op::DIV, Op::DIVU, Op::REM,    Op::REMU};
+
+} // namespace
+
 Instr decode(uint32_t w) {
   Instr I;
   I.raw = w;
-  // rd, rs1 and rs2 are in the same spots for all instructions
+  // rd, rs1 and rs2 sit in the same bits in every format (usesRs1 and
+  // friends say whether a given op really reads them)
   I.rd = (w >> 7) & 31;
   I.rs1 = (w >> 15) & 31;
   I.rs2 = (w >> 20) & 31;
   const uint32_t funct3 = (w >> 12) & 7;
   const uint32_t funct7 = w >> 25;
 
-  // switch on the opcode, lower 7 bits
   switch (w & 0x7F) {
   case 0x37:
     I.op = Op::LUI;
@@ -107,173 +126,47 @@ Instr decode(uint32_t w) {
       I.imm = immI(w);
     }
     break;
-  case 0x63: // conditional branches
+  case 0x63:
+    I.op = kBranch[funct3];
     I.imm = immB(w);
-    switch (funct3) {
-    case 0:
-      I.op = Op::BEQ;
-      break;
-    case 1:
-      I.op = Op::BNE;
-      break;
-    case 4:
-      I.op = Op::BLT;
-      break;
-    case 5:
-      I.op = Op::BGE;
-      break;
-    case 6:
-      I.op = Op::BLTU;
-      break;
-    case 7:
-      I.op = Op::BGEU;
-      break;
-    }
     break;
-  case 0x03: // loads
+  case 0x03:
+    I.op = kLoad[funct3];
     I.imm = immI(w);
-    switch (funct3) {
-    case 0:
-      I.op = Op::LB;
-      break;
-    case 1:
-      I.op = Op::LH;
-      break;
-    case 2:
-      I.op = Op::LW;
-      break;
-    case 4:
-      I.op = Op::LBU;
-      break;
-    case 5:
-      I.op = Op::LHU;
-      break;
-    }
     break;
-  case 0x23: // stores
+  case 0x23:
+    I.op = kStore[funct3];
     I.imm = immS(w);
-    switch (funct3) {
-    case 0:
-      I.op = Op::SB;
-      break;
-    case 1:
-      I.op = Op::SH;
-      break;
-    case 2:
-      I.op = Op::SW;
-      break;
-    }
     break;
-  case 0x13: // ALU with immediate
+  case 0x13:
+    I.op = kOpImm[funct3];
     I.imm = immI(w);
-    switch (funct3) {
-    case 0:
-      I.op = Op::ADDI;
-      break;
-    case 2:
-      I.op = Op::SLTI;
-      break;
-    case 3:
-      I.op = Op::SLTIU;
-      break;
-    case 4:
-      I.op = Op::XORI;
-      break;
-    case 6:
-      I.op = Op::ORI;
-      break;
-    case 7:
-      I.op = Op::ANDI;
-      break;
-    case 1: // shifts encode shamt in the rs2 field
-      if (funct7 == 0x00) {
-        I.op = Op::SLLI;
-        I.imm = I.rs2;
-      }
-      break;
-    case 5:
-      if (funct7 == 0x00) {
-        I.op = Op::SRLI;
-        I.imm = I.rs2;
-      }
-      if (funct7 == 0x20) {
+    if (funct3 == 1 || funct3 == 5) { // shifts: shamt sits in the rs2 field
+      if (funct3 == 5 && funct7 == 0x20)
         I.op = Op::SRAI;
+      else if (funct7 != 0x00)
+        I.op = Op::ILLEGAL;
+      if (I.op != Op::ILLEGAL)
         I.imm = I.rs2;
-      }
-      break;
     }
     break;
-  case 0x33: // ALU register-register
-    if (funct7 == 0x00) {
-      switch (funct3) {
-      case 0:
-        I.op = Op::ADD;
-        break;
-      case 1:
-        I.op = Op::SLL;
-        break;
-      case 2:
-        I.op = Op::SLT;
-        break;
-      case 3:
-        I.op = Op::SLTU;
-        break;
-      case 4:
-        I.op = Op::XOR;
-        break;
-      case 5:
-        I.op = Op::SRL;
-        break;
-      case 6:
-        I.op = Op::OR;
-        break;
-      case 7:
-        I.op = Op::AND;
-        break;
-      }
-    } else if (funct7 == 0x20) {
-      if (funct3 == 0)
-        I.op = Op::SUB;
-      if (funct3 == 5)
-        I.op = Op::SRA;
-    } else if (funct7 == 0x01) { // M extension
-      switch (funct3) {
-      case 0:
-        I.op = Op::MUL;
-        break;
-      case 1:
-        I.op = Op::MULH;
-        break;
-      case 2:
-        I.op = Op::MULHSU;
-        break;
-      case 3:
-        I.op = Op::MULHU;
-        break;
-      case 4:
-        I.op = Op::DIV;
-        break;
-      case 5:
-        I.op = Op::DIVU;
-        break;
-      case 6:
-        I.op = Op::REM;
-        break;
-      case 7:
-        I.op = Op::REMU;
-        break;
-      }
-    }
+  case 0x33:
+    if (funct7 == 0x00)
+      I.op = kOp[funct3];
+    else if (funct7 == 0x20)
+      I.op = kOpAlt[funct3];
+    else if (funct7 == 0x01)
+      I.op = kMulDiv[funct3]; // M extension
     break;
   case 0x0F:
     I.op = Op::FENCE;
-    break;   // NOP for us: single hart
+    break; // single hart: nothing to order
   case 0x73: // SYSTEM
     if (w == 0x00000073)
       I.op = Op::ECALL;
     if (w == 0x00100073)
       I.op = Op::EBREAK;
-    break; // CSR instructions: ILLEGAL
+    break; // CSR instructions stay ILLEGAL
   }
   return I;
 }

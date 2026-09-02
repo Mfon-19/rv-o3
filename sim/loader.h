@@ -1,5 +1,3 @@
-// Program-image loaders.
-
 #pragma once
 
 #include <cstdint>
@@ -9,5 +7,5 @@
 // from address 0. '#' and '//' start a comment that runs to end of line.
 std::vector<uint32_t> loadHexFile(const char *path);
 
-// Raw little-endian flat binary, loaded at address 0
+// Raw little-endian flat binary loaded at address 0.
 std::vector<uint8_t> loadBinFile(const char *path);

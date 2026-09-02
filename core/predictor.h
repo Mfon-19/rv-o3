@@ -18,9 +18,11 @@
 // plus its table index; a mispredicting branch restores the history
 // from that snapshot (with the true outcome shifted in), and training
 // at commit uses the carried index, so predict and train always touch
-// the same counter. The return-address stack is also updated on
-// guesses, and is NOT repaired after a flush; a squash can corrupt
-// it, which costs only extra mispredictions later.
+// the same counter.
+//
+// The return-address stack is also updated on guesses, and is NOT
+// repaired after a flush; a squash can corrupt it, which costs only
+// extra mispredictions later.
 
 #pragma once
 
@@ -39,15 +41,14 @@ public:
     uint32_t target = 0;
     uint32_t phtIdx = 0;    // counter this prediction consulted
     uint32_t ghrBefore = 0; // history before this prediction shifted it
-    bool shifted = false;   // did a conditional prediction shift the GHR?
   };
 
-  // Fetch-time lookup for the instruction at pc (speculative RAS push/
-  // pop and GHR shift happen here)
+  // Fetch-time lookup for the instruction at pc; the speculative RAS
+  // push/pop and GHR shift happen here
   Pred predict(uint32_t pc);
 
-  // Recovery: rewind the history to a mispredicting branch's snapshot,
-  // with its actual outcome shifted in (conditionals only)
+  // Recovery: rewind the history to a recovery point's snapshot, with
+  // the actual outcome shifted in when that point is a conditional
   void restore(uint32_t ghrBefore, bool cond, bool actualTaken);
 
   // Commit-time training with the resolved outcome

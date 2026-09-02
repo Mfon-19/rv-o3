@@ -4,9 +4,8 @@
 #include <cstdlib>
 #include <cstring>
 
-// Tag values for this cache's own traffic to the level below
-static constexpr uint64_t kWbTag = UINT64_MAX; // writeback; the reply
-                                               // will just be dropped
+// Tag on this cache's own writebacks to the level below; the ack is dropped
+static constexpr uint64_t kWbTag = UINT64_MAX;
 
 Cache::Cache(const char *name, const CacheConfig &cfg, MemPort *below,
              uint8_t srcId)
@@ -111,10 +110,11 @@ void Cache::finishHit(MemResponse &&resp) {
     hitPipe.push_back(HitTxn{std::move(resp), cfg.hitLatency - 1});
 }
 
-// Evict whatever occupies the way lineAddr will live in. Returns false
-// when the victim is dirty and the writeback queue has no room; the
-// caller retries later
-bool Cache::claimWay(uint32_t lineAddr, uint32_t &set, uint32_t &way) {
+// Install a line in the way victimWay picks for it. A dirty occupant
+// goes to the writeback queue first; if that queue is full, nothing
+// changes and the caller retries later
+bool Cache::installLine(uint32_t lineAddr, const uint8_t *src, bool isDirty,
+                        uint32_t &set, uint32_t &way) {
   set = setOf(lineAddr);
   way = victimWay(set);
   const uint32_t i = set * cfg.ways + way;
@@ -122,14 +122,17 @@ bool Cache::claimWay(uint32_t lineAddr, uint32_t &set, uint32_t &way) {
     if (wbq.size() >= cfg.wbq)
       return false;
     stats.dirtyEvictions++;
-    // bytesWritten is charged when the writeback is actually SENT;
-    // a restore from the writeback queue can still cancel this entry
+    // bytesWritten is charged when the writeback is actually SENT; a
+    // restore from the writeback queue can still cancel this entry
     WbEntry wb;
     wb.addr = lineAddrOf(set, way);
     wb.line.assign(lineData(set, way), lineData(set, way) + cfg.lineBytes);
     wbq.push_back(std::move(wb));
   }
-  valid[i] = 0;
+  memcpy(lineData(set, way), src, cfg.lineBytes);
+  tags[i] = tagOf(lineAddr);
+  valid[i] = 1;
+  dirty[i] = isDirty;
   return true;
 }
 
@@ -151,18 +154,13 @@ void Cache::access(const MemRequest &req) {
   }
 
   // A miss whose line is still parked in the writeback queue must NOT
-  // refill from below; the level below is stale until that writeback
+  // refill from below: the level below is stale until that writeback
   // lands, and a refill would overtake it. Pull the line straight back
   // into the arrays (a victim-cache restore) and serve it as a hit
   for (size_t i = 0; i < wbq.size(); i++) {
     if (wbq[i].addr == lineAddr) {
-      uint32_t s, w;
-      claimWay(lineAddr, s, w); // canAccept() guaranteed queue room
-      const uint32_t li = s * cfg.ways + w;
-      memcpy(lineData(s, w), wbq[i].line.data(), cfg.lineBytes);
-      tags[li] = tagOf(req.addr);
-      valid[li] = 1;
-      dirty[li] = 1; // it was queued below precisely because it was dirty
+      uint32_t s, w; // still dirty; canAccept() guaranteed queue room
+      installLine(lineAddr, wbq[i].line.data(), true, s, w);
       wbq.erase(wbq.begin() + i);
       stats.hits++;
       stats.wbqRestores++;
@@ -174,25 +172,19 @@ void Cache::access(const MemRequest &req) {
   stats.misses++;
   if (req.isWrite && req.size == cfg.lineBytes) {
     // Full-line write (an upper cache's dirty victim): every byte is
-    // overwritten, so install directly with no refill; UNLESS a
-    // refill for this very line is already in flight (the other L1
-    // wants it), because installing now would later be overwritten
-    // by the stale refill. Join the MSHR's waiting list instead; the
-    // install will apply this write over the refilled line
+    // overwritten, so install directly with no refill. UNLESS a refill
+    // for this very line is already in flight (the other L1 wants it):
+    // an install now would later be overwritten by the stale refill,
+    // so join the MSHR's waiting list instead and the install applies
+    // this write over the refilled line
     const int inflight = mshrFor(lineAddr);
     if (inflight >= 0) {
       stats.mergedMisses++;
       mshrs[inflight].waiting.push_back(Waiting{req, tickCount});
       return;
     }
-    // canAccept() guaranteed writeback-queue room for our own victim
-    uint32_t s, w;
-    claimWay(lineAddr, s, w);
-    const uint32_t i = s * cfg.ways + w;
-    memcpy(lineData(s, w), req.wline.data(), cfg.lineBytes);
-    tags[i] = tagOf(req.addr);
-    valid[i] = 1;
-    dirty[i] = 1;
+    uint32_t s, w; // canAccept() guaranteed queue room for our own victim
+    installLine(lineAddr, req.wline.data(), true, s, w);
     touchLRU(s, w);
     MemResponse ack;
     ack.src = req.src;
@@ -218,17 +210,13 @@ void Cache::access(const MemRequest &req) {
 
 // A refill has arrived: claim a way, install the line, and re-apply
 // every request that was waiting for it, in arrival order. Returns
-// false if the victim couldn't be evicted yet (writeback queue full)
+// false if the victim couldn't be evicted yet (writeback queue full);
+// the MSHR stays and the caller retries
 bool Cache::tryInstall(uint32_t mshrIdx, const std::vector<uint8_t> &line) {
   Mshr &m = mshrs[mshrIdx];
   uint32_t set, way;
-  if (!claimWay(m.lineAddr, set, way))
+  if (!installLine(m.lineAddr, line.data(), false, set, way))
     return false;
-  const uint32_t i = set * cfg.ways + way;
-  memcpy(lineData(set, way), line.data(), cfg.lineBytes);
-  tags[i] = tagOf(m.lineAddr);
-  valid[i] = 1;
-  dirty[i] = 0;
   stats.bytesRead += cfg.lineBytes;
   for (Waiting &w : m.waiting) {
     stats.latencySum += tickCount - w.issueTick + 1;
@@ -281,7 +269,7 @@ void Cache::tick() {
       wb.src = srcId;
       wb.tag = kWbTag;
       wbq.pop_front();
-      stats.bytesWritten += cfg.lineBytes; // the transfer really happens
+      stats.bytesWritten += cfg.lineBytes; // the transfer really happens now
       below->access(wb);
     } else if (refillIdx >= 0) {
       MemRequest rd;
@@ -324,8 +312,9 @@ bool Cache::peek8(uint32_t addr, uint8_t &out) const {
   // scalar store to a missing line) have left every other structure;
   // until the refill lands they exist only here. Scanning from the
   // newest, a waiting write covering this byte IS its current value;
-  // bytes no waiting write covers still come from the level below. (A line is never in the
-  // arrays, the wb queue, and an MSHR at once, so order is unambiguous)
+  // bytes no waiting write covers still come from the level below. A
+  // line is never in the arrays, the wb queue, and an MSHR at once, so
+  // the order of these three searches is unambiguous
   for (const Mshr &m : mshrs) {
     if (!m.valid)
       continue;

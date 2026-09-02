@@ -1,23 +1,19 @@
 // Simulation statistics.
 //
-// Counters are accumulated by the timing model as it runs and printed
-// to stderr at the end. Program output goes to stdout; trace,
-// statistics and diagnostics go to stderr. Per-cache counters live with
-// the caches themselves (CacheStats in memory/cache.h) and per-unit
-// counters with the functional units (FuUnit in core/fu.h); this
-// struct holds the core-side counters.
+// The core-side counters, accumulated by the timing model as it runs
+// and printed to stderr at the end. Per-cache counters live with the
+// caches (CacheStats in memory/cache.h) and per-unit counters with the
+// functional units (FuUnit in core/fu.h).
 
 #pragma once
 
-#include <cinttypes>
 #include <cstdint>
-#include <cstdio>
 
 struct Stats {
   uint64_t cycles = 0;
   uint64_t retired = 0; // instructions committed from the ROB head
 
-  // Dispatch-stall cycles by cause:
+  // Dispatch-stall cycles by cause (the first blocking resource wins)
   uint64_t dsRobFull = 0, dsIqFull = 0, dsLsqFull = 0, dsNoPreg = 0,
            dsSerialize = 0, dsFetchEmpty = 0;
 
@@ -33,23 +29,14 @@ struct Stats {
                                // was flushed and re-executed
   uint64_t sbCommitStalls = 0; // cycles commit stalled on a full store buffer
   uint64_t issuedOps = 0;      // total ops issued (for average issue width)
-  uint64_t fetchStallCycles = 0; // cycles dispatch had nothing fetched
-  uint64_t dataStallCycles = 0;  // cycles some load waited on the cache
+  uint64_t dataStallCycles = 0; // cycles some issued load was waiting on
+                                // the cache
 
   // Per-cycle occupancy sums, divided by cycles at print time
   uint64_t robOccSum = 0, iqOccSum = 0, lsqOccSum = 0, sbOccSum = 0;
   uint64_t pregsUsedSum = 0; // physical registers held by in-flight dests
-  // Attribution (definitions in doc/phase-5-validation.md):
-  uint64_t recoveryLossCycles = 0;    // recover() -> next successful dispatch
-  uint64_t memRetireStallCycles = 0;  // commit blocked on an unfinished load
 
-  void printMemStalls() const {
-    fprintf(stderr, "--- rvsim: %" PRIu64 " ifetch stall cycles, %" PRIu64
-            " data stall cycles\n",
-            fetchStallCycles, dataStallCycles);
-  }
-
-  void printExit(int exitCode) const {
-    fprintf(stderr, "--- rvsim: exit code %d\n", exitCode);
-  }
+  // Attribution intervals
+  uint64_t recoveryLossCycles = 0;   // recover() -> next successful dispatch
+  uint64_t memRetireStallCycles = 0; // commit blocked on an unfinished load
 };

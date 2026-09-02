@@ -1,6 +1,4 @@
-// ==============================================================
-// ISA definitions: opcodes, decoded-instruction record, classification
-// ==============================================================
+// ISA definitions: opcodes, the decoded-instruction record, classification.
 //
 // RV32I base integer ISA plus the M extension for mul/div, little-endian.
 // FENCE has nothing to order on a single core and executes as a
@@ -8,9 +6,8 @@
 // programs can print and exit, EBREAK stops the simulation.
 //
 // Everything in isa/ is timing-free: pure decode, pure execute semantics,
-// and disassembly. Any timing model (the out-of-order core today,
-// others later) and the functional reference model all build on these
-// same definitions, so their architectural behavior cannot diverge.
+// and disassembly. The out-of-order core and the functional reference
+// model both build on these same definitions.
 
 #pragma once
 
@@ -47,7 +44,6 @@
 
 enum class Op : uint8_t {
 #define X(e, s) e,
-  // Expands to all the instructions in uppercase
   OP_LIST(X)
 #undef X
 };
@@ -63,8 +59,8 @@ inline const char *opName(Op op) {
   return "?unknown?";
 }
 
-// A fully decoded instruction. We decode once and carry this record
-// through whatever model is executing it
+// A fully decoded instruction. Decoded once and carried, unchanged,
+// through whichever model executes it
 struct Instr {
   Op op = Op::ILLEGAL;
   uint8_t rd = 0, rs1 = 0, rs2 = 0; // register specifier fields
@@ -72,8 +68,8 @@ struct Instr {
   uint32_t raw = 0;                 // original encoding, kept for messages
 };
 
-// Functions down here are for instruction classification,
-// so called "control signals" in hardware
+// Instruction classification: the "control signals" a hardware decoder
+// would produce
 inline bool isLoad(Op op) { return op >= Op::LB && op <= Op::LHU; }
 
 inline bool isStore(Op op) { return op >= Op::SB && op <= Op::SW; }
@@ -97,8 +93,8 @@ inline bool writesRd(Op op) {
 }
 
 // Does this encoding's rs1 field name a real source register? For
-// U/J-type instructions those bits are immediate bits, so we must not
-// treat them as a register use when checking hazards
+// U/J-type instructions those bits are immediate bits and must not
+// become a register dependence at rename
 inline bool usesRs1(Op op) {
   switch (op) {
   case Op::LUI:
@@ -114,8 +110,7 @@ inline bool usesRs1(Op op) {
   }
 }
 
-inline bool usesRs2(Op op) {
-  // all R-type including M extension
+inline bool usesRs2(Op op) { // branches, stores, and every R-type op
   return isBranch(op) || isStore(op) || (op >= Op::ADD && op <= Op::REMU);
 }
 
@@ -160,7 +155,7 @@ inline uint32_t accessSize(Op op) {
   }
 }
 
-// Sub-word loads sign- or zero-extended into 32 bits as per the ISA
+// Sub-word loads sign- or zero-extend to 32 bits, as the ISA specifies
 inline uint32_t extendLoad(Op op, uint32_t raw) {
   switch (op) {
   case Op::LB:
@@ -179,9 +174,11 @@ inline uint32_t extendLoad(Op op, uint32_t raw) {
 // ABI register names, indexed by register number
 extern const char *const kRegName[32];
 
+// The -r register dump: all 32 registers and the pc, to stderr
+void dumpRegisters(const uint32_t regs[32], uint32_t pc);
+
 // Decode one 32-bit instruction word (decode.cpp)
 Instr decode(uint32_t w);
 
-// Disassemble a decoded instruction, used for traces and error
-// messages (disasm.cpp)
+// Disassemble for traces and error messages (disasm.cpp)
 std::string disasm(const Instr &I);

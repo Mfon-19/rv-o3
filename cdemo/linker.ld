@@ -33,7 +33,7 @@ SECTIONS
 
     .text :
     {
-        /* KEEP ensures the entry point survives future section garbage collection. */
+        /* KEEP preserves the entry point if section garbage collection is enabled. */
         KEEP(*(.text.start))
         *(.text .text.*)
     } > RAM :text

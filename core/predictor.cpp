@@ -5,8 +5,8 @@ Predictor::Predictor(const SimConfig &cfg)
       ghrMask(cfg.ghrBits ? (1u << cfg.ghrBits) - 1 : 0),
       btb(cfg.btbEntries), ras(cfg.rasEntries) {}
 
-// The standard RISC-V idioms: jal/jalr with rd=ra is a call, jalr
-// x0, 0(ra) is a return
+// The standard RISC-V idioms: jal/jalr with rd = ra is a call,
+// jalr x0, 0(ra) is a return
 Predictor::Kind Predictor::kindOf(const Instr &ins) {
   if (isBranch(ins.op))
     return COND;
@@ -33,7 +33,6 @@ Predictor::Pred Predictor::predict(uint32_t pc) {
     p.taken = pht[p.phtIdx] >= 2;
     p.target = b.target;
     ghr = ((ghr << 1) | (p.taken ? 1 : 0)) & ghrMask;
-    p.shifted = true;
     break;
   case CALL:
     ras[rasN % ras.size()] = pc + 4;
@@ -59,7 +58,7 @@ Predictor::Pred Predictor::predict(uint32_t pc) {
 }
 
 void Predictor::restore(uint32_t ghrBefore, bool cond, bool actualTaken) {
-  // Wipe the flushed wrong-path predictions from the history; a
+  // Drop the flushed wrong-path guesses from the history; a
   // conditional's own actual outcome goes back in
   ghr = cond ? (((ghrBefore << 1) | (actualTaken ? 1 : 0)) & ghrMask)
              : ghrBefore;

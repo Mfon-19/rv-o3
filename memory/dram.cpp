@@ -2,37 +2,27 @@
 
 #include <cstring>
 
-// Perform the access on the backing store now. Writes take effect
-// immediately (see the header for why that is safe); reads capture
-// their data here, so a later write cannot retroactively change an
-// read that is already in flight; arrival order is memory order
+// Perform the access on the backing store now: writes take effect
+// immediately, reads capture their data (see the header for why that
+// is safe). Arrival order here is memory order; the latency only
+// delays the response
 MemResponse DRAM::perform(const MemRequest &req) {
   MemResponse r;
   r.src = req.src;
   r.tag = req.tag;
-  backing.check(req.addr, req.size, req.isWrite ? "store" : "load");
-  if (req.isWrite) {
-    if (req.size <= 4) {
-      switch (req.size) {
-      case 1: backing.store8(req.addr, (uint8_t)req.wdata); break;
-      case 2: backing.store16(req.addr, (uint16_t)req.wdata); break;
-      default: backing.store32(req.addr, req.wdata); break;
-      }
-    } else {
-      memcpy(backing.bytes.data() + req.addr, req.wline.data(), req.size);
-    }
-  } else {
-    if (req.size <= 4) {
-      switch (req.size) {
-      case 1: r.rdata = backing.load8(req.addr); break;
-      case 2: r.rdata = backing.load16(req.addr); break;
-      default: r.rdata = backing.load32(req.addr); break;
-      }
-    } else {
-      r.rline.assign(backing.bytes.begin() + req.addr,
-                     backing.bytes.begin() + req.addr + req.size);
-    }
+  if (req.size <= 4) { // a scalar access from a flat-mode core
+    if (req.isWrite)
+      backing.store(req.addr, req.size, req.wdata);
+    else
+      r.rdata = backing.load(req.addr, req.size);
+    return r;
   }
+  backing.check(req.addr, req.size, req.isWrite ? "store" : "load");
+  if (req.isWrite)
+    memcpy(backing.bytes.data() + req.addr, req.wline.data(), req.size);
+  else
+    r.rline.assign(backing.bytes.begin() + req.addr,
+                   backing.bytes.begin() + req.addr + req.size);
   return r;
 }
 

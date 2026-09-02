@@ -1,4 +1,4 @@
-// Disassembler (used only for the -t trace and error messages)
+// Disassembler and register dump: for traces, error messages, and -r
 
 #include "isa/isa.h"
 
@@ -9,6 +9,14 @@ const char *const kRegName[32] = {
     "a1",   "a2", "a3", "a4", "a5",  "a6",  "a7", "s2", "s3", "s4", "s5",
     "s6",   "s7", "s8", "s9", "s10", "s11", "t3", "t4", "t5", "t6",
 };
+
+void dumpRegisters(const uint32_t regs[32], uint32_t pc) {
+  fprintf(stderr, "--- registers ---\n");
+  for (int i = 0; i < 32; i++)
+    fprintf(stderr, "%4s=%08x%s", kRegName[i], regs[i],
+            (i % 4 == 3) ? "\n" : "  ");
+  fprintf(stderr, "pc  =%08x\n", pc);
+}
 
 std::string disasm(const Instr &I) {
   char b[64];

@@ -1,6 +1,5 @@
-# sum.hex: computes 1+2+...+10 = 55, prints it, exits with code 0.
-# Exercises: a data-dependent loop, a backward branch taken 9 times
-# (each taken branch costs 2 squashed instructions in this pipeline).
+# Basic loop test: compute 1+2+...+10 with a data-dependent backward branch.
+# Expected output: 55, exit 0.
 
 00000293   # 0x00        addi t0, zero, 0    ; sum = 0
 00100313   # 0x04        addi t1, zero, 1    ; i = 1

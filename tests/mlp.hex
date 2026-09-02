@@ -1,9 +1,8 @@
-# Directed memory test: miss-level parallelism. Two independent loads
-# from cold lines far apart; both miss L1D, L2, and go to DRAM. With
-# MSHRs the two 30-cycle misses overlap (L1D "overlap cycles" > 0 in
-# the stats) instead of serializing; total time is one miss plus a few
-# cycles, not two misses. The loaded values are zero (cold memory);
-# correctness rides on -d as always.
+# Directed memory-level parallelism test: two independent loads from
+# cold lines far apart; both miss L1D and L2 and go to DRAM. Separate
+# MSHRs keep both misses outstanding, so they overlap (L1D "overlap
+# cycles" > 0 in the stats) instead of serializing. Memory starts at
+# zero, so the loaded values are zero; correctness rides on -d.
 # Expected output: 7, exit 0.
 000100B7   # lui  x1, 0x10        0x10000
 00020137   # lui  x2, 0x20        0x20000

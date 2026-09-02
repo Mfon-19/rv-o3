@@ -1,4 +1,4 @@
-// Main memory: flat, byte addressable, little-endian, zero-initialized
+// Main memory: flat, byte-addressable, little-endian, zero-initialized.
 //
 // A single unified memory that holds both instructions and data. It
 // sits at the bottom of the timed memory system (request/response
@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 struct Memory {
@@ -17,49 +18,49 @@ struct Memory {
 
   explicit Memory(size_t size) : bytes(size, 0) {}
 
-  // Any out-of-range access is a fatal simulation error. On real hardware,
-  // an access-fault exception would be raised
+  // The two fatal access errors, shared by both models so their
+  // messages cannot drift apart. There is no trap handler: an
+  // out-of-range access (an access fault in hardware) or a misaligned
+  // one (which RV32I permits trapping on) simply ends the run
+  [[noreturn]] void failOutOfRange(uint32_t addr, const char *what) const {
+    fprintf(stderr, "fatal: %s at 0x%08x is outside memory (%zu bytes)\n",
+            what, addr, bytes.size());
+    exit(1);
+  }
+  [[noreturn]] static void failMisaligned(uint32_t addr, const char *what,
+                                          uint32_t pc) {
+    fprintf(stderr, "fatal: misaligned %s of 0x%08x at pc=0x%08x\n", what,
+            addr, pc);
+    exit(1);
+  }
   void check(uint32_t addr, uint32_t len, const char *what) const {
-    if ((uint64_t)addr + len > bytes.size()) {
-      fprintf(stderr, "fatal: %s at 0x%08x is outside memory (%zu bytes)\n",
-              what, addr, bytes.size());
-      exit(1);
-    }
+    if ((uint64_t)addr + len > bytes.size())
+      failOutOfRange(addr, what);
   }
 
-  // load/store for different data sizes
-  uint8_t load8(uint32_t a) const {
-    check(a, 1, "load");
-    return bytes[a];
+  // Little-endian scalar access of 1, 2, or 4 bytes
+  uint32_t load(uint32_t a, uint32_t size) const {
+    check(a, size, "load");
+    uint32_t v = 0;
+    for (uint32_t b = 0; b < size; b++)
+      v |= (uint32_t)bytes[a + b] << (8 * b);
+    return v;
   }
-
-  uint16_t load16(uint32_t a) const {
-    check(a, 2, "load");
-    return (uint16_t)(bytes[a] | bytes[a + 1] << 8);
+  void store(uint32_t a, uint32_t size, uint32_t v) {
+    check(a, size, "store");
+    for (uint32_t b = 0; b < size; b++)
+      bytes[a + b] = (uint8_t)(v >> (8 * b));
   }
+  uint8_t load8(uint32_t a) const { return (uint8_t)load(a, 1); }
+  uint32_t load32(uint32_t a) const { return load(a, 4); }
 
-  uint32_t load32(uint32_t a) const {
-    check(a, 4, "load");
-    return (uint32_t)bytes[a] | (uint32_t)bytes[a + 1] << 8 |
-           (uint32_t)bytes[a + 2] << 16 | (uint32_t)bytes[a + 3] << 24;
+  // Program images land at address 0
+  void loadWords(const std::vector<uint32_t> &words) {
+    for (size_t i = 0; i < words.size(); i++)
+      store((uint32_t)(i * 4), 4, words[i]);
   }
-
-  void store8(uint32_t a, uint8_t v) {
-    check(a, 1, "store");
-    bytes[a] = v;
-  }
-
-  void store16(uint32_t a, uint16_t v) {
-    check(a, 2, "store");
-    bytes[a] = (uint8_t)v;
-    bytes[a + 1] = (uint8_t)(v >> 8);
-  }
-
-  void store32(uint32_t a, uint32_t v) {
-    check(a, 4, "store");
-    bytes[a] = (uint8_t)v;
-    bytes[a + 1] = (uint8_t)(v >> 8);
-    bytes[a + 2] = (uint8_t)(v >> 16);
-    bytes[a + 3] = (uint8_t)(v >> 24);
+  void loadBytes(const std::vector<uint8_t> &image) {
+    check(0, (uint32_t)image.size(), "program image");
+    memcpy(bytes.data(), image.data(), image.size());
   }
 };

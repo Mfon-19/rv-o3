@@ -23,8 +23,8 @@ MemorySystem::MemorySystem(const SimConfig &cfg)
 // requester above before that requester's own tick. Each routing pass
 // repeats after the requester's tick as well, because a tick can
 // issue a request that a latency-1 level below answers within the
-// call; the promise that latency 1 answers within the same cycle
-// must hold across level boundaries too
+// call; the promise that latency 1 answers within the same cycle must
+// hold across level boundaries too
 void MemorySystem::tick() {
   dram.tick();
   if (flat) {

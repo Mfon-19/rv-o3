@@ -1,17 +1,18 @@
 // Fixed-latency main memory, the bottom of the hierarchy.
 //
 // Pipelined: it accepts one request per cycle and each completes
-// independently `latency` cycles later; this models a memory with
-// enough independent banks that several cache misses can be serviced
-// at the same time. With latency 1 it answers combinationally, which is
-// exactly the original flat-memory timing; flat mode attaches two of
-// these directly to the core's fetch and data ports.
+// independently `latency` cycles later, like a memory with enough
+// independent banks that several cache misses can be serviced at the
+// same time (no banks, rows, or scheduling are actually modeled). With
+// latency 1 it answers combinationally; flat mode attaches two of these
+// directly to the core's fetch and data ports.
 //
 // Writes are applied to the backing store at access() and acknowledged
 // after the latency. Applying early keeps the backing store current
 // the moment a writeback leaves the cache above (which is what lets
 // evicted lines be fire-and-forget), and arrival order at this single
 // point IS the memory order, so nothing can observe the difference.
+// Reads capture their data at access() for the same reason.
 
 #pragma once
 
@@ -33,7 +34,7 @@ public:
   void tick() override;
 
 private:
-  MemResponse perform(const MemRequest &req); // read the backing store
+  MemResponse perform(const MemRequest &req); // read/write the backing store
 
   Memory &backing;
   uint32_t latency;

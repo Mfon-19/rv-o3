@@ -1,8 +1,8 @@
 # Directed OoO test: instruction-level parallelism. Two independent
-# accumulator chains interleaved inside a 20-iteration loop (looped so
-# the caches warm up and steady state dominates). In-order issue caps
-# at 1 IPC; the out-of-order core issues from both chains at once and
-# should approach 2.
+# accumulator chains are interleaved inside a 20-iteration loop (looped
+# so the caches warm up and steady state dominates). In-order issue
+# would cap at 1 IPC; the out-of-order core issues from both chains at
+# once and should approach 2.
 # Expected output: 1100 (20 x 25 + 20 x 30), exit 0.
 00000093   # addi x1, x0, 0       chain A
 00000113   # addi x2, x0, 0       chain B

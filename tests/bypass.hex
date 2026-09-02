@@ -1,10 +1,8 @@
 # Directed memory test: a load bypasses an older, unrelated store.
 # The store to 512 has its ADDRESS immediately (split store-address/
 # store-data) but its DATA hangs on a divide. The younger load from
-# 1024 provably doesn't overlap, so it needn't wait for the divide;
-# with stores requiring both operands at issue (the old design) the
-# store would never have resolved its address and the load would have
-# stalled behind the unknown for the divide's full latency.
+# 1024 provably doesn't overlap, so in every mode it proceeds without
+# waiting for the divide.
 # Expected output: 3, exit 0.
 20000093   # addi x1, x0, 512     store address
 40000113   # addi x2, x0, 1024    load address

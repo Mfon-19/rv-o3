@@ -1,6 +1,6 @@
 # Directed FU test: independent ALU work overlapping a divide.
 # The three addi's don't touch the divide's registers, so they issue
-# and finish while the divider grinds through its 12 cycles; a long
+# and finish while the non-pipelined divider is still busy; a long
 # operation only holds up work that needs its result. The final add
 # does need the quotient, so it alone waits.
 # Expected output: 45, exit 0.

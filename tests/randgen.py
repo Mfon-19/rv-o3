@@ -43,8 +43,8 @@ def b_t(imm, rs2, rs1, f3):
         | (((u >> 11) & 1) << 7) | 0x63
 
 
-# Three lines to fight over, parked at 8 KiB; that is far above any
-# program this generator can emit, so stores can never reach the code
+# Three lines to fight over, parked at 8 KiB, well above the code; the
+# size check at the end refuses a program long enough to reach them
 DATA_REGION = 0x2000
 BASES = [(1, 0x00), (2, 0x40), (3, 0x80)]
 DATA = [4, 5, 6, 7, 8, 9, 11, 12, 13, 14]  # scratch registers

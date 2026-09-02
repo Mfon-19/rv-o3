@@ -1,8 +1,8 @@
-# jump.hex: control-hazard test; prints 5 and exits with code 0.
-# The jal skips two instructions that would overwrite ra. In this pipeline
-# the jump is resolved in EX, so both skipped instructions have already
-# been fetched/decoded and must be squashed. If flushing were broken,
-# this program would print 222 instead of 5.
+# Directed control-hazard test: the jal skips two instructions that
+# would overwrite ra. With a cold BTB fetch falls through and has both
+# of them in the machine before the branch unit resolves the jump;
+# recovery must squash them, or the program prints 222 instead of 5.
+# Expected output: 5, exit 0.
 
 00500093   # 0x00  addi ra, zero, 5     ; ra = 5
 00C0006F   # 0x04  jal  zero, +12       ; goto 0x10

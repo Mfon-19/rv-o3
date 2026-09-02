@@ -79,6 +79,15 @@ const Knob kKnobs[] = {
 static_assert(sizeof(size_t) == sizeof(uint64_t),
               "memBytes is dumped/parsed as a 64-bit knob");
 
+const struct {
+  const char *name;
+  MemOrder value;
+} kMemOrders[] = {
+    {"conservative", MemOrder::Conservative},
+    {"bypass", MemOrder::Bypass},
+    {"speculative", MemOrder::Speculative},
+};
+
 void *fieldPtr(SimConfig &c, const Knob &k) {
   return (char *)&c + k.off;
 }
@@ -139,15 +148,12 @@ void setKnob(SimConfig &c, const char *key, const char *val,
         knobFail(where, "bad value for", key);
       return;
     case MEMORD:
-      if (!strcmp(val, "conservative"))
-        *(MemOrder *)fieldPtr(c, k) = MemOrder::Conservative;
-      else if (!strcmp(val, "bypass"))
-        *(MemOrder *)fieldPtr(c, k) = MemOrder::Bypass;
-      else if (!strcmp(val, "speculative"))
-        *(MemOrder *)fieldPtr(c, k) = MemOrder::Speculative;
-      else
-        knobFail(where, "bad value for", key);
-      return;
+      for (const auto &m : kMemOrders)
+        if (!strcmp(val, m.name)) {
+          *(MemOrder *)fieldPtr(c, k) = m.value;
+          return;
+        }
+      knobFail(where, "bad value for", key);
     }
   }
   knobFail(where, "unknown knob", key);
@@ -161,6 +167,13 @@ char *trim(char *s) {
                    e[-1] == '\r'))
     *--e = '\0';
   return s;
+}
+
+void require(bool ok, const char *what) {
+  if (!ok) {
+    fprintf(stderr, "fatal: config: %s\n", what);
+    exit(1);
+  }
 }
 
 } // namespace
@@ -223,29 +236,19 @@ void dumpConfig(const SimConfig &c, FILE *out) {
     case BOOL:
       fprintf(out, "%s = %d\n", k.name, *(const bool *)fieldPtr(c, k));
       break;
-    case MEMORD: {
-      const MemOrder m = *(const MemOrder *)fieldPtr(c, k);
-      fprintf(out, "%s = %s\n", k.name,
-              m == MemOrder::Conservative ? "conservative"
-              : m == MemOrder::Bypass     ? "bypass"
-                                          : "speculative");
+    case MEMORD:
+      for (const auto &m : kMemOrders)
+        if (m.value == *(const MemOrder *)fieldPtr(c, k))
+          fprintf(out, "%s = %s\n", k.name, m.name);
       break;
     }
-    }
-  }
-}
-
-static void require(bool ok, const char *what) {
-  if (!ok) {
-    fprintf(stderr, "fatal: config: %s\n", what);
-    exit(1);
   }
 }
 
 void validateConfig(SimConfig &c) {
-  // The invariant the core has relied on since renaming was built: one
-  // physical register per architectural register plus one per ROB
-  // entry. 0 means derive it; explicit values allow pressure studies
+  // Default: one physical register per architectural register plus one
+  // per ROB entry, so the free list can never bind before the ROB does.
+  // An explicit smaller value makes register pressure a real constraint
   if (c.physRegs == 0)
     c.physRegs = 32 + c.robSize;
   require(c.physRegs >= 33, "physRegs must be at least 33 (32 arch + 1)");

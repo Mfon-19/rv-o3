@@ -4,19 +4,10 @@
 #              with the simulator or its reference model)
 # `make benchtest` at the repo root runs sim-vs-host-vs-refmodel.
 
-CC := clang
-LD := riscv64-linux-gnu-ld
-OBJCOPY := riscv64-linux-gnu-objcopy
+include ../cdemo/toolchain.mk
 HOSTCC ?= cc
 
-ARCH_FLAGS := --target=riscv32-none-elf -march=rv32im -mabi=ilp32
-CFLAGS := $(ARCH_FLAGS) -std=c11 -O2 -Wall -Wextra \
-	-ffreestanding -fno-builtin -fno-stack-protector \
-	-fno-pic -fno-pie -mno-relax -msmall-data-limit=0
-ASFLAGS := $(ARCH_FLAGS) -mno-relax
-LDFLAGS := -m elf32lriscv --no-relax -T ../cdemo/linker.ld
-
-BENCHES := ptrchase mlpbench matmul mm64 qsortb rle branchy
+BENCHES := $(patsubst %.c,%,$(wildcard *.c))
 
 all: $(BENCHES:%=%.bin) $(BENCHES:%=%.host)
 

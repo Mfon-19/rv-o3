@@ -1,11 +1,5 @@
-// Command-line driver for rvsim.
-//
-// I/O conventions
-//      - Program output (syscalls) goes to stdout
-//      - Trace, statistics and diagnostics go to stderr
-//
-// Build: make
-// Run:   ./rvsim [-t] [-r] [-c maxCycles] [-m memBytes] [program.hex|.bin]
+// Command-line driver for rvsim. Program output (syscalls) goes to
+// stdout; trace, statistics, and diagnostics go to stderr.
 
 #include <cinttypes>
 #include <cstdio>
@@ -39,7 +33,7 @@ static void usage(const char *argv0) {
           argv0);
 }
 
-// Differential checking: print one commit record for a divergence report
+// One side of a differential divergence report
 static void printCommit(const char *who, const CommitRecord &r) {
   fprintf(stderr, "  %s: seq %" PRIu64 " pc=0x%08x %-20s", who, r.sequence,
           r.pc, disasm(decode(r.instruction)).c_str());
@@ -52,28 +46,6 @@ static void printCommit(const char *who, const CommitRecord &r) {
   if (r.exception)
     fprintf(stderr, "  exception=illegal");
   fputc('\n', stderr);
-}
-
-static bool sameCommit(const CommitRecord &a, const CommitRecord &b) {
-  if (a.sequence != b.sequence || a.pc != b.pc ||
-      a.instruction != b.instruction)
-    return false;
-  if (a.registerWrite.has_value() != b.registerWrite.has_value())
-    return false;
-  if (a.registerWrite && (a.registerWrite->rd != b.registerWrite->rd ||
-                          a.registerWrite->value != b.registerWrite->value))
-    return false;
-  if (a.memoryWrite.has_value() != b.memoryWrite.has_value())
-    return false;
-  if (a.memoryWrite && (a.memoryWrite->addr != b.memoryWrite->addr ||
-                        a.memoryWrite->value != b.memoryWrite->value ||
-                        a.memoryWrite->size != b.memoryWrite->size))
-    return false;
-  if (a.exception.has_value() != b.exception.has_value())
-    return false;
-  if (a.exception && a.exception->kind != b.exception->kind)
-    return false;
-  return true;
 }
 
 int main(int argc, char **argv) {
@@ -116,7 +88,7 @@ int main(int argc, char **argv) {
       file = argv[i];
   }
 
-  // Precedence: defaults, then the file, then -O overrides in order
+  // Precedence: defaults, then the config file, then -O overrides in order
   if (cfgFile)
     loadConfigFile(cfg, cfgFile);
   for (const char *kv : overrides)
@@ -133,19 +105,18 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  // .bin loads as raw bytes, everything else as hex words
   const size_t n = strlen(file);
   const bool isBin = n > 4 && !strcmp(file + n - 4, ".bin");
-  auto loadInto = [&](auto &machine) {
+  auto loadInto = [&](Memory &mem) {
     if (isBin)
-      machine.loadBytes(loadBinFile(file));
+      mem.loadBytes(loadBinFile(file));
     else
-      machine.loadWords(loadHexFile(file));
+      mem.loadWords(loadHexFile(file));
   };
 
   if (cfg.refModel) {
     RefModel ref(cfg);
-    loadInto(ref);
+    loadInto(ref.mem);
     int code = ref.run();
     if (cfg.dumpRegs)
       ref.dumpRegs();
@@ -154,18 +125,18 @@ int main(int argc, char **argv) {
 
   MemorySystem msys(cfg);
   OoOCore core(cfg, msys);
-  loadInto(core);
+  loadInto(msys.backing);
 
   // Differential check: the reference model runs alongside the core,
-  // silently, advancing exactly one instruction each time the core
-  // commits one, and the two commit records are compared. The first
-  // mismatch pinpoints the exact instruction where the core corrupted
-  // architectural state
+  // silently, advancing one instruction each time the core commits
+  // one, and the two commit records are compared. The first mismatch
+  // pinpoints the instruction where the core corrupted architectural
+  // state
   RefModel ref(cfg);
   uint64_t verified = 0;
   if (cfg.diffCheck) {
     ref.quiet = true;
-    loadInto(ref);
+    loadInto(ref.mem);
     core.onCommit = [&](const CommitRecord &pipe) {
       CommitRecord refRec;
       if (!ref.step(&refRec)) {
@@ -176,7 +147,7 @@ int main(int argc, char **argv) {
         printCommit("pipeline ", pipe);
         exit(1);
       }
-      if (!sameCommit(pipe, refRec)) {
+      if (!(pipe == refRec)) {
         fprintf(stderr, "differential check FAILED: commit streams diverge\n");
         printCommit("pipeline ", pipe);
         printCommit("reference", refRec);

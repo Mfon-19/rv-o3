@@ -2,9 +2,8 @@
  * Memory-level parallelism: independent random gathers over a 512 KiB
  * array (twice the L2). Each load's address comes from a small index
  * table, not from the previous load, so the out-of-order window can
- * keep several DRAM misses in flight; this is ptrchase's control
- * experiment.
- * Average outstanding misses should clearly exceed ptrchase's.
+ * keep several DRAM misses in flight. This is ptrchase's control
+ * experiment: average outstanding misses should clearly exceed its.
  */
 #include "bench.h"
 

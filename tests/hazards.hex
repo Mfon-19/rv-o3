@@ -1,19 +1,17 @@
-# hazards.hex: a gauntlet of data hazards; prints 84 and exits with code 0.
-# Exercises back-to-back dependent instructions, a load whose value is
-# needed immediately by the next instruction, and a loaded value that
-# is immediately stored again (the store must pick up the load's data,
-# not a stale register). Data lives at 4096 (0x1000), well clear of
-# the code at 0.
-# Run with -t to watch the stall and the forwards happen.
+# Directed data-hazard test: back-to-back dependent instructions, a
+# load whose value the next instruction needs immediately, and a loaded
+# value that is immediately stored again (the store must pick up the
+# load's data, not a stale register). Data lives at 0x1000, clear of
+# the code at 0. Expected output: 84, exit 0.
 
 00001137   # 0x00  lui  sp, 0x1        ; sp = 0x1000, data area
 02A00093   # 0x04  addi ra, zero, 42   ; ra = 42
 00112023   # 0x08  sw   ra, 0(sp)      ; mem[0x1000] = 42
 00012183   # 0x0c  lw   gp, 0(sp)      ; gp = 42
-00318233   # 0x10  add  tp, gp, gp     ; LOAD-USE: 1-cycle stall, tp = 84
+00318233   # 0x10  add  tp, gp, gp     ; LOAD-USE RAW dependency, tp = 84
 00412223   # 0x14  sw   tp, 4(sp)      ; mem[0x1004] = 84
 00412283   # 0x18  lw   t0, 4(sp)      ; t0 = 84
-00512423   # 0x1c  sw   t0, 8(sp)      ; lw;sw pair: MEM/WB->MEM fwd, no stall
+00512423   # 0x1c  sw   t0, 8(sp)      ; load-to-store RAW dependency
 00812503   # 0x20  lw   a0, 8(sp)      ; a0 = 84
 00100893   # 0x24  addi a7, zero, 1    ; syscall 1: print_int
 00000073   # 0x28  ecall               ; prints "84"

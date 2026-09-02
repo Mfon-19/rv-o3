@@ -1,10 +1,9 @@
 # Directed FU test: divider contention, and two writers of one
 # register. The divider is non-pipelined, so the second divu must
 # wait at issue until the first one's quotient comes out. Then a div
-# into x8 is immediately overwritten by "addi x8, x0, 7": both write
-# x8 while the divide is still running, and renaming must keep them
-# apart so the final value of x8 is 7, not the divide's quotient
-# landing afterwards.
+# into x8 is followed by "addi x8, x0, 7" while the divide is still
+# running: a write-after-write hazard. Renaming gives the two writers
+# separate physical registers, so the late quotient cannot clobber x8.
 # Expected output: 30 then 7, exit 0.
 06400093   # addi x1, x0, 100
 00400113   # addi x2, x0, 4
@@ -17,7 +16,7 @@
 00100893   # addi x17, x0, 1      syscall 1: print integer
 00000073   # ecall                prints 30
 0220C433   # div  x8, x1, x2      25 in flight...
-00700413   # addi x8, x0, 7       ...WAW: waits, then makes x8 = 7
+00700413   # addi x8, x0, 7       WAW: newer renamed definition of x8
 00040513   # addi x10, x8, 0
 00100893   # addi x17, x0, 1
 00000073   # ecall                prints 7

@@ -1,9 +1,9 @@
-# Directed OoO test: conservative memory ordering. The second store's
-# address comes out of a divide, so it resolves late; the younger load
-# to the same address (known immediately) is ready long before. The
-# LSQ must hold the load until the store's address is known, then
-# forward 99; a load that sneaks past the unresolved store would read
-# the stale 77 parked there earlier.
+# Directed memory-ordering test: the second store's address comes out
+# of a divide, so it resolves late; the younger load to the same
+# address is ready long before. Conservative and Bypass modes hold the
+# load until the store's address is known; Speculative mode lets it
+# read the stale 77 parked there, then detects the alias and replays
+# it. Either way it ends up forwarding 99.
 # Expected output: 99, exit 0.
 40000213   # addi x4, x0, 1024    the load's address, known early
 00200293   # addi x5, x0, 2

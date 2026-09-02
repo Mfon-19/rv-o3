@@ -2,11 +2,11 @@
 //
 // Given a decoded instruction, its pc, and its two resolved source
 // operands, execute() computes what the instruction *means*: the value
-// it produces and any control transfer it causes. Where the operands
-// come from (the register file, a forwarding network, a physical
-// register file...) and how long it takes are the timing model's
-// business, not this file's. The core's issue stage and the
-// functional reference model both call this same function.
+// it produces (ALU result, effective address, or link address) and any
+// control transfer it causes. Where the operands come from and how
+// long it takes are the timing model's business, not this file's. The
+// core's issue stage and the functional reference model both call this
+// same function.
 
 #pragma once
 
@@ -19,6 +19,6 @@ struct ExecResult {
   uint32_t target = 0;   // new pc, meaningful only when redirect is set
 };
 
-// FENCE, ECALL, EBREAK, and ILLEGAL pass through with value 0; the
-// timing model handles them at commit
+// FENCE, ECALL, EBREAK, and ILLEGAL pass through with value 0; they
+// take effect at commit
 ExecResult execute(const Instr &I, uint32_t pc, uint32_t a, uint32_t b);

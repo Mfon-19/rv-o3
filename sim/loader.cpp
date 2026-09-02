@@ -1,5 +1,6 @@
 #include "sim/loader.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -15,14 +16,8 @@ std::vector<uint32_t> loadHexFile(const char *path) {
   std::vector<uint32_t> words;
   std::string line;
   while (std::getline(f, line)) {
-    // strip comments
-    size_t cut = line.find('#');
-    size_t cut2 = line.find("//");
-    if (cut2 != std::string::npos && (cut == std::string::npos || cut2 < cut))
-      cut = cut2;
-    if (cut != std::string::npos)
-      line.resize(cut);
-
+    for (const char *comment : {"#", "//"})
+      line.resize(std::min(line.size(), line.find(comment)));
     std::istringstream ss(line);
     std::string tok;
     while (ss >> tok) {

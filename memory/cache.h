@@ -19,20 +19,17 @@
 //
 // Hits keep being served while misses are pending, simply because
 // hits never consult the MSHRs. Reads capture their data and writes
-// take effect at access() (a hit) or at line install (a miss);
-// requests to a line take effect in the order they arrived, and the
-// core never has two overlapping requests in flight at once, so the
-// order in which an MSHR's waiting list is re-applied at install
-// cannot change any value.
+// take effect at access() (a hit) or at line install (a miss); an
+// MSHR's waiting list is replayed in arrival order at install, so
+// requests to one line take effect in the order they arrived.
 //
 // Deliberate simplifications: canAccept() conservatively requires a
 // free MSHR and writeback-queue room even for what turns out to be a
 // hit; a full-line write that misses installs immediately without a
 // refill (every byte is overwritten); accepted accesses per cycle are
-// not limited (the port above already rations itself); writebacks to
-// the level below are sent without waiting for a reply (the level
-// below applies them
-// on arrival).
+// not limited (the port above already rations itself); a writeback
+// leaves the queue as soon as the level below accepts it, and its ack
+// is dropped.
 
 #pragma once
 
@@ -78,9 +75,10 @@ public:
   // routed here by the MemorySystem
   void deliverBelowResponse(const MemResponse &r);
 
-  // Functional read for the simulator's own use (syscall 3 string
-  // reads): returns true and the byte if this cache holds the line,
-  // whether in the arrays or still parked in the writeback queue
+  // Functional read for the simulator's own use (syscall 3 strings,
+  // the differential checker's final memory compare): the newest copy
+  // of the byte this cache owns, whether in the arrays, the writeback
+  // queue, or a write waiting in an MSHR. False if it owns none
   bool peek8(uint32_t addr, uint8_t &out) const;
 
   const char *name;
@@ -133,9 +131,11 @@ private:
   // Perform one request on a resident line; returns the response
   MemResponse performOnLine(const MemRequest &req, uint32_t set,
                             uint32_t way);
-  // Evict (to the wb queue) and claim a way for lineAddr; false if the
-  // wb queue has no room for the dirty victim
-  bool claimWay(uint32_t lineAddr, uint32_t &set, uint32_t &way);
+  // Put a line into the way picked for lineAddr, evicting a dirty
+  // occupant to the wb queue. False, changing nothing, if that queue
+  // has no room for the victim
+  bool installLine(uint32_t lineAddr, const uint8_t *src, bool isDirty,
+                   uint32_t &set, uint32_t &way);
   bool tryInstall(uint32_t mshrIdx, const std::vector<uint8_t> &line);
   void finishHit(MemResponse &&resp);
 

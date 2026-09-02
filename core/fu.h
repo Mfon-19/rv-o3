@@ -7,8 +7,8 @@
 //
 //      N x integer ALU   latency 1, pipelined
 //      1 x branch unit   latency 1, pipelined
-//      1 x multiplier    latency 3, pipelined (one new op per cycle)
-//      1 x divider       latency 12+, non-pipelined (busy throughout)
+//      1 x multiplier    latency mulLatency, pipelined (configurable)
+//      1 x divider       latency divLatency, non-pipelined (busy throughout)
 //      1 x AGU           latency 1; drains to the LSQ, not a WB port
 //
 // The result VALUE is computed by execute() at issue (semantics stay
@@ -26,7 +26,7 @@
 
 #include "isa/isa.h"
 
-// "No physical register"
+// "No physical register": branches, stores, and writes to x0
 constexpr uint8_t kNoReg = 0xFF;
 
 // An instruction in flight inside a functional unit
@@ -45,8 +45,8 @@ struct FuOp {
 };
 
 // A fixed-latency unit, pipelined or not. Pipelined: a shift register
-// one slot per cycle of latency, accepting a new op every cycle.
-// Non-pipelined: a single op occupies the unit for its whole latency
+// with one slot per cycle of latency, accepting a new op every cycle.
+// Non-pipelined: one op occupies the unit for its whole latency
 struct FuUnit {
   const char *name;
   uint32_t latency;
@@ -86,10 +86,9 @@ struct FuUnit {
     }
   }
 
-  // Clock edge: advance one cycle. While the output slot is occupied
-  // a pipelined unit freezes entirely (nothing shifts, bubbles
-  // included), and a non-pipelined unit keeps its finished result
-  // parked inside
+  // Clock edge: advance one cycle. While the output slot is occupied a
+  // pipelined unit freezes entirely (nothing shifts, bubbles included)
+  // and a non-pipelined unit keeps its finished result parked inside
   void tick() {
     if (busy())
       busyCycles++;
@@ -106,8 +105,8 @@ struct FuUnit {
     }
   }
 
-  // Squash recovery: kill every in-flight op younger than the
-  // mispredicted branch. Their results must never write back
+  // Squash: kill every in-flight op younger than seq. Their results
+  // must never write back
   void flushYounger(uint64_t seq) {
     for (FuOp &s : stages)
       if (s.valid && s.seq > seq)

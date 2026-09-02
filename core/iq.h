@@ -3,11 +3,11 @@
 //
 // Each entry tracks its two source physical registers and a ready bit
 // per source. When a result writes back, its physical register number
-// is announced to every entry here (the "wakeup"); any source waiting
-// on that register flips to ready. The scheduler picks the OLDEST
-// fully ready entries whose unit can accept, up to issue width;
-// favoring the oldest keeps long dependency chains moving and makes
-// starvation impossible.
+// is broadcast to every entry here (the wakeup); any source waiting on
+// that register flips to ready. Select takes the OLDEST fully ready
+// entries whose unit can accept, up to issue width; favoring the
+// oldest keeps long dependency chains moving and makes starvation
+// impossible.
 
 #pragma once
 
@@ -64,16 +64,6 @@ struct IssueQueue {
       if (q.ps2 == preg)
         q.ready2 = true;
     }
-  }
-
-  // The oldest ready entry the scheduler hasn't taken this cycle
-  IqEntry *oldestReady() {
-    IqEntry *best = nullptr;
-    for (IqEntry &q : e)
-      if (q.valid && q.ready1 && q.ready2 &&
-          (!best || q.seq < best->seq))
-        best = &q;
-    return best;
   }
 
   void flushYounger(uint64_t seq) {

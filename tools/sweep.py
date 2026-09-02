@@ -7,7 +7,7 @@ benchmark, plus the metric that axis is expected to move (so the
 sweep carries its own evidence, not just a headline number).
 
 Usage: tools/sweep.py AXIS [prog.bin ...]     (axes: rob width l1
-       mshr pred; default programs: the six bench/ binaries)
+       mshr pred; default programs: the seven bench/ binaries)
 """
 import re
 import subprocess
