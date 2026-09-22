@@ -13,10 +13,10 @@
 
 template <class T> class Ring {
 public:
-  explicit Ring(uint32_t capacity) : e(capacity) {}
+  explicit Ring(uint32_t capacity) : e(capacity), capacity(capacity) {}
 
   bool empty() const { return n == 0; }
-  bool full() const { return n == e.size(); }
+  bool full() const { return n == capacity; }
   uint32_t count() const { return n; }
 
   // Take the slot after the tail, reset it, and return its ring index
@@ -33,11 +33,16 @@ public:
   T &tail() { return e[indexOf(n - 1)]; }
   T &nth(uint32_t k) { return e[indexOf(k)]; } // k-th oldest, 0 = head
   uint32_t indexOf(uint32_t k) const {
-    return (headIdx + k) % (uint32_t)e.size();
+    // All callers use offsets <= capacity: at most one wrap, even for
+    // non-power-of-two capacities. Subtract first to avoid overflow.
+    const uint32_t toEnd = capacity - headIdx;
+    return k < toEnd ? headIdx + k : k - toEnd;
   }
   // Is this ring index currently occupied by a live entry?
   bool live(uint32_t idx) const {
-    return (idx + (uint32_t)e.size() - headIdx) % (uint32_t)e.size() < n;
+    const uint32_t distance = idx >= headIdx ? idx - headIdx
+                                            : capacity - (headIdx - idx);
+    return idx < capacity && distance < n;
   }
 
   void popHead() {
@@ -45,8 +50,10 @@ public:
     n--;
   }
   void popTail() { n--; }
+  void clear() { headIdx = n = 0; }
 
 private:
   std::vector<T> e;
+  const uint32_t capacity;
   uint32_t headIdx = 0, n = 0;
 };

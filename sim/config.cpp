@@ -254,9 +254,8 @@ void validateConfig(SimConfig &c) {
   require(c.physRegs >= 33, "physRegs must be at least 33 (32 arch + 1)");
   require(c.physRegs <= 255, "physRegs must fit 8-bit ids (max 255)");
 
-  require(c.width >= 1 && c.width <= 8 && (c.width & (c.width - 1)) == 0,
-          "width must be 1, 2, 4, or 8 (fetch-block alignment)");
-  const uint32_t fetchBytes = c.width * 4 < 8 ? 8 : c.width * 4;
+  require(c.width >= 1 && c.width <= 8, "width must be in 1..8");
+  const uint32_t fetchBytes = c.fetchBlockBytes();
   require(c.fetchQSize >= fetchBytes / 4,
           "fetchQSize must hold at least one fetch block");
   require(c.robSize >= 1 && c.iqSize >= 1 && c.lsqSize >= 1 && c.sbSize >= 1,

@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <vector>
 
 #include "core/ooo.h"
@@ -18,7 +19,6 @@ static void usage(const char *argv0) {
           "usage: %s [options] [program.hex|program.bin]\n"
           "  -t            trace pipeline occupancy every cycle (stderr)\n"
           "  -r            dump registers when the simulation ends\n"
-          "  -f            run the functional reference model (no pipeline)\n"
           "  -d            differential check: compare the core's commit\n"
           "                stream against the reference model, instruction by\n"
           "                instruction\n"
@@ -64,8 +64,6 @@ int main(int argc, char **argv) {
       cfg.trace = true;
     else if (!strcmp(argv[i], "-r"))
       cfg.dumpRegs = true;
-    else if (!strcmp(argv[i], "-f"))
-      cfg.refModel = true;
     else if (!strcmp(argv[i], "-d"))
       cfg.diffCheck = true;
     else if (!strcmp(argv[i], "-c") && i + 1 < argc)
@@ -114,15 +112,6 @@ int main(int argc, char **argv) {
       mem.loadWords(loadHexFile(file));
   };
 
-  if (cfg.refModel) {
-    RefModel ref(cfg);
-    loadInto(ref.mem);
-    int code = ref.run();
-    if (cfg.dumpRegs)
-      ref.dumpRegs();
-    return code;
-  }
-
   MemorySystem msys(cfg);
   OoOCore core(cfg, msys);
   loadInto(msys.backing);
@@ -132,14 +121,17 @@ int main(int argc, char **argv) {
   // one, and the two commit records are compared. The first mismatch
   // pinpoints the instruction where the core corrupted architectural
   // state
-  RefModel ref(cfg);
+  std::optional<RefModel> ref;
   uint64_t verified = 0;
   if (cfg.diffCheck) {
-    ref.quiet = true;
-    loadInto(ref.mem);
+    ref.emplace(cfg);
+    loadInto(ref->mem);
     core.onCommit = [&](const CommitRecord &pipe) {
       CommitRecord refRec;
-      if (!ref.step(&refRec)) {
+      if (pipe.instruction == 0x00000073 && ref->reg(17) == 5 &&
+          pipe.registerWrite)
+        ref->replayInput = pipe.registerWrite->value;
+      if (!ref->step(&refRec)) {
         fprintf(stderr,
                 "differential check FAILED: pipeline retired seq %" PRIu64
                 " but the reference model had already halted\n",
@@ -160,11 +152,11 @@ int main(int argc, char **argv) {
   int code = core.run();
 
   if (cfg.diffCheck && code != 2) { // a blown cycle budget isn't architectural
-    if (!ref.halted() || ref.exitCode() != code) {
+    if (!ref->halted() || ref->exitCode() != code) {
       fprintf(stderr,
               "differential check FAILED: exit state diverges "
               "(pipeline exited %d, reference %s with exit %d)\n",
-              code, ref.halted() ? "halted" : "still running", ref.exitCode());
+              code, ref->halted() ? "halted" : "still running", ref->exitCode());
       exit(1);
     }
     // Final architectural state. The commit stream alone cannot catch
@@ -174,20 +166,20 @@ int main(int argc, char **argv) {
     // So the settled state is compared too; memory is read through
     // peek8, since the newest copy of a byte may still be in a cache
     for (int r = 0; r < 32; r++) {
-      if (core.reg(r) != ref.reg(r)) {
+      if (core.reg(r) != ref->reg(r)) {
         fprintf(stderr,
                 "differential check FAILED: final %s diverges "
                 "(pipeline 0x%08x, reference 0x%08x)\n",
-                kRegName[r], core.reg(r), ref.reg(r));
+                kRegName[r], core.reg(r), ref->reg(r));
         exit(1);
       }
     }
     for (uint32_t a = 0; a < (uint32_t)cfg.memBytes; a++) {
-      if (msys.peek8(a) != ref.mem.bytes[a]) {
+      if (msys.peek8(a) != ref->mem.bytes[a]) {
         fprintf(stderr,
                 "differential check FAILED: final mem[0x%08x] diverges "
                 "(pipeline 0x%02x, reference 0x%02x)\n",
-                a, msys.peek8(a), ref.mem.bytes[a]);
+                a, msys.peek8(a), ref->mem.bytes[a]);
         exit(1);
       }
     }

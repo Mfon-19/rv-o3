@@ -1,5 +1,5 @@
 CXX ?= g++
-CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra
+CXXFLAGS ?= -std=c++17 -O2 -flto -Wall -Wextra
 CXXFLAGS += -I. -MMD -MP
 
 SRCS := isa/decode.cpp isa/disasm.cpp isa/execute.cpp \
@@ -12,16 +12,59 @@ DEPS := $(OBJS:.o=.d)
 rvsim: $(OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $(OBJS)
 
-%.o: %.cpp
+%.o: %.cpp Makefile
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
 -include $(DEPS)
 
+# Optional GCC profile-guided build. Keep training and profile use at -O2:
+# changing optimization levels can invalidate GCC's control-flow counters.
+# Rebuild and retrain each time, so profiles never silently outlive the source.
+PGO_IMAGE ?= bench/mm64.bin
+PGO_CYCLES ?= 200000000
+PGO_MEMORY ?= 67108864
+PGO_CXXFLAGS = $(filter-out -MMD -MP -flto,$(CXXFLAGS))
+.PHONY: pgo
+pgo: bench
+	@test -r "$(PGO_IMAGE)" || { echo "PGO_IMAGE must name a readable program" >&2; exit 1; }
+	@mkdir -p build/pgo/counts
+	@rm -f build/pgo/counts/*.gcda
+	$(CXX) $(PGO_CXXFLAGS) -fprofile-generate=$(abspath build/pgo/counts) -o build/pgo/rvsim $(SRCS)
+	@: > build/pgo/train-stdout.txt
+	@: > build/pgo/train-stderr.txt
+	@for image in "$(PGO_IMAGE)" bench/mm64.bin bench/branchy.bin bench/mlpbench.bin; do \
+		echo "PGO training: $$image"; status=0; \
+		build/pgo/rvsim -m $(PGO_MEMORY) -c $(PGO_CYCLES) "$$image" </dev/null \
+			>>build/pgo/train-stdout.txt 2>>build/pgo/train-stderr.txt || status=$$?; \
+		if [ $$status -ne 0 ] && [ $$status -ne 2 ]; then \
+			cat build/pgo/train-stderr.txt >&2; exit $$status; \
+		fi; \
+	done
+	@build/pgo/rvsim -O width=8 -O aluCount=8 -O wbPorts=8 -O fetchQSize=16 bench/mm64.bin \
+		</dev/null >>build/pgo/train-stdout.txt 2>>build/pgo/train-stderr.txt
+	@build/pgo/rvsim -d -O flatMemory=1 bench/branchy.bin \
+		</dev/null >>build/pgo/train-stdout.txt 2>>build/pgo/train-stderr.txt
+	$(CXX) $(PGO_CXXFLAGS) -flto -fno-tracer -fprofile-use=$(abspath build/pgo/counts) \
+		-Werror=coverage-mismatch -Werror=missing-profile -o build/pgo/rvsim $(SRCS)
+
 # Run every bundled program under -d, checking the core's commit stream
 # against the reference model instruction by instruction. Each .hex
 # file's header says what it exercises and what it should print.
-.PHONY: test
-test: rvsim
+.PHONY: test testinput testhost testdecode
+testdecode: rvsim
+	python3 tests/decode_cache.py
+
+testinput: rvsim
+	python3 tests/syscall_input.py
+
+build/tests/host_structures: tests/host_structures.cpp core/fu.h core/iq.h core/lsq.h core/ring.h memory/request.h isa/isa.h
+	@mkdir -p build/tests
+	$(CXX) $(CXXFLAGS) -UNDEBUG -o $@ $<
+
+testhost: build/tests/host_structures
+	./build/tests/host_structures
+
+test: rvsim testinput testhost testdecode
 	@for t in tests/*.hex; do \
 		echo "== $$t"; ./rvsim -d $$t || exit 1; \
 	done
@@ -78,3 +121,4 @@ benchtest: rvsim bench
 .PHONY: clean
 clean:
 	rm -f rvsim $(OBJS) $(DEPS)
+	rm -f build/tests/host_structures build/tests/host_structures.d

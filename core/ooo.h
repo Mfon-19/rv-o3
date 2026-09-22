@@ -11,10 +11,10 @@
 // The widths shown are the shipped defaults; all of them are knobs.
 //
 // Microarchitecture
-//      - Fetch pulls one aligned block per cycle (width*4 bytes, minimum
-//        8) into a small queue. A direction table, a branch target
-//        buffer, and a return-address stack steer the next block, so
-//        correctly predicted taken branches cost nothing
+//      - Fetch pulls one aligned block per cycle (width*4 bytes rounded
+//        up to a power of two, minimum 8) into a small queue. A direction
+//        table, a branch target buffer, and a return-address stack steer
+//        the next block, so correctly predicted taken branches cost nothing
 //      - Rename (in order) maps each source register to the physical
 //        register currently holding its value and hands each destination
 //        a fresh one from the free list. No physical register is written
@@ -63,8 +63,8 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
-#include <deque>
 #include <functional>
 #include <string>
 #include <vector>
@@ -123,16 +123,31 @@ private:
   FuUnit agu;                  // address generation; drains to the LSQ
   std::vector<FuUnit *> units; // all of the above, for flush and tick
 
+  // Reused writeback candidates; these pointers do not own entries.
+  std::vector<FuOp *> wbScratch;
+
+  // Host-only memoization of pure decode/classification. Always compare
+  // the fetched bits, so replacement and self-modifying code stay correct.
+  struct DispatchInfo {
+    Instr ins;
+    FuKind unit = FuKind::NONE;
+    bool memory = false, hasDest = false;
+    bool reads1 = false, reads2 = false;
+    bool valid = false;
+  };
+  std::array<DispatchInfo, 64> decodeCache{};
+  void fillDispatchInfo(DispatchInfo &entry, uint32_t raw);
+
   // fetch state: at most one block request is outstanding at a time
   uint32_t pc = 0;      // next address fetch will request
-  const uint32_t fBytes; // aligned fetch-block size: max(8, width*4)
+  const uint32_t fBytes; // aligned power-of-two fetch block, at least 8 bytes
   struct Fetched {
     uint32_t pc = 0, raw = 0;
     bool predTaken = false;
     uint32_t predTarget = 0;
     uint32_t predIdx = 0, ghrBefore = 0; // predictor snapshot
   };
-  std::deque<Fetched> fetchQ;
+  Ring<Fetched> fetchQ;
   bool fOutstanding = false, fStale = false; // stale: squashed while in flight
   uint32_t fBlock = 0, fFetchPc = 0; // the outstanding block, and the pc in it
 

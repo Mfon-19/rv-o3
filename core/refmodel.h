@@ -1,4 +1,5 @@
-// The functional reference model: the executable form of the ISA spec.
+// The differential-checking reference model: the executable form of the ISA spec.
+// Used only to verify instructions retired by the out-of-order core.
 //
 // A plain fetch-decode-execute-commit interpreter. One instruction at a
 // time, in program order, each fully completed before the next begins.
@@ -32,20 +33,12 @@ public:
 
   Memory mem;
 
-  // Suppress all output (syscall prints and halt messages) while still
-  // honoring exit. Set when the model runs as a silent shadow of the
-  // core in a differential check, so side effects happen once
-  bool quiet = false;
+  // A differential shadow consumes the primary core's recorded input byte.
+  uint32_t replayInput = UINT32_MAX;
 
   // Execute one instruction and optionally describe it in *rec.
   // Returns false if the model had already halted
   bool step(CommitRecord *rec = nullptr);
-
-  // Run until an exit syscall / ebreak / error, or the instruction
-  // budget runs out; returns the exit code
-  int run();
-
-  void dumpRegs() const { dumpRegisters(regs, pc); }
 
   bool halted() const { return halted_; }
   int exitCode() const { return exitCode_; }
@@ -60,5 +53,4 @@ private:
   bool halted_ = false;
   int exitCode_ = 0;
   uint64_t retired_ = 0;
-  uint64_t maxInstrs; // reuses the -c budget, counted in instructions
 };

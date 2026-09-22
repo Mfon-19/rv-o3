@@ -24,10 +24,15 @@ Cache::Cache(const char *name, const CacheConfig &cfg, MemPort *below,
   if (this->cfg.hitLatency == 0)
     this->cfg.hitLatency = 1;
   sets = cfg.sizeBytes / (cfg.lineBytes * cfg.ways);
+  binaryGeometry = (cfg.lineBytes & (cfg.lineBytes - 1)) == 0 &&
+                   (sets & (sets - 1)) == 0;
+  if (binaryGeometry) {
+    lineShift = __builtin_ctz(cfg.lineBytes);
+    tagShift = lineShift + __builtin_ctz(sets);
+  }
   const size_t lines = (size_t)sets * cfg.ways;
   data.assign(lines * cfg.lineBytes, 0);
-  tags.assign(lines, 0);
-  valid.assign(lines, 0);
+  tags.assign(lines, invalidTag);
   dirty.assign(lines, 0);
   lru.assign(lines, 0);
   mshrs.assign(cfg.mshrs, Mshr{});
@@ -36,7 +41,7 @@ Cache::Cache(const char *name, const CacheConfig &cfg, MemPort *below,
 int Cache::findWay(uint32_t set, uint32_t tag) const {
   for (uint32_t w = 0; w < cfg.ways; w++) {
     const uint32_t i = set * cfg.ways + w;
-    if (valid[i] && tags[i] == tag)
+    if (tags[i] == tag)
       return (int)w;
   }
   return -1;
@@ -47,7 +52,7 @@ uint32_t Cache::victimWay(uint32_t set) const {
   uint64_t oldest = UINT64_MAX;
   for (uint32_t w = 0; w < cfg.ways; w++) {
     const uint32_t i = set * cfg.ways + w;
-    if (!valid[i])
+    if (tags[i] == invalidTag)
       return w; // free way first
     if (lru[i] < oldest) {
       oldest = lru[i];
@@ -76,7 +81,7 @@ int Cache::mshrFor(uint32_t lineAddr) const {
 MemResponse Cache::performOnLine(const MemRequest &req, uint32_t set,
                                  uint32_t way) {
   uint8_t *line = lineData(set, way);
-  const uint32_t off = req.addr % cfg.lineBytes;
+  const uint32_t off = offsetOf(req.addr);
   MemResponse resp;
   resp.src = req.src;
   resp.tag = req.tag;
@@ -107,7 +112,7 @@ void Cache::finishHit(MemResponse &&resp) {
   if (cfg.hitLatency == 1)
     respQ.push_back(std::move(resp));
   else
-    hitPipe.push_back(HitTxn{std::move(resp), cfg.hitLatency - 1});
+    hitPipe.push_back(HitTxn{std::move(resp), tickCount + cfg.hitLatency - 1});
 }
 
 // Install a line in the way victimWay picks for it. A dirty occupant
@@ -118,7 +123,7 @@ bool Cache::installLine(uint32_t lineAddr, const uint8_t *src, bool isDirty,
   set = setOf(lineAddr);
   way = victimWay(set);
   const uint32_t i = set * cfg.ways + way;
-  if (valid[i] && dirty[i]) {
+  if (tags[i] != invalidTag && dirty[i]) {
     if (wbq.size() >= cfg.wbq)
       return false;
     stats.dirtyEvictions++;
@@ -131,24 +136,20 @@ bool Cache::installLine(uint32_t lineAddr, const uint8_t *src, bool isDirty,
   }
   memcpy(lineData(set, way), src, cfg.lineBytes);
   tags[i] = tagOf(lineAddr);
-  valid[i] = 1;
   dirty[i] = isDirty;
   return true;
 }
 
 void Cache::access(const MemRequest &req) {
   stats.accesses++;
-  const uint32_t lineAddr = (req.addr / cfg.lineBytes) * cfg.lineBytes;
+  const uint32_t lineAddr = req.addr - offsetOf(req.addr);
   const uint32_t set = setOf(req.addr);
 
   const int way = findWay(set, tagOf(req.addr));
   if (way >= 0) {
     stats.hits++;
-    for (const Mshr &m : mshrs)
-      if (m.valid) {
-        stats.hitUnderMiss++;
-        break;
-      }
+    if (pendingMisses)
+      stats.hitUnderMiss++;
     finishHit(performOnLine(req, set, (uint32_t)way));
     return;
   }
@@ -202,6 +203,7 @@ void Cache::access(const MemRequest &req) {
   const int idx = freeMshr(); // canAccept() guaranteed one
   Mshr &m = mshrs[idx];
   m.valid = true;
+  pendingMisses++;
   m.lineAddr = lineAddr;
   m.refillSent = false;
   m.waiting.clear();
@@ -212,7 +214,7 @@ void Cache::access(const MemRequest &req) {
 // every request that was waiting for it, in arrival order. Returns
 // false if the victim couldn't be evicted yet (writeback queue full);
 // the MSHR stays and the caller retries
-bool Cache::tryInstall(uint32_t mshrIdx, const std::vector<uint8_t> &line) {
+bool Cache::tryInstall(uint32_t mshrIdx, const ReadPayload &line) {
   Mshr &m = mshrs[mshrIdx];
   uint32_t set, way;
   if (!installLine(m.lineAddr, line.data(), false, set, way))
@@ -222,7 +224,12 @@ bool Cache::tryInstall(uint32_t mshrIdx, const std::vector<uint8_t> &line) {
     stats.latencySum += tickCount - w.issueTick + 1;
     respQ.push_back(performOnLine(w.req, set, way));
   }
-  m = Mshr{};
+  // Keep the waiting-list allocation for the next miss in this slot.
+  m.waiting.clear();
+  m.valid = false;
+  pendingMisses--;
+  m.lineAddr = 0;
+  m.refillSent = false;
   return true;
 }
 
@@ -235,14 +242,11 @@ void Cache::deliverBelowResponse(const MemResponse &r) {
 
 void Cache::tick() {
   tickCount++;
-  // hits counting out their latency
-  for (size_t i = 0; i < hitPipe.size();) {
-    if (--hitPipe[i].remaining == 0) {
-      respQ.push_back(std::move(hitPipe[i].resp));
-      hitPipe.erase(hitPipe.begin() + i);
-    } else {
-      i++;
-    }
+  // All hits have the same latency, so their deadlines are in order.
+  // Pending responses stay in place until the first one is ready.
+  while (!hitPipe.empty() && hitPipe.front().readyAt <= tickCount) {
+    respQ.push_back(std::move(hitPipe.front().resp));
+    hitPipe.pop_front();
   }
   // installs that were waiting for writeback-queue room
   while (!pendingInstalls.empty() &&
@@ -252,7 +256,7 @@ void Cache::tick() {
   // one transaction to the level below per cycle: refills are the
   // critical path, but a full writeback queue goes first (it gates
   // installs and evictions)
-  if (below->canAccept()) {
+  if ((pendingMisses || !wbq.empty()) && below->canAccept()) {
     const bool wbFirst = wbq.size() >= cfg.wbq;
     int refillIdx = -1;
     for (size_t i = 0; i < mshrs.size(); i++)
@@ -281,12 +285,9 @@ void Cache::tick() {
       below->access(rd);
     }
   }
-  uint32_t pending = 0;
-  for (const Mshr &m : mshrs)
-    pending += m.valid;
-  if (pending >= 2)
+  if (pendingMisses >= 2)
     stats.overlapCycles++;
-  stats.mshrOccSum += pending;
+  stats.mshrOccSum += pendingMisses;
   stats.ticks++;
 }
 
@@ -299,7 +300,7 @@ MemResponse Cache::response() {
 bool Cache::peek8(uint32_t addr, uint8_t &out) const {
   const int way = findWay(setOf(addr), tagOf(addr));
   if (way >= 0) {
-    out = lineData(setOf(addr), (uint32_t)way)[addr % cfg.lineBytes];
+    out = lineData(setOf(addr), (uint32_t)way)[offsetOf(addr)];
     return true;
   }
   for (const WbEntry &wb : wbq) { // evicted but not yet written below

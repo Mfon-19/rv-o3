@@ -135,9 +135,9 @@ Four make targets build on the checker:
 
 | Target | What it does |
 | --- | --- |
-| `make test` | 18 directed programs, each aimed at one mechanism, plus the compiled C demo |
+| `make test` | 18 directed programs, the compiled C demo, input and changed-code checks, and host data-structure checks for payload ownership, queue wraparound/age/readiness, pending loads, and functional-unit timing |
 | `make randtest` | Generated load/store soups over a few contested cache lines, with late-resolving addresses and eviction pressure; the reference model is the oracle |
-| `make configtest` | The directed suite under twelve configurations: widths 1 and 4, ROB 16 and 128, one MSHR, all three ordering modes, flat memory, tiny caches, and more |
+| `make configtest` | The directed suite under seventeen configurations: widths 1–8, ROB 16 and 128, one MSHR, all three ordering modes, flat memory, tiny caches, and more |
 | `make benchtest` | Every benchmark is also compiled natively for the host; simulator output must match the native binary byte for byte, in all three ordering modes. The host build shares no code with the simulator, so it checks the one layer the shared reference model cannot |
 
 ## Benchmarks
@@ -176,7 +176,6 @@ default) derives 32 plus the ROB size. The full command line:
 usage: ./rvsim [options] [program.hex|program.bin]
   -t            trace pipeline occupancy every cycle (stderr)
   -r            dump registers when the simulation ends
-  -f            run the functional reference model (no pipeline)
   -d            differential check against the reference model
   -c <cycles>   cycle budget (default 10000000)
   -m <bytes>    memory size (default 1 MiB)
@@ -212,6 +211,7 @@ settled state.
 | `2` | print the low byte of `a0` as a character |
 | `3` | print the NUL-terminated string at address `a0` |
 | `4` | print `a0` as eight hex digits |
+| `5` | read one available stdin byte into `a0`, or `0xffffffff` if none is available |
 | `10`, `93` | exit with the low byte of `a0` as the status |
 
 ### Running real C
@@ -242,6 +242,7 @@ tests/      18 annotated directed tests plus randgen.py
 bench/      benchmarks with native-build oracles
 tools/      configtest.sh, sweep.py
 cdemo/      freestanding C demo and its runtime
+doom/       RV32IM Doomgeneric port, ASCII renderer, and terminal launcher
 ```
 
 ## Limitations

@@ -27,7 +27,12 @@ run_suite() {
 
 run_suite "defaults"
 run_suite "width 1" -O width=1 -O wbPorts=1 -O aluCount=1
+run_suite "width 3" -O width=3 -O wbPorts=3 -O aluCount=3
 run_suite "width 4" -O width=4 -O wbPorts=4 -O aluCount=4
+run_suite "width 5" -O width=5 -O wbPorts=5 -O aluCount=5
+run_suite "width 6" -O width=6 -O wbPorts=6 -O aluCount=6
+run_suite "width 7" -O width=7 -O wbPorts=7 -O aluCount=7
+run_suite "width 8" -O width=8 -O wbPorts=8 -O aluCount=8
 run_suite "rob 16" -O robSize=16
 run_suite "rob 128" -O robSize=128
 run_suite "single mshr" -O l1d.mshrs=1 -O l2.mshrs=1

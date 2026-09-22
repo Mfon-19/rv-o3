@@ -1,6 +1,5 @@
 #include "core/refmodel.h"
 
-#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -8,8 +7,7 @@
 #include "isa/execute.h"
 #include "sim/syscall.h"
 
-RefModel::RefModel(const SimConfig &cfg)
-    : mem(cfg.memBytes), maxInstrs(cfg.maxCycles) {
+RefModel::RefModel(const SimConfig &cfg) : mem(cfg.memBytes) {
   memset(regs, 0, sizeof regs);
 }
 
@@ -35,19 +33,17 @@ bool RefModel::step(CommitRecord *rec) {
   case Op::ECALL:
     retired_++;
     if (runSyscall(
-            regs[17], regs[10], pc, quiet,
-            [&](uint32_t a) { return mem.load8(a); }, exitCode_))
+            regs[17], regs[10], pc, true,
+            [&](uint32_t a) { return mem.load8(a); }, exitCode_, replayInput))
       halted_ = true;
+    if (regs[17] == 5)
+      r.registerWrite = RegisterWrite{10, regs[10]};
     break;
   case Op::EBREAK:
     retired_++;
-    if (!quiet)
-      fprintf(stderr, "ebreak at pc=0x%08x; halting\n", pc);
     halted_ = true;
     break;
   case Op::ILLEGAL:
-    if (!quiet)
-      fprintf(stderr, "illegal instruction 0x%08x at pc=0x%08x\n", raw, pc);
     halted_ = true;
     exitCode_ = 1;
     r.exception = Exception{ExceptionKind::IllegalInstruction};
@@ -86,23 +82,4 @@ bool RefModel::step(CommitRecord *rec) {
   if (rec)
     *rec = r;
   return true;
-}
-
-int RefModel::run() {
-  while (!halted_) {
-    if (retired_ >= maxInstrs) {
-      fprintf(stderr,
-              "stopping after %" PRIu64
-              " instructions without an exit syscall (raise with -c)\n",
-              retired_);
-      exitCode_ = 2;
-      break;
-    }
-    step();
-  }
-  fprintf(stderr,
-          "--- rvsim: functional model, %" PRIu64 " instructions retired\n",
-          retired_);
-  fprintf(stderr, "--- rvsim: exit code %d\n", exitCode_);
-  return exitCode_;
 }

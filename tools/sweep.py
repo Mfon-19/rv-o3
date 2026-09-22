@@ -20,8 +20,9 @@ AXES = {
     },
     "width": {
         "points": [(f"width {v}",
-                    [f"width={v}", f"wbPorts={v}", f"aluCount={v}"])
-                   for v in (1, 2, 4)],
+                    [f"width={v}", f"wbPorts={v}", f"aluCount={v}",
+                     "fetchQSize=16"])
+                   for v in (1, 2, 4, 5, 6, 7, 8)],
         "aux": ("avg issue width", r"avg issue ([\d.]+)"),
     },
     "l1": {

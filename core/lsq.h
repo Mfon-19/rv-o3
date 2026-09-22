@@ -33,25 +33,24 @@ struct LsqEntry {
   uint64_t seq = 0;
   uint32_t robIdx = 0;
   uint32_t pc = 0;
-  Instr ins;
-  bool isStore = false;
-  uint8_t pdst = 0xFF; // loads: where the result goes
-  bool addrValid = false;
   uint32_t addr = 0;
-  uint8_t size = 4;
   // Stores: address and data resolve independently. The data operand's
   // physical register is watched until it is ready; it is written
   // exactly once while this store is live, so a late capture is
   // always safe
   uint32_t data = 0;
+  uint32_t value = 0;
+  uint16_t gen = 0;       // slot generation: rejects squashed loads' responses
+  Op op = Op::ILLEGAL;    // load extension needs only the opcode
+  uint8_t pdst = 0xFF;    // loads: where the result goes
+  uint8_t size = 4;
   uint8_t dataPreg = 0xFF;
+  bool isStore = false;
+  bool addrValid = false;
   bool dataReady = true;
   bool done = false;     // loads: value produced (forwarded or from cache)
   bool issued = false;   // loads: access in flight at the cache
   bool reported = false; // loads: handed to the writeback arbiter
-  uint16_t gen = 0;      // slot generation, embedded in the access tag
-                         // so a squashed load's response fails the match
-  uint32_t value = 0;
 };
 
 // Do two accesses touch any byte in common?
@@ -72,8 +71,59 @@ public:
     return idx;
   }
 
+  void issueLoad(LsqEntry &load) {
+    load.issued = true;
+    pendingLoads++;
+  }
+
+  // Cache replies, forwarding, and fault completion all become visible to
+  // writeback on the next LSQ update. Stale replies are rejected by the caller.
+  void completeLoad(LsqEntry &load, uint32_t value) {
+    load.value = value;
+    load.done = true;
+    if (load.issued)
+      pendingLoads--;
+    unreportedLoads++;
+  }
+
+  void reportLoad(LsqEntry &load) {
+    load.reported = true;
+    unreportedLoads--;
+  }
+
+  void setStoreSource(LsqEntry &store, uint8_t preg, bool ready, uint32_t value) {
+    store.dataPreg = preg;
+    store.dataReady = ready;
+    if (ready)
+      store.data = value;
+    else
+      waitingStores++;
+  }
+
+  void captureStoreData(LsqEntry &store, uint32_t value) {
+    store.data = value;
+    store.dataReady = true;
+    waitingStores--;
+  }
+
+  void popTail() {
+    const LsqEntry &entry = tail();
+    if (entry.issued && !entry.done)
+      pendingLoads--;
+    if (!entry.isStore && entry.done && !entry.reported)
+      unreportedLoads--;
+    if (entry.isStore && !entry.dataReady)
+      waitingStores--;
+    Ring::popTail();
+  }
+
+  bool hasPendingLoads() const { return pendingLoads != 0; }
+  bool needsUpdate() const { return unreportedLoads != 0 || waitingStores != 0; }
+
 private:
   std::vector<uint16_t> genCtr;
+  uint32_t pendingLoads = 0;
+  uint32_t unreportedLoads = 0, waitingStores = 0;
 };
 
 // Committed stores waiting to be written to the cache: issued in

@@ -29,29 +29,27 @@
 // "No physical register": branches, stores, and writes to x0
 constexpr uint8_t kNoReg = 0xFF;
 
-// An instruction in flight inside a functional unit
+// A result in flight. The ROB owns the decoded instruction and PC until
+// retirement; units carry only its index and execution result.
 struct FuOp {
-  bool valid = false;
   uint64_t seq = 0;    // program order; writeback arbitration picks oldest
   uint32_t robIdx = 0; // this op's reorder-buffer entry
-  Instr ins;
-  uint32_t pc = 0;
-  uint32_t value = 0;    // result / effective address (memory ops)
+  uint32_t value = 0;   // result / effective address (memory ops)
+  uint32_t lsqIdx = 0;  // memory ops: the LSQ entry to fill at AGU drain
+  uint32_t target = 0;  // branch target, checked against fetch's prediction
   uint8_t pdst = kNoReg; // physical destination register
-  uint32_t lsqIdx = 0;   // memory ops: the LSQ entry to fill at AGU drain
-  bool redirect = false; // branches: the true direction and target,
-  uint32_t target = 0;   // computed at issue; writeback compares them
-                         // against what fetch predicted
+  bool valid = false;
+  bool redirect = false; // branches: the true direction
 };
 
-// A fixed-latency unit, pipelined or not. Pipelined: a shift register
+// A fixed-latency unit, pipelined or not. Pipelined: a circular buffer
 // with one slot per cycle of latency, accepting a new op every cycle.
 // Non-pipelined: one op occupies the unit for its whole latency
 struct FuUnit {
   const char *name;
   uint32_t latency;
   bool pipelined;
-  std::vector<FuOp> stages; // pipelined occupancy
+  std::vector<FuOp> stages; // circular pipeline, indexed by inputSlot
   FuOp cur;                 // non-pipelined occupancy
   uint32_t remaining = 0;
   FuOp out; // completed, waiting for a writeback port
@@ -64,23 +62,19 @@ struct FuUnit {
   }
 
   bool busy() const {
-    if (!pipelined)
-      return cur.valid;
-    for (const FuOp &s : stages)
-      if (s.valid)
-        return true;
-    return false;
+    return pipelined ? inFlight != 0 : cur.valid;
   }
 
   bool canAccept() const {
-    return pipelined ? !stages[0].valid : (!cur.valid && !out.valid);
+    return pipelined ? !stages[inputSlot].valid : (!cur.valid && !out.valid);
   }
 
   void accept(const FuOp &op) {
     ops++;
-    if (pipelined)
-      stages[0] = op;
-    else {
+    if (pipelined) {
+      stages[inputSlot] = op;
+      inFlight++;
+    } else {
       cur = op;
       remaining = latency;
     }
@@ -90,18 +84,24 @@ struct FuUnit {
   // pipelined unit freezes entirely (nothing shifts, bubbles included)
   // and a non-pipelined unit keeps its finished result parked inside
   void tick() {
-    if (busy())
-      busyCycles++;
+    if (!busy())
+      return;
+    busyCycles++;
     if (pipelined) {
       if (out.valid)
         return;
-      out = stages[latency - 1];
-      for (uint32_t i = latency - 1; i >= 1; i--)
-        stages[i] = stages[i - 1];
-      stages[0] = FuOp{};
-    } else if (cur.valid && --remaining == 0) {
+      // The last stage becomes the next input slot. Advancing the index
+      // moves every op one logical stage without copying the records.
+      inputSlot = inputSlot ? inputSlot - 1 : latency - 1;
+      FuOp &last = stages[inputSlot];
+      if (last.valid) {
+        out = last;
+        last.valid = false;
+        inFlight--;
+      }
+    } else if (--remaining == 0) {
       out = cur; // canAccept() kept out empty while cur ran
-      cur = FuOp{};
+      cur.valid = false;
     }
   }
 
@@ -109,13 +109,19 @@ struct FuUnit {
   // must never write back
   void flushYounger(uint64_t seq) {
     for (FuOp &s : stages)
-      if (s.valid && s.seq > seq)
-        s = FuOp{};
+      if (s.valid && s.seq > seq) {
+        s.valid = false;
+        inFlight--;
+      }
     if (cur.valid && cur.seq > seq) {
-      cur = FuOp{};
+      cur.valid = false;
       remaining = 0;
     }
     if (out.valid && out.seq > seq)
-      out = FuOp{};
+      out.valid = false;
   }
+
+private:
+  uint32_t inputSlot = 0;
+  uint32_t inFlight = 0; // pipeline entries; excludes the output slot
 };

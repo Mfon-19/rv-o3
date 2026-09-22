@@ -17,7 +17,6 @@
 #pragma once
 
 #include <deque>
-#include <vector>
 
 #include "memory/memory.h"
 #include "memory/request.h"
@@ -38,11 +37,12 @@ private:
 
   Memory &backing;
   uint32_t latency;
+  uint64_t tickCount = 0;
   bool acceptedThisCycle = false; // bandwidth: one new request per cycle
   struct Txn {
     MemResponse resp;
-    uint32_t remaining;
+    uint64_t readyAt;
   };
-  std::vector<Txn> inflight;
+  std::deque<Txn> inflight;
   std::deque<MemResponse> respQ;
 };

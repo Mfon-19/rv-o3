@@ -29,10 +29,9 @@ enum class MemOrder {
 
 struct SimConfig {
   size_t memBytes = 1u << 20;      // 1 MiB
-  uint64_t maxCycles = 10'000'000; // cycle budget (instructions for -f)
+  uint64_t maxCycles = 10'000'000; // cycle budget
   bool trace = false;              // -t: pipeline trace, one line per cycle
   bool dumpRegs = false;           // -r: register dump at the end
-  bool refModel = false;           // -f: run the functional reference model
   bool diffCheck = false;          // -d: run the reference model alongside
                                    // and compare every retired instruction
 
@@ -70,6 +69,12 @@ struct SimConfig {
   uint32_t ghrBits = 0;       // history bits; 0 = plain bimodal
   uint32_t btbEntries = 64;
   uint32_t rasEntries = 8;
+
+  // Cache fetches use aligned power-of-two blocks. Intermediate core
+  // widths share the next larger fetch block (5..8 use 32 bytes).
+  uint32_t fetchBlockBytes() const {
+    return width <= 2 ? 8 : width <= 4 ? 16 : 32;
+  }
 };
 
 // The named-knob interface (sim/config.cpp). All errors are fatal: a

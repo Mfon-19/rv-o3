@@ -21,24 +21,83 @@
 
 #pragma once
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <memory>
+#include <utility>
 #include <vector>
 
+// All supported instruction-fetch blocks fit inline. Larger cache refills
+// retain owning storage, so queued responses never refer into mutable caches.
+class ReadPayload {
+public:
+  ReadPayload() = default;
+  ReadPayload(const ReadPayload &other) {
+    assign(other.data(), other.data() + other.size());
+  }
+  ReadPayload &operator=(const ReadPayload &other) {
+    if (this != &other)
+      assign(other.data(), other.data() + other.size());
+    return *this;
+  }
+  ReadPayload(ReadPayload &&other) noexcept { moveFrom(std::move(other)); }
+  ReadPayload &operator=(ReadPayload &&other) noexcept {
+    if (this != &other)
+      moveFrom(std::move(other));
+    return *this;
+  }
+
+  void assign(const uint8_t *first, const uint8_t *last) {
+    const size_t size = (size_t)(last - first);
+    if (size <= small.size()) {
+      if (size)
+        std::memcpy(small.data(), first, size);
+      large.reset();
+    } else {
+      if (size != length || !large)
+        large.reset(new uint8_t[size]);
+      std::memcpy(large.get(), first, size);
+    }
+    length = size;
+  }
+  size_t size() const { return length; }
+  const uint8_t *data() const {
+    return length <= small.size() ? small.data() : large.get();
+  }
+  uint8_t operator[](size_t i) const { return data()[i]; }
+
+private:
+  // Unused inline bytes are neither initialized nor copied.
+  std::array<uint8_t, 32> small;
+  std::unique_ptr<uint8_t[]> large;
+  size_t length = 0;
+
+  void moveFrom(ReadPayload &&other) {
+    length = other.length;
+    if (length && length <= small.size())
+      std::memcpy(small.data(), other.small.data(), length);
+    large = std::move(other.large);
+    other.length = 0;
+  }
+};
+
 struct MemRequest {
-  uint32_t addr = 0;
-  uint32_t size = 0; // 1, 2, 4 (scalar), the fetch block, or lineBytes
-  bool isWrite = false;
-  uint32_t wdata = 0;         // scalar store data (size <= 4)
   std::vector<uint8_t> wline; // line-write payload (size == lineBytes)
-  uint8_t src = 0;            // requester port id, echoed back
-  uint64_t tag = 0;           // requester transaction id, echoed back
+  uint64_t tag = 0;          // requester transaction id, echoed back
+  uint32_t addr = 0;
+  uint32_t size = 0;         // 1, 2, 4 (scalar), the fetch block, or lineBytes
+  uint32_t wdata = 0;        // scalar store data (size <= 4)
+  uint8_t src = 0;           // requester port id, echoed back
+  bool isWrite = false;
 };
 
 struct MemResponse {
-  uint32_t rdata = 0;         // scalar load data, zero-extended
-  std::vector<uint8_t> rline; // multi-word payload (size > 4 reads)
-  uint8_t src = 0;
+  ReadPayload rline;         // multi-word payload (size > 4 reads)
   uint64_t tag = 0;
+  uint32_t rdata = 0;         // scalar load data, zero-extended
+  uint8_t src = 0;
 };
 
 struct MemPort {

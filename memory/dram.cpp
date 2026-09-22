@@ -21,8 +21,8 @@ MemResponse DRAM::perform(const MemRequest &req) {
   if (req.isWrite)
     memcpy(backing.bytes.data() + req.addr, req.wline.data(), req.size);
   else
-    r.rline.assign(backing.bytes.begin() + req.addr,
-                   backing.bytes.begin() + req.addr + req.size);
+    r.rline.assign(backing.bytes.data() + req.addr,
+                   backing.bytes.data() + req.addr + req.size);
   return r;
 }
 
@@ -32,18 +32,16 @@ void DRAM::access(const MemRequest &req) {
   if (latency == 1)
     respQ.push_back(std::move(r)); // combinational answer
   else
-    inflight.push_back(Txn{std::move(r), latency - 1});
+    inflight.push_back(Txn{std::move(r), tickCount + latency - 1});
 }
 
 void DRAM::tick() {
+  tickCount++;
   acceptedThisCycle = false;
-  for (size_t i = 0; i < inflight.size();) {
-    if (--inflight[i].remaining == 0) {
-      respQ.push_back(std::move(inflight[i].resp));
-      inflight.erase(inflight.begin() + i);
-    } else {
-      i++;
-    }
+  // Fixed latency preserves arrival order; only the front can finish next.
+  while (!inflight.empty() && inflight.front().readyAt <= tickCount) {
+    respQ.push_back(std::move(inflight.front().resp));
+    inflight.pop_front();
   }
 }
 

@@ -47,3 +47,6 @@ bench/*.o
 bench/*.elf
 bench/*.bin
 bench/*.host
+doom/.deps/
+doom/build/
+__pycache__/

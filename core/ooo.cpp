@@ -12,17 +12,19 @@ OoOCore::OoOCore(const SimConfig &cfg, MemorySystem &msys)
     : cfg(cfg), msys(msys), imem(msys.imem), dmem(msys.dmem),
       showMemStats(!cfg.flatMemory || cfg.flatLatency > 1),
       freeList(cfg.physRegs), prf(cfg.physRegs), rob(cfg.robSize),
-      iq(cfg.iqSize), lsq(cfg.lsqSize), sb(cfg.sbSize), pred(cfg),
+      iq(cfg.iqSize, cfg.robSize, cfg.physRegs), lsq(cfg.lsqSize), sb(cfg.sbSize),
+      pred(cfg),
       alus(cfg.aluCount, FuUnit("alu", 1, true)), brUnit("br", 1, true),
       mulUnit("mul", cfg.mulLatency, cfg.mulPipelined),
       divUnit("div", cfg.divLatency, false), agu("agu", 1, true),
-      fBytes(std::max(8u, cfg.width * 4)),
+      fBytes(cfg.fetchBlockBytes()), fetchQ(cfg.fetchQSize),
       loadOuts(cfg.width > 2 ? cfg.width : 2), depTable(cfg.depTableSize, 0),
       trace(cfg.trace) {
   for (FuUnit &u : alus)
     units.push_back(&u);
   for (FuUnit *u : {&brUnit, &mulUnit, &divUnit, &agu})
     units.push_back(u);
+  wbScratch.reserve(units.size() + loadOuts.size());
   rmap.reset(); // architectural register i starts in physical register i...
   for (uint32_t p = 32; p < cfg.physRegs; p++)
     freeList.push((uint8_t)p); // ...and the rest are free
@@ -134,7 +136,7 @@ void OoOCore::commitStage() {
 
     if (e.isSystem) {
       switch (I.op) {
-      case Op::ECALL:
+      case Op::ECALL: {
         stats.retired++;
         // The argument registers were captured at dispatch into a
         // drained machine, so their values are final
@@ -142,7 +144,12 @@ void OoOCore::commitStage() {
                 prf.val[e.sysA7], prf.val[e.sysA0], e.pc, false,
                 [&](uint32_t a) { return msys.peek8(a); }, exitCode))
           halted = true;
+        // ECALL executes alone in a drained machine, so updating the current
+        // architectural mapping cannot clobber an older or younger operand.
+        if (prf.val[e.sysA7] == 5)
+          rec.registerWrite = RegisterWrite{10, prf.val[e.sysA0]};
         break;
+      }
       case Op::EBREAK:
         stats.retired++;
         fprintf(stderr, "ebreak at pc=0x%08x; halting\n", e.pc);
@@ -191,7 +198,8 @@ void OoOCore::commitStage() {
       stats.retired++;
     }
 
-    note(vCT, I);
+    if (trace)
+      note(vCT, I);
     if (onCommit)
       onCommit(rec);
     rob.popHead();
@@ -214,18 +222,20 @@ void OoOCore::commitStage() {
 // recovery, which also flushes the rest of this cycle's (younger)
 // winners
 void OoOCore::writebackStage() {
-  std::vector<FuOp *> cands;
+  auto &cands = wbScratch;
+  cands.clear();
   for (FuUnit *u : units)
     if (u != &agu && u->out.valid) // the AGU drains to the LSQ instead
       cands.push_back(&u->out);
   for (FuOp &l : loadOuts)
     if (l.valid)
       cands.push_back(&l);
-  std::sort(cands.begin(), cands.end(),
-            [](const FuOp *a, const FuOp *b) { return a->seq < b->seq; });
-
   const size_t winners = std::min((size_t)cfg.wbPorts, cands.size());
   for (size_t i = 0; i < winners; i++) {
+    // Only winners need ordering. Leave the losing results in their slots.
+    const auto oldest = std::min_element(cands.begin() + i, cands.end(),
+        [](const FuOp *a, const FuOp *b) { return a->seq < b->seq; });
+    std::iter_swap(cands.begin() + i, oldest);
     FuOp &op = *cands[i];
     RobEntry &e = rob.at(op.robIdx);
     if (op.pdst != kNoReg) {
@@ -234,16 +244,17 @@ void OoOCore::writebackStage() {
       iq.wakeup(op.pdst);
     }
     e.done = true;
-    note(vWB, op.ins);
+    if (trace)
+      note(vWB, e.ins);
     if (e.isBranch) {
       e.actualTaken = op.redirect;
-      e.actualTarget = op.redirect ? op.target : op.pc + 4;
+      e.actualTarget = op.redirect ? op.target : e.pc + 4;
       if (e.mispredicted()) {
         const uint64_t seq = op.seq;
         const uint32_t tgt = e.actualTarget;
         if (cfg.usePredictor)
-          pred.restore(e.ghrBefore, isBranch(op.ins.op), e.actualTaken);
-        op = FuOp{}; // not younger than seq, so recover() would leave it
+          pred.restore(e.ghrBefore, isBranch(e.ins.op), e.actualTaken);
+        op.valid = false; // not younger than seq, so recover() would leave it
         recover(seq);
         pendRedirect = true;
         pendTarget = tgt;
@@ -255,7 +266,7 @@ void OoOCore::writebackStage() {
         break; // younger winners were flushed by recover()
       }
     }
-    op = FuOp{};
+    op.valid = false;
   }
   if (cands.size() > winners && !pendRedirect)
     stats.wbConflicts += cands.size() - winners;
@@ -273,7 +284,7 @@ void OoOCore::recover(uint64_t seq) {
     u->flushYounger(seq);
   for (FuOp &l : loadOuts)
     if (l.valid && l.seq > seq)
-      l = FuOp{};
+      l.valid = false;
   // A cache access already in flight for a squashed load cannot be
   // cancelled, and needs no bookkeeping either: its response fails the
   // {slot, generation} tag match and is dropped
@@ -308,10 +319,10 @@ void OoOCore::aguDrain() {
   if (!agu.out.valid)
     return;
   const FuOp op = agu.out;
-  agu.out = FuOp{};
+  agu.out.valid = false;
   LsqEntry &le = lsq.at(op.lsqIdx);
   le.addr = op.value;
-  le.size = (uint8_t)accessSize(op.ins.op);
+  le.size = (uint8_t)accessSize(le.op);
   le.addrValid = true;
 
   RobEntry &e = rob.at(op.robIdx);
@@ -389,8 +400,7 @@ void OoOCore::drainDataResponses() {
     LsqEntry &le = lsq.at(idx);
     if (le.isStore || !le.issued || le.done || le.gen != gen)
       continue; // stale response from a squashed generation
-    le.value = extendLoad(le.ins.op, r.rdata);
-    le.done = true;
+    lsq.completeLoad(le, extendLoad(le.op, r.rdata));
   }
 }
 
@@ -405,39 +415,31 @@ void OoOCore::lsqOperate() {
   while (!sb.empty() && sb.head().acked)
     sb.popHead(); // acks can arrive out of order; entries pop in order
 
-  // Surface completed loads to the writeback arbiter, oldest first
-  for (FuOp &slot : loadOuts) {
-    if (slot.valid)
-      continue;
-    LsqEntry *best = nullptr;
+  // Walk once, oldest first: surface completed loads and capture store
+  // data whose physical register is ready. Each store's register is
+  // written exactly once while the store is live, so captured data stays valid.
+  if (lsq.needsUpdate()) {
+    size_t nextOutput = 0;
     for (uint32_t k = 0; k < lsq.count(); k++) {
       LsqEntry &le = lsq.nth(k);
-      if (!le.isStore && le.done && !le.reported &&
-          (!best || le.seq < best->seq))
-        best = &le;
-    }
-    if (!best)
-      break;
-    slot.valid = true;
-    slot.seq = best->seq;
-    slot.robIdx = best->robIdx;
-    slot.ins = best->ins;
-    slot.pc = best->pc;
-    slot.pdst = best->pdst;
-    slot.value = best->value;
-    best->reported = true;
-  }
-
-  // Split stores: capture the data operand the moment its physical
-  // register is ready (it is written exactly once while this store is
-  // live, so the capture is never stale)
-  for (uint32_t k = 0; k < lsq.count(); k++) {
-    LsqEntry &le = lsq.nth(k);
-    if (le.isStore && !le.dataReady && prf.ready[le.dataPreg]) {
-      le.data = prf.val[le.dataPreg];
-      le.dataReady = true;
-      if (le.addrValid)
-        rob.at(le.robIdx).done = true;
+      if (le.isStore && !le.dataReady && prf.ready[le.dataPreg]) {
+        lsq.captureStoreData(le, prf.val[le.dataPreg]);
+        if (le.addrValid)
+          rob.at(le.robIdx).done = true;
+      }
+      if (!le.isStore && le.done && !le.reported) {
+        while (nextOutput < loadOuts.size() && loadOuts[nextOutput].valid)
+          nextOutput++;
+        if (nextOutput == loadOuts.size())
+          continue;
+        FuOp &slot = loadOuts[nextOutput++];
+        slot.valid = true;
+        slot.seq = le.seq;
+        slot.robIdx = le.robIdx;
+        slot.pdst = le.pdst;
+        slot.value = le.value;
+        lsq.reportLoad(le);
+      }
     }
   }
 
@@ -468,8 +470,7 @@ void OoOCore::lsqOperate() {
       // Faulted (possibly wrong-path garbage): never touch memory.
       // Produce a zero so the entry can reach commit, which decides
       // whether the fault is real
-      le.value = 0;
-      le.done = true;
+      lsq.completeLoad(le, 0);
       continue;
     }
     const bool cautious = cfg.memOrder != MemOrder::Speculative ||
@@ -487,8 +488,7 @@ void OoOCore::lsqOperate() {
         if (!dataReady) {
           blocked = true; // aliases, but the data doesn't exist yet
         } else {
-          le.value = extendLoad(le.ins.op, data);
-          le.done = true;
+          lsq.completeLoad(le, extendLoad(le.op, data));
           forwarded = true;
         }
       } else if (overlaps(addr, size, le.addr, le.size)) {
@@ -552,7 +552,7 @@ void OoOCore::lsqOperate() {
       req.addr = cand->addr;
       req.size = cand->size;
       req.tag = ((uint64_t)candRing << 16) | cand->gen;
-      cand->issued = true;
+      lsq.issueLoad(*cand);
       if (candSpeculative)
         stats.specLoads++;
       dmem->access(req);
@@ -561,11 +561,7 @@ void OoOCore::lsqOperate() {
 
   drainDataResponses(); // a combinational hit completes this cycle
 
-  bool waiting = false;
-  for (uint32_t k = 0; k < lsq.count(); k++)
-    if (!lsq.nth(k).isStore && lsq.nth(k).issued && !lsq.nth(k).done)
-      waiting = true;
-  if (waiting) {
+  if (lsq.hasPendingLoads()) {
     stats.dataStallCycles++;
     if (trace)
       events.push_back("dmem wait");
@@ -578,20 +574,13 @@ void OoOCore::lsqOperate() {
 // register file; writeback ran earlier this cycle, so a ready bit set
 // today is readable today
 void OoOCore::issueStage() {
-  std::vector<IqEntry *> ready;
-  for (IqEntry &q : iq.e)
-    if (q.valid && q.ready1 && q.ready2)
-      ready.push_back(&q);
-  std::sort(ready.begin(), ready.end(),
-            [](const IqEntry *a, const IqEntry *b) { return a->seq < b->seq; });
-
   uint32_t issued = 0;
-  for (IqEntry *q : ready) {
-    if (issued == cfg.width)
-      break;
-    const Instr &I = q->ins;
+  iq.visitReady(rob.indexOf(0), [&](IqEntry &candidate) {
+    IqEntry *q = &candidate;
+    const RobEntry &entry = rob.at(q->robIdx);
+    const Instr &I = entry.ins;
     FuUnit *unit = nullptr;
-    switch (fuKindOf(I.op)) {
+    switch (q->unit) {
     case FuKind::ALU:
       for (FuUnit &u : alus)
         if (u.canAccept()) {
@@ -615,29 +604,42 @@ void OoOCore::issueStage() {
       break; // system ops never enter the issue queue
     }
     if (!unit || !unit->canAccept())
-      continue; // the unit is busy; try a younger ready op instead
+      return true; // the unit is busy; try a younger ready op instead
 
-    const uint32_t a = usesRs1(I.op) ? prf.val[q->ps1] : 0;
-    const uint32_t b = usesRs2(I.op) ? prf.val[q->ps2] : 0;
-    const ExecResult r = execute(I, q->pc, a, b);
+    // execute() ignores unused operands; dispatch already checked which
+    // sources must be ready. No second opcode classification is needed here.
+    const ExecResult r = execute(I, entry.pc, prf.val[q->ps1], prf.val[q->ps2]);
 
     FuOp op;
     op.valid = true;
     op.seq = q->seq;
     op.robIdx = q->robIdx;
     op.lsqIdx = q->lsqIdx;
-    op.ins = I;
-    op.pc = q->pc;
-    op.pdst = q->pdst;
+    op.pdst = entry.pdst;
     op.value = r.value;
     op.redirect = r.redirect;
     op.target = r.target;
     unit->accept(op);
-    note(vIS, I);
-    q->valid = false;
+    if (trace)
+      note(vIS, I);
+    iq.release(q);
     issued++;
     stats.issuedOps++;
-  }
+    return issued < cfg.width;
+  });
+}
+
+// Pure decode work happens only on a memoization miss. Rename and resource
+// checks still run every cycle; the cache changes no modeled pipeline timing.
+void OoOCore::fillDispatchInfo(DispatchInfo &entry, uint32_t raw) {
+  entry.ins = decode(raw);
+  const Op op = entry.ins.op;
+  entry.unit = fuKindOf(op);
+  entry.memory = isLoad(op) || isStore(op);
+  entry.hasDest = writesRd(op) && entry.ins.rd != 0;
+  entry.reads1 = usesRs1(op);
+  entry.reads2 = usesRs2(op) && !isStore(op); // store data waits in the LSQ
+  entry.valid = true;
 }
 
 // Dispatch: up to width per cycle, in program order: decode, rename,
@@ -650,11 +652,14 @@ void OoOCore::dispatchStage() {
         stats.dsFetchEmpty++;
       return;
     }
-    const Fetched f = fetchQ.front();
-    const Instr I = decode(f.raw);
-    const bool sys = fuKindOf(I.op) == FuKind::NONE;
-    const bool mem = isLoad(I.op) || isStore(I.op);
-    const bool hasDest = writesRd(I.op) && I.rd != 0;
+    const Fetched f = fetchQ.head();
+    DispatchInfo &decoded = decodeCache[(f.pc >> 2) & (decodeCache.size() - 1)];
+    if (!decoded.valid || decoded.ins.raw != f.raw)
+      fillDispatchInfo(decoded, f.raw);
+    const Instr &I = decoded.ins;
+    const bool sys = decoded.unit == FuKind::NONE;
+    const bool mem = decoded.memory;
+    const bool hasDest = decoded.hasDest;
 
     // System ops wait for the machine to empty completely (all older
     // work committed AND the store buffer drained), then run alone
@@ -692,7 +697,7 @@ void OoOCore::dispatchStage() {
       stats.recoveryLossCycles += stats.cycles - recTimerStart;
       recTimerArmed = false;
     }
-    fetchQ.pop_front();
+    fetchQ.popHead();
     const uint64_t seq = seqCtr++;
     const uint32_t robIdx = rob.alloc();
     RobEntry &e = rob.at(robIdx);
@@ -709,7 +714,8 @@ void OoOCore::dispatchStage() {
       e.isSystem = true;
       e.sysA0 = rmap.map[10]; // the map is architectural right now
       e.sysA7 = rmap.map[17];
-      note(vDS, I);
+      if (trace)
+        note(vDS, I);
       return;
     }
 
@@ -734,40 +740,36 @@ void OoOCore::dispatchStage() {
       le.seq = seq;
       le.robIdx = robIdx;
       le.pc = f.pc;
-      le.ins = I;
+      le.op = I.op;
       le.isStore = isStore(I.op);
       le.pdst = e.pdst;
       if (le.isStore) {
         // Address and data resolve independently: capture the data
         // now if its producer already wrote back, else watch its preg
-        le.dataPreg = ps2;
-        le.dataReady = prf.ready[ps2];
-        if (le.dataReady)
-          le.data = prf.val[ps2];
+        lsq.setStoreSource(le, ps2, prf.ready[ps2], prf.val[ps2]);
       }
     }
-    if (fuKindOf(I.op) == FuKind::BRANCH) {
+    if (decoded.unit == FuKind::BRANCH) {
       e.isBranch = true;
       e.predictedTaken = f.predTaken;
       e.predictedTarget = f.predTarget;
       e.predIdx = f.predIdx;
     }
 
-    IqEntry *q = iq.allocate();
+    IqEntry *q = iq.allocate(robIdx);
     q->seq = seq;
-    q->robIdx = robIdx;
     q->lsqIdx = lsqIdx;
-    q->pc = f.pc;
-    q->ins = I;
-    q->pdst = e.pdst;
+    q->unit = decoded.unit;
     q->ps1 = ps1;
     q->ps2 = ps2;
-    q->ready1 = !usesRs1(I.op) || prf.ready[ps1];
+    q->ready1 = !decoded.reads1 || prf.ready[ps1];
     // Stores don't wait for their data to issue; only the address
     // operand gates them, and the LSQ captures the data when it
     // appears
-    q->ready2 = !usesRs2(I.op) || isStore(I.op) || prf.ready[ps2];
-    note(vDS, I);
+    q->ready2 = !decoded.reads2 || prf.ready[ps2];
+    iq.track(q);
+    if (trace)
+      note(vDS, I);
   }
 }
 
@@ -786,7 +788,7 @@ void OoOCore::fetchStage() {
   if (fOutstanding && imem->hasResponse())
     consume();
   if (fOutstanding || pendRedirect ||
-      fetchQ.size() + fBytes / 4 > (size_t)cfg.fetchQSize)
+      fetchQ.count() + fBytes / 4 > cfg.fetchQSize)
     return;
   if (pc % 4 != 0) {
     fprintf(stderr, "fatal: misaligned fetch at pc=0x%8x\n", pc);
@@ -817,7 +819,7 @@ void OoOCore::processFetch(const MemResponse &r) {
     Predictor::Pred p;
     if (cfg.usePredictor)
       p = pred.predict(wpc);
-    fetchQ.push_back(
+    fetchQ.push(
         Fetched{wpc, raw, p.taken, p.target, p.phtIdx, p.ghrBefore});
     if (p.taken) {
       pc = p.target;
@@ -838,10 +840,14 @@ void OoOCore::stepCycle() {
   stats.lsqOccSum += lsq.count();
   stats.sbOccSum += sb.count();
   stats.pregsUsedSum += (cfg.physRegs - 32) - freeList.count();
-  events.clear();
-  vDS = vIS = vWB = vCT = "";
-  if (trace)
+  if (trace) {
+    events.clear();
+    vDS.clear();
+    vIS.clear();
+    vWB.clear();
+    vCT.clear();
     captureView();
+  }
 
   commitStage();
   if (halted) {
@@ -883,7 +889,7 @@ void OoOCore::note(std::string &v, const Instr &ins) {
 
 void OoOCore::captureView() {
   char b[64];
-  snprintf(b, sizeof b, "fq%zu rob%2u iq%2u lsq%2u sb%u", fetchQ.size(),
+  snprintf(b, sizeof b, "fq%u rob%2u iq%2u lsq%2u sb%u", fetchQ.count(),
            rob.count(), iq.count(), lsq.count(), sb.count());
   vOcc = b;
 }

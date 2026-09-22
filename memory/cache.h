@@ -64,7 +64,7 @@ public:
         uint8_t srcId);
 
   bool canAccept() const override {
-    return freeMshr() >= 0 && wbq.size() < cfg.wbq;
+    return pendingMisses < mshrs.size() && wbq.size() < cfg.wbq;
   }
   void access(const MemRequest &req) override;
   bool hasResponse() const override { return !respQ.empty(); }
@@ -101,15 +101,23 @@ private:
   };
   struct HitTxn {
     MemResponse resp;
-    uint32_t remaining;
+    uint64_t readyAt;
   };
   struct PendingInstall { // refill returned while the wb queue was full
     uint32_t mshrIdx;
-    std::vector<uint8_t> line;
+    ReadPayload line;
   };
 
-  uint32_t setOf(uint32_t addr) const { return (addr / cfg.lineBytes) % sets; }
-  uint32_t tagOf(uint32_t addr) const { return (addr / cfg.lineBytes) / sets; }
+  uint32_t setOf(uint32_t addr) const {
+    return binaryGeometry ? (addr >> lineShift) & (sets - 1)
+                          : (addr / cfg.lineBytes) % sets;
+  }
+  uint32_t tagOf(uint32_t addr) const {
+    return binaryGeometry ? addr >> tagShift : (addr / cfg.lineBytes) / sets;
+  }
+  uint32_t offsetOf(uint32_t addr) const {
+    return binaryGeometry ? addr & (cfg.lineBytes - 1) : addr % cfg.lineBytes;
+  }
   uint32_t lineAddrOf(uint32_t set, uint32_t way) const {
     return (tags[set * cfg.ways + way] * sets + set) * cfg.lineBytes;
   }
@@ -136,24 +144,31 @@ private:
   // has no room for the victim
   bool installLine(uint32_t lineAddr, const uint8_t *src, bool isDirty,
                    uint32_t &set, uint32_t &way);
-  bool tryInstall(uint32_t mshrIdx, const std::vector<uint8_t> &line);
+  bool tryInstall(uint32_t mshrIdx, const ReadPayload &line);
   void finishHit(MemResponse &&resp);
 
   CacheConfig cfg;
   uint32_t sets;
+  // Common power-of-two geometries need no host integer division. Keep
+  // the general path for valid, non-power-of-two configurations.
+  bool binaryGeometry;
+  unsigned lineShift = 0, tagShift = 0;
   MemPort *below;
   uint8_t srcId;
 
   std::vector<uint8_t> data;
   std::vector<uint32_t> tags;
-  std::vector<uint8_t> valid, dirty;
+  // lineBytes >= 4, so no valid address can produce UINT32_MAX as its tag.
+  static constexpr uint32_t invalidTag = UINT32_MAX;
+  std::vector<uint8_t> dirty;
   std::vector<uint64_t> lru;
   uint64_t lruTick = 0;
 
   std::vector<Mshr> mshrs;
+  uint32_t pendingMisses = 0; // occupied MSHRs, including pending installs
   std::deque<WbEntry> wbq;
   std::deque<PendingInstall> pendingInstalls;
-  std::vector<HitTxn> hitPipe;
+  std::deque<HitTxn> hitPipe;
   std::deque<MemResponse> respQ;
   uint64_t tickCount = 0;
 };
