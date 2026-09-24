@@ -94,9 +94,6 @@ public:
   // The architectural value of register i, read through the rename map
   uint32_t reg(int i) const { return prf.val[rmap.map[i]]; }
 
-  // Cycles simulated so far (the current cycle while a stage is running)
-  uint64_t cycles() const { return stats.cycles; }
-
   // Called once per committed instruction, in commit order. Null by
   // default; the differential checker plugs in here
   std::function<void(const CommitRecord &)> onCommit;

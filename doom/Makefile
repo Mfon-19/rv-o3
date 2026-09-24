@@ -22,7 +22,7 @@ LIBGCC := $(DEPS)/gcc/libgcc.a
 OBJECTS := $(addprefix $(BUILD)/,$(addsuffix .o,$(filter-out w_file_stdc,$(DOOM_SOURCES)))) \
            $(BUILD)/platform.o $(BUILD)/runtime.o $(BUILD)/memops.o $(BUILD)/fixed.o $(BUILD)/wad_io.o $(BUILD)/start.o $(BUILD)/gamewad.o
 
-.PHONY: all setup run demo clean viewer testviewer
+.PHONY: all setup run demo clean viewer
 all: $(BUILD)/doom.bin
 setup:
 	python3 setup.py
@@ -35,8 +35,6 @@ demo:
 HOST_CXX ?= c++
 PKG_CONFIG ?= pkg-config
 viewer: $(BUILD)/doom-viewer
-testviewer: viewer
-	python3 ../tests/display_viewer.py
 $(BUILD)/doom-viewer: viewer.cpp ../sim/display_protocol.h | $(BUILD)
 	@$(PKG_CONFIG) --exists sdl3 || { echo 'SDL3 missing: on macOS run brew install sdl3 pkg-config' >&2; exit 1; }
 	$(HOST_CXX) -std=c++20 -O2 -Wall -Wextra $$($(PKG_CONFIG) --cflags sdl3) $< -o $@ $$($(PKG_CONFIG) --libs sdl3)

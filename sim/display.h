@@ -15,7 +15,6 @@ namespace display {
 inline int frameFd = -1, keyFd = -1;
 inline uint8_t partialKey[4];
 inline size_t keyBytes = 0;
-inline uint64_t framesPresented = 0; // frames handed to the frame pipe
 
 [[noreturn]] inline void fail(const char *message) {
   fprintf(stderr, "display: %s\n", message);
@@ -99,8 +98,6 @@ void present(uint32_t descriptor, size_t memoryBytes, ReadByte readByte, bool qu
 
   if (quiet) return; // the reference validates the ABI but never presents twice
   if (frameFd < 0) fail("frame syscall requires --frame-fd and --key-fd");
-
-  framesPresented++;
 
   std::vector<uint8_t> packet;
   packet.reserve(12 + bytes);

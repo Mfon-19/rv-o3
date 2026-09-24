@@ -1,8 +1,9 @@
 # Project executable
 /rvsim
 
-# Local planning notes
-/doc/
+# Local development tools and editor settings
+/tools/
+/compile_flags.txt
 
 # Freestanding C demo outputs (object files are covered by *.o below)
 /cdemo/demo.elf

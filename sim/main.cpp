@@ -13,7 +13,6 @@
 #include "memory/system.h"
 #include "sim/config.h"
 #include "sim/loader.h"
-#include "sim/profile.h"
 #include "sim/syscall.h"
 
 static void usage(const char *argv0) {
@@ -27,9 +26,6 @@ static void usage(const char *argv0) {
           "  -C <file>     load configuration ('key = value' lines, # comments)\n"
           "  -O key=value  override one setting (repeatable; applied after -C)\n"
           "  -p            print the effective configuration and exit\n"
-          "  --profile F   write per-pc retired instructions, cycles, and\n"
-          "                mispredicts to F (read by tools/guestprof.py)\n"
-          "  --profile-after N  start profiling after N frames were presented\n"
           "  --frame-fd N, --key-fd N  inherited display pipes (doom/run.py)\n",
           argv0);
 }
@@ -56,8 +52,6 @@ int main(int argc, char **argv) {
   std::vector<const char *> overrides;
   bool printConfig = false;
   int frameFd = -1, keyFd = -1;
-  const char *profileFile = nullptr;
-  uint64_t profileAfter = 0;
   auto fdArg = [&](int &i) {
     char *end = nullptr;
     const long fd = strtol(argv[++i], &end, 10);
@@ -75,10 +69,6 @@ int main(int argc, char **argv) {
       frameFd = fdArg(i);
     else if (!strcmp(argv[i], "--key-fd") && i + 1 < argc)
       keyFd = fdArg(i);
-    else if (!strcmp(argv[i], "--profile") && i + 1 < argc)
-      profileFile = argv[++i];
-    else if (!strcmp(argv[i], "--profile-after") && i + 1 < argc)
-      profileAfter = numArg(i);
     else if (!strcmp(argv[i], "-t"))
       cfg.trace = true;
     else if (!strcmp(argv[i], "-r"))
@@ -169,23 +159,7 @@ int main(int argc, char **argv) {
     };
   }
 
-  // The profiler rides the same commit hook, after the checker if any
-  std::optional<GuestProfile> profile;
-  if (profileFile) {
-    profile.emplace(profileAfter);
-    core.onCommit = [&, check = std::move(core.onCommit)](const CommitRecord &rec) {
-      if (check)
-        check(rec);
-      profile->record(rec, core.cycles(), display::framesPresented);
-    };
-  }
-
   int code = core.run();
-
-  if (profile && !profile->write(profileFile, display::framesPresented)) {
-    perror(profileFile);
-    return 1;
-  }
 
   if (cfg.diffCheck && code != 2) { // a blown cycle budget isn't architectural
     if (!ref->halted() || ref->exitCode() != code) {

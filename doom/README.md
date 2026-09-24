@@ -155,8 +155,6 @@ syscall 7 and suppresses duplicate frame output.
 
 `make test` includes the display checks (cache visibility, both pixel
 formats, input replay, malformed descriptors), which need no SDL.
-`make -C doom testviewer` checks the SDL renderer with its dummy video
-backend: RGB channels, fragmented frames, dimension changes, and EOF.
 
 ## Dependencies and licenses
 

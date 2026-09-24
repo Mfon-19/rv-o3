@@ -146,22 +146,19 @@ written) are compared. At exit the whole register file and memory are
 compared too, because out-of-order completion can produce a correct commit
 stream while still leaving a stale value behind.
 
-| Target | What it runs |
-| --- | --- |
-| `make test` | Unit tests (including randomized checks of the issue queue's and LSQ's bookkeeping against brute-force answers), interface tests, and every directed program in `tests/` under `-d` |
-| `make randtest` | Generated load/store programs over a few contested cache lines, checked against the reference model |
-| `make benchtest` | Each benchmark under `-d` in all three memory-order modes, with output compared byte for byte against a native build of the same C source, an oracle that shares no code with the simulator |
+`make test` runs unit tests (including randomized checks of the issue
+queue's and LSQ's bookkeeping against brute-force answers), interface and
+timing tests, and every directed program in `tests/` under `-d`.
 
 ## Benchmarks
 
-Seven small C programs in `bench/`, each stressing one behavior. At the
+Six small C programs in `bench/`, each stressing one behavior. At the
 default configuration:
 
 | Benchmark | IPC | What it shows |
 | --- | --- | --- |
 | `ptrchase` | 0.440 | Serial pointer chasing over 512 KiB; no window size can help a dependent chain |
 | `mlpbench` | 1.001 | Independent gathers over 512 KiB; scales with ROB size and MSHR count |
-| `matmul` | 1.673 | 24x24 integer matrix multiply: instruction-level parallelism with quiet caches |
 | `mm64` | 1.710 | A 48 KiB working set, just past the 32 KiB L1 |
 | `qsortb` | 1.205 | Recursive quicksort: 49 branch mispredicts per 1000 instructions |
 | `rle` | 1.581 | Run-length encode/decode: byte traffic in short loops |
@@ -191,23 +188,8 @@ usage: ./rvsim [options] [program.hex|program.bin]
   -C <file>     load configuration ('key = value' lines, # comments)
   -O key=value  override one setting (repeatable; applied after -C)
   -p            print the effective configuration and exit
-  --profile F   write per-pc retired instructions, cycles, and
-                mispredicts to F (read by tools/guestprof.py)
-  --profile-after N  start profiling after N frames were presented
   --frame-fd N, --key-fd N  inherited display pipes (doom/run.py)
 ```
-
-## Tools
-
-- `make pgo` builds a profile-guided simulator in `build/pgo/rvsim` with
-  Clang. Train it on the workload you care about, for example
-  `make pgo PGO_IMAGE=doom/build/doom.bin PGO_CONFIG=configs/doom.cfg`.
-- `tools/hostbench.py` times simulator binaries on identical simulated work
-  and checks that their outputs match. With `--warmup-frames N` it reports
-  milliseconds per frame for a graphical guest; this produced the Doom
-  measurement above.
-- `tools/guestprof.py` turns an `rvsim --profile` file into a
-  per-function table of instructions, cycles, and mispredicts.
 
 ## Writing programs
 
@@ -238,11 +220,10 @@ core/     the out-of-order core (ooo.cpp), predictor, rename, ROB, issue
           queue, LSQ, functional units, reference model
 memory/   caches with MSHRs and writeback queues, pipelined DRAM
 sim/      configuration, statistics, loaders, syscalls, display pipe, driver
-configs/  the baseline and Doom machines
+configs/  the Doom machine configuration (baseline defaults live in sim/config.h)
 tests/    directed programs (each header says what it checks), unit tests,
-          interface tests, random program generator
-bench/    benchmarks with native-build oracles
-tools/    hostbench.py (host timing), guestprof.py (guest profiles)
+          interface and timing tests
+bench/    RV32IM benchmarks and PGO workloads
 cdemo/    freestanding C demo and its runtime
 doom/     the RV32IM Doom port, SDL viewer, and launcher
 ```

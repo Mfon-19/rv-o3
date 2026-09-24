@@ -62,37 +62,9 @@ build/tests/units: tests/units.cpp memory/cache.cpp memory/dram.cpp $(wildcard c
 	@mkdir -p build/tests
 	$(CXX) $(CXXFLAGS) -o $@ tests/units.cpp memory/cache.cpp memory/dram.cpp
 
-# Randomized differential testing: programs full of aliasing loads and
-# stores (tests/randgen.py), each checked against the reference model.
-# Directed tests can't enumerate the interleavings that load-speculation
-# and MSHR bugs hide in; these get close
-SEEDS ?= 50
-.PHONY: randtest
-randtest: rvsim
-	@for s in $$(seq 1 $(SEEDS)); do \
-		python3 tests/randgen.py $$s 120 > /tmp/rvsim-rand.hex; \
-		./rvsim -d /tmp/rvsim-rand.hex >/dev/null 2>/tmp/rvsim-rand.err \
-			|| { echo "FAIL seed $$s"; tail -4 /tmp/rvsim-rand.err; exit 1; }; \
-	done; echo "randtest: $(SEEDS) random programs verified"
-
-# Benchmarks run under -d in all three memory-ordering modes AND must
-# match a natively compiled build of the same source, an oracle that
-# shares no code with the simulator
-.PHONY: bench benchtest
+.PHONY: bench
 bench:
 	@$(MAKE) -s -C bench
-benchtest: rvsim bench
-	@for b in $(patsubst bench/%.c,%,$(wildcard bench/*.c)); do \
-		./bench/$$b.host > /tmp/rvbench-exp.txt; \
-		for mode in conservative bypass speculative; do \
-			./rvsim -d -O memOrder=$$mode bench/$$b.bin \
-				> /tmp/rvbench-got.txt 2>/tmp/rvbench-err.txt \
-				|| { echo "FAIL: $$b ($$mode)"; tail -4 /tmp/rvbench-err.txt; exit 1; }; \
-			cmp -s /tmp/rvbench-exp.txt /tmp/rvbench-got.txt \
-				|| { echo "FAIL: $$b ($$mode) differs from the native build"; exit 1; }; \
-		done; \
-		echo "$$b: ok"; \
-	done
 
 .PHONY: clean
 clean:

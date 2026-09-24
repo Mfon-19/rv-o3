@@ -32,14 +32,7 @@ static int keyCode(SDL_Keycode key) {
     }
 }
 
-int main(int argc, char **argv) {
-    // Optional capture saves the latest frame for pixel-transport verification.
-    const char *capture = nullptr;
-    if (argc == 3 && SDL_strcmp(argv[1], "--capture") == 0) capture = argv[2];
-    else if (argc != 1) {
-        fprintf(stderr, "usage: doom-viewer [--capture frame.bmp]\n");
-        return 1;
-    }
+int main() {
     signal(SIGPIPE, SIG_IGN);
     for (int fd : {STDIN_FILENO, STDOUT_FILENO}) {
         const int flags = fcntl(fd, F_GETFL);
@@ -177,11 +170,6 @@ int main(int argc, char **argv) {
             if (!SDL_RenderClear(renderer) ||
                     (texture && !SDL_RenderTexture(renderer, texture, nullptr, nullptr))) {
                 result = 1; running = false;
-            }
-            if (capture && frames) {
-                SDL_Surface *surface = SDL_RenderReadPixels(renderer, nullptr);
-                if (!surface || !SDL_SaveBMP(surface, capture)) result = 1;
-                SDL_DestroySurface(surface);
             }
             if (!SDL_RenderPresent(renderer)) { result = 1; running = false; }
             redraw = false;

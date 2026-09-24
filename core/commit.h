@@ -56,9 +56,6 @@ struct CommitRecord {
   std::optional<RegisterWrite> registerWrite;
   std::optional<MemoryWrite> memoryWrite;
   std::optional<Exception> exception;
-  // Timing annotation for profiling, not architectural state: fetch guessed
-  // this branch wrong. Excluded from the comparison below
-  bool mispredicted = false;
 };
 inline bool operator==(const CommitRecord &a, const CommitRecord &b) {
   return a.sequence == b.sequence && a.pc == b.pc &&

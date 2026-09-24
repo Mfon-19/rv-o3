@@ -204,10 +204,8 @@ void OoOCore::commitStage() {
       }
       if (e.isBranch) {
         stats.branches++;
-        if (e.mispredicted()) {
+        if (e.mispredicted())
           stats.mispredicts++;
-          rec.mispredicted = true;
-        }
         if (cfg.usePredictor)
           pred.update(e.pc, I, e.actualTaken, e.actualTarget, e.predIdx,
                       e.predBefore);
