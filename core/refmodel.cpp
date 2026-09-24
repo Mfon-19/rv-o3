@@ -34,9 +34,9 @@ bool RefModel::step(CommitRecord *rec) {
     retired_++;
     if (runSyscall(
             regs[17], regs[10], pc, true,
-            [&](uint32_t a) { return mem.load8(a); }, exitCode_, replayInput))
+            [&](uint32_t a) { return mem.load8(a); }, exitCode_, mem.bytes.size(), replayInput))
       halted_ = true;
-    if (regs[17] == 5)
+    if (syscallReturnsInput(regs[17]))
       r.registerWrite = RegisterWrite{10, regs[10]};
     break;
   case Op::EBREAK:

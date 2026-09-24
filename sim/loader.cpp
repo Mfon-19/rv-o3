@@ -13,6 +13,7 @@ std::vector<uint32_t> loadHexFile(const char *path) {
     fprintf(stderr, "cannot open %s\n", path);
     exit(1);
   }
+  
   std::vector<uint32_t> words;
   std::string line;
   while (std::getline(f, line)) {

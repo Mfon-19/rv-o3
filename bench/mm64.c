@@ -1,7 +1,7 @@
 /*
  * 64x64 integer matrix multiply: three 16 KiB arrays, a 48 KiB
- * working set sized to straddle the L1 sweep points: it misses hard
- * at 16 KiB and fits at 64 KiB. The cache-capacity knee workload.
+ * working set between common L1 sizes: it misses hard at 16 KiB and
+ * fits at 64 KiB. The cache-capacity knee workload.
  */
 #include "bench.h"
 

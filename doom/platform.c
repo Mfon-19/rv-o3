@@ -1,16 +1,14 @@
-/* All rendering, including the conversion to ASCII, executes on RV32IM. */
+/* Doom rendering executes on RV32IM; the host presents finished frames. */
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include "doomgeneric.h"
 #include "doomkeys.h"
 #include "ecall.h"
+#include "i_video.h"
 #include "options.h"
+#include "../sim/display_protocol.h"
 
 static uint32_t ticks = 1, frames;
-static unsigned char held[256];
-static unsigned int expires[256];
-static int escape_state;
 
 void DG_Init(void) {}
 void DG_SetWindowTitle(const char *title) { (void)title; }
@@ -26,51 +24,32 @@ void __wrap_I_Quit(void) {
     exit(0);
 }
 
+/* CMAP256 keeps Doom's 8-bit palette indices; the host expands them through
+ * colors[], whose {b,g,r,a=0} entries are already 0x00RRGGBB words. */
+_Static_assert(sizeof(struct color) == 4, "palette entries must be XRGB words");
+
 void DG_DrawFrame(void) {
-    static const char ramp[] = " .:-=+*#%@";
-    static char output[(ASCII_COLS + 1) * ASCII_ROWS + 128];
-    char *p = output;
     ++frames;
-    if (ANSI_OUTPUT) {
-        p += sprintf(p, "%s\033[H", frames == 1 ? "\033[2J" : "");
-    } else {
-        p += sprintf(p, "\n--- frame %u ---\n", (unsigned)frames);
-    }
-    for (unsigned y = 0; y < ASCII_ROWS; ++y) {
-        unsigned y0 = y * DOOMGENERIC_RESY / ASCII_ROWS;
-        unsigned y1 = (y + 1) * DOOMGENERIC_RESY / ASCII_ROWS;
-        for (unsigned x = 0; x < ASCII_COLS; ++x) {
-            unsigned x0 = x * DOOMGENERIC_RESX / ASCII_COLS;
-            unsigned x1 = (x + 1) * DOOMGENERIC_RESX / ASCII_COLS;
-            unsigned light = 0;
-            for (unsigned sy = y0; sy < y1; ++sy) {
-                for (unsigned sx = x0; sx < x1; ++sx) {
-                    uint32_t rgb = DG_ScreenBuffer[sy * DOOMGENERIC_RESX + sx];
-                    light += (77 * ((rgb >> 16) & 255) +
-                              150 * ((rgb >> 8) & 255) + 29 * (rgb & 255)) >> 8;
-                }
-            }
-            light /= (x1 - x0) * (y1 - y0);
-            /* A modest brightness lift makes dark corridors legible in text. */
-            light = light * 3 / 2;
-            if (light > 255) light = 255;
-            *p++ = ramp[light * (sizeof(ramp) - 2) / 255];
-        }
-        *p++ = '\n';
-    }
-    int status = snprintf(p, ASCII_COLS + 1,
-                          "frame %u | WASD move/turn  J/L strafe  F fire  E use  Q quit",
-                          (unsigned)frames);
-    p += status < ASCII_COLS ? status : ASCII_COLS;
-    *p++ = '\n';
-    *p = 0;
-    rv_print(output);
+    const uint32_t descriptor[] = {
+        (uint32_t)(uintptr_t)DG_ScreenBuffer,
+#ifdef CMAP256
+        DOOMGENERIC_RESX, DOOMGENERIC_RESY, RV_PIXEL_INDEXED8,
+        (uint32_t)(uintptr_t)colors
+#else
+        DOOMGENERIC_RESX, DOOMGENERIC_RESY, RV_PIXEL_XRGB8888
+#endif
+    };
+    rv_call(6, (uint32_t)(uintptr_t)descriptor);
     if (MAX_FRAMES && frames >= MAX_FRAMES) exit(0);
 }
 
 static int translate(int c) {
     if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
     switch (c) {
+    case RV_KEY_UP: return KEY_UPARROW;
+    case RV_KEY_DOWN: return KEY_DOWNARROW;
+    case RV_KEY_LEFT: return KEY_LEFTARROW;
+    case RV_KEY_RIGHT: return KEY_RIGHTARROW;
     case 'w': return KEY_UPARROW;
     case 's': return KEY_DOWNARROW;
     case 'a': return KEY_LEFTARROW;
@@ -86,46 +65,11 @@ static int translate(int c) {
 }
 
 int DG_GetKey(int *pressed, unsigned char *key) {
-    /* Terminals send presses/repeats, not releases. Release after two frames. */
-    for (unsigned i = 0; i < 256; ++i) {
-        if (held[i] && frames >= expires[i]) {
-            held[i] = 0;
-            *pressed = 0; *key = i;
-            return 1;
-        }
-    }
-    for (;;) {
-        int c = (int)rv_call(5, 0);
-        if (c < 0) {
-            if (escape_state == 1) {
-                escape_state = 0;
-                c = KEY_ESCAPE;
-            } else return 0;
-        } else if (escape_state == 1 && c == '[') {
-            escape_state = 2;
-            continue;
-        } else if (escape_state == 2) {
-            escape_state = 0;
-            switch (c) {
-            case 'A': c = KEY_UPARROW; break;
-            case 'B': c = KEY_DOWNARROW; break;
-            case 'C': c = KEY_RIGHTARROW; break;
-            case 'D': c = KEY_LEFTARROW; break;
-            default: continue;
-            }
-        } else if (c == 27) {
-            escape_state = 1;
-            continue;
-        } else {
-            escape_state = 0;
-            c = translate(c);
-        }
-        expires[c] = frames + 2;
-        if (held[c]) continue;
-        held[c] = 1;
-        *pressed = 1; *key = c;
-        return 1;
-    }
+    const uint32_t event = rv_call(7, 0);
+    if (event == UINT32_MAX) return 0;
+    *pressed = (event >> 8) & 1;
+    *key = translate(event & 255);
+    return 1;
 }
 
 int main(void) {

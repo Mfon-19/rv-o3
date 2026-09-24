@@ -5,6 +5,10 @@
 //   3   print the NUL-terminated string at address a0
 //   4   print a0 as 8 hex digits (architectural-test signatures)
 //   5   nonblocking stdin byte: returns byte in a0, or UINT32_MAX if unavailable
+//   6   present a frame: a0 points to {pixels, width, height, format};
+//       format 1 is XRGB8888, format 2 is 8-bit indexed with a fifth
+//       word naming a 256-entry XRGB palette (sim/display_protocol.h)
+//   7   nonblocking window key event: key | pressed<<8, or UINT32_MAX
 //   93  exit with code a0 (Linux-flavoured number; 10 also accepted)
 //
 // The core and the reference model run this same function, so the two
@@ -12,7 +16,7 @@
 // reads through its cache hierarchy, the reference model straight from
 // its own memory. quiet drops the output (the silent shadow in a
 // differential check) while still honoring exit; input is supplied through
-// replayInput in that mode. Syscall 5 writes its return value into arg.
+// replayInput in that mode. Syscalls 5 and 7 write their return value into arg.
 // Returns true if the program asked to exit, leaving its status in exitCode.
 
 #pragma once
@@ -21,6 +25,9 @@
 #include <cstdio>
 #include <poll.h>
 #include <unistd.h>
+#include "sim/display.h"
+
+inline bool syscallReturnsInput(uint32_t num) { return num == 5 || num == 7; }
 
 inline uint32_t pollInputByte() {
   pollfd input{STDIN_FILENO, POLLIN, 0};
@@ -33,7 +40,7 @@ inline uint32_t pollInputByte() {
 
 template <class ReadByte>
 bool runSyscall(uint32_t num, uint32_t &arg, uint32_t pc, bool quiet,
-                ReadByte readByte, int &exitCode,
+                ReadByte readByte, int &exitCode, size_t memoryBytes,
                 uint32_t replayInput = UINT32_MAX) {
   switch (num) {
   case 1:
@@ -57,6 +64,12 @@ bool runSyscall(uint32_t num, uint32_t &arg, uint32_t pc, bool quiet,
     return false;
   case 5:
     arg = quiet ? replayInput : pollInputByte();
+    return false;
+  case 6:
+    display::present(arg, memoryBytes, readByte, quiet);
+    return false;
+  case 7:
+    arg = quiet ? replayInput : display::pollKey();
     return false;
   case 10:
   case 93:

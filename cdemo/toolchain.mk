@@ -2,9 +2,19 @@
 # LLVM Clang can emit RV32 code even when running on an x86 host; GNU's
 # RISC-V binutils then assign final addresses and extract the raw binary.
 CC := clang
-LD := riscv64-linux-gnu-ld
-OBJCOPY := riscv64-linux-gnu-objcopy
-OBJDUMP := riscv64-linux-gnu-objdump
+# Apple's system Clang omits the RISC-V backend. Homebrew LLVM includes it.
+ifeq ($(shell uname -s),Darwin)
+LLVM_PREFIX ?= $(shell brew --prefix llvm 2>/dev/null)
+ifneq ($(LLVM_PREFIX),)
+CC := $(LLVM_PREFIX)/bin/clang
+endif
+endif
+# Linux distro packages use linux-gnu; Homebrew uses elf. Command-line
+# RISCV_PREFIX/LD/OBJCOPY/OBJDUMP overrides remain available.
+RISCV_PREFIX ?= $(shell if command -v riscv64-linux-gnu-ld >/dev/null 2>&1; then echo riscv64-linux-gnu-; else echo riscv64-elf-; fi)
+LD := $(RISCV_PREFIX)ld
+OBJCOPY := $(RISCV_PREFIX)objcopy
+OBJDUMP := $(RISCV_PREFIX)objdump
 
 # --target selects a bare-metal 32-bit RISC-V target rather than this host.
 # -march/-mabi constrain generated code to the simulator's RV32IM + ILP32 ABI.

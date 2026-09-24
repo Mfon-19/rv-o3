@@ -32,13 +32,16 @@ void MemorySystem::tick() {
     return;
   }
   auto drainDram = [&] {
-    while (dram.hasResponse())
-      l2->deliverBelowResponse(dram.response());
+    while (dram.hasResponse()) {
+      l2->deliverBelowResponse(dram.frontResponse());
+      dram.popResponse();
+    }
   };
   auto drainL2 = [&] {
     while (l2->hasResponse()) {
-      MemResponse r = l2->response();
+      const MemResponse &r = l2->frontResponse();
       (r.src == SRC_L1I ? l1i : l1d)->deliverBelowResponse(r);
+      l2->popResponse();
     }
   };
   drainDram();

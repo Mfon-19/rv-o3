@@ -8,10 +8,14 @@
 
 #include "sim/config.h"
 
+#include <bit>
+
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+
+#include "memory/request.h" // kMaxLineBytes
 
 namespace {
 
@@ -49,6 +53,8 @@ struct Knob {
   _("l2.mshrs",      U32,    l2.mshrs)                                      \
   _("l2.wbq",        U32,    l2.wbq)                                        \
   _("aluCount",      U32,    aluCount)                                      \
+  _("aguCount",      U32,    aguCount)                                      \
+  _("dataPorts",     U32,    dataPorts)                                     \
   _("mulLatency",    U32,    mulLatency)                                    \
   _("mulPipelined",  BOOL,   mulPipelined)                                  \
   _("divLatency",    U32,    divLatency)                                    \
@@ -60,6 +66,7 @@ struct Knob {
   _("sbSize",        U32,    sbSize)                                        \
   _("physRegs",      U32,    physRegs)                                      \
   _("fetchQSize",    U32,    fetchQSize)                                    \
+  _("fetchBytes",    U32,    fetchBytes)                                    \
   _("usePredictor",  BOOL,   usePredictor)                                  \
   _("memOrder",      MEMORD, memOrder)                                      \
   _("depPredictor",  BOOL,   depPredictor)                                  \
@@ -67,7 +74,14 @@ struct Knob {
   _("phtBits",       U32,    phtBits)                                       \
   _("ghrBits",       U32,    ghrBits)                                       \
   _("btbEntries",    U32,    btbEntries)                                    \
-  _("rasEntries",    U32,    rasEntries)
+  _("btbWays",       U32,    btbWays)                                       \
+  _("rasEntries",    U32,    rasEntries)                                    \
+  _("rasRepair",     BOOL,   rasRepair)                                     \
+  _("tageTables",    U32,    tageTables)                                    \
+  _("tageTableBits", U32,    tageTableBits)                                 \
+  _("tageTagBits",   U32,    tageTagBits)                                   \
+  _("tageMinHist",   U32,    tageMinHist)                                   \
+  _("tageMaxHist",   U32,    tageMaxHist)
 // clang-format on
 
 const Knob kKnobs[] = {
@@ -256,14 +270,31 @@ void validateConfig(SimConfig &c) {
 
   require(c.width >= 1 && c.width <= 8, "width must be in 1..8");
   const uint32_t fetchBytes = c.fetchBlockBytes();
+  require(fetchBytes >= 8 && fetchBytes <= 64 &&
+              (fetchBytes & (fetchBytes - 1)) == 0,
+          "fetchBytes must be 0 (automatic), 8, 16, 32, or 64");
   require(c.fetchQSize >= fetchBytes / 4,
           "fetchQSize must hold at least one fetch block");
   require(c.robSize >= 1 && c.iqSize >= 1 && c.lsqSize >= 1 && c.sbSize >= 1,
           "robSize/iqSize/lsqSize/sbSize must be at least 1");
-  require(c.aluCount >= 1 && c.wbPorts >= 1, "need at least 1 ALU and WB port");
+  require(c.aluCount >= 1 && c.aluCount <= 8, "aluCount must be in 1..8");
+  require(c.wbPorts >= 1, "need at least 1 writeback port");
+  require(c.aguCount >= 1 && c.aguCount <= 8, "aguCount must be in 1..8");
+  require(c.dataPorts >= 1 && c.dataPorts <= 8, "dataPorts must be in 1..8");
   require(c.mulLatency >= 1 && c.divLatency >= 1, "unit latencies are >= 1");
 
   if (!c.flatMemory) {
+    for (const CacheConfig *cache : {&c.l1i, &c.l1d, &c.l2}) {
+      const uint32_t lines = cache->ways ? cache->sizeBytes / cache->lineBytes : 0;
+      require(std::has_single_bit(cache->lineBytes) &&
+                  cache->lineBytes <= kMaxLineBytes,
+              "cache lines must be a power of two up to 128 bytes");
+      require(cache->ways >= 1 && lines % cache->ways == 0 &&
+                  std::has_single_bit(lines / cache->ways),
+              "cache size / (line size x ways) must be a power-of-two set count");
+      require(cache->mshrs >= 1 && cache->wbq >= 1,
+              "caches need at least 1 MSHR and 1 writeback-queue entry");
+    }
     require(c.l1i.lineBytes == c.l1d.lineBytes &&
                 c.l1d.lineBytes == c.l2.lineBytes,
             "all cache levels must share one line size");
@@ -275,5 +306,17 @@ void validateConfig(SimConfig &c) {
   require(c.ghrBits <= 30, "ghrBits must be 0..30");
   require(c.btbEntries >= 1 && c.rasEntries >= 1 && c.depTableSize >= 1,
           "predictor structures need at least 1 entry");
+  require(c.btbWays >= 1 && c.btbEntries % c.btbWays == 0,
+          "btbEntries must be a multiple of btbWays");
+  require(c.tageTables <= 12, "tageTables must be 0..12");
+  if (c.tageTables) {
+    require(c.tageTableBits >= 4 && c.tageTableBits <= 16,
+            "tageTableBits must be 4..16");
+    require(c.tageTagBits >= 4 && c.tageTagBits <= 16,
+            "tageTagBits must be 4..16");
+    require(c.tageMinHist >= 1 && c.tageMinHist <= c.tageMaxHist &&
+                c.tageMaxHist <= 1024,
+            "TAGE history lengths must satisfy 1 <= min <= max <= 1024");
+  }
   require(c.memBytes >= 64 * 1024, "memBytes must be at least 64 KiB");
 }

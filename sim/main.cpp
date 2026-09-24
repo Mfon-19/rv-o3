@@ -13,23 +13,24 @@
 #include "memory/system.h"
 #include "sim/config.h"
 #include "sim/loader.h"
+#include "sim/profile.h"
+#include "sim/syscall.h"
 
 static void usage(const char *argv0) {
   fprintf(stderr,
           "usage: %s [options] [program.hex|program.bin]\n"
           "  -t            trace pipeline occupancy every cycle (stderr)\n"
           "  -r            dump registers when the simulation ends\n"
-          "  -d            differential check: compare the core's commit\n"
-          "                stream against the reference model, instruction by\n"
-          "                instruction\n"
+          "  -d            differential check against the reference model\n"
           "  -c <cycles>   cycle budget (default 10000000)\n"
           "  -m <bytes>    memory size (default 1 MiB)\n"
           "  -C <file>     load configuration ('key = value' lines, # comments)\n"
-          "  -O key=value  override one knob (repeatable; applied after -C)\n"
+          "  -O key=value  override one setting (repeatable; applied after -C)\n"
           "  -p            print the effective configuration and exit\n"
-          "Defaults are the shipped machine (see SimConfig in sim/config.h);\n"
-          "rvsim -p lists every knob.\n"
-          "Hex format: whitespace-separated 32-bit hex words, '#' comments.\n",
+          "  --profile F   write per-pc retired instructions, cycles, and\n"
+          "                mispredicts to F (read by tools/guestprof.py)\n"
+          "  --profile-after N  start profiling after N frames were presented\n"
+          "  --frame-fd N, --key-fd N  inherited display pipes (doom/run.py)\n",
           argv0);
 }
 
@@ -54,13 +55,31 @@ int main(int argc, char **argv) {
   const char *cfgFile = nullptr;
   std::vector<const char *> overrides;
   bool printConfig = false;
+  int frameFd = -1, keyFd = -1;
+  const char *profileFile = nullptr;
+  uint64_t profileAfter = 0;
+  auto fdArg = [&](int &i) {
+    char *end = nullptr;
+    const long fd = strtol(argv[++i], &end, 10);
+    if (!*argv[i] || *end || fd < 3 || fd > INT32_MAX)
+      display::fail("invalid file descriptor");
+    return int(fd);
+  };
 
   auto numArg = [&](int &i) -> uint64_t {
     return strtoull(argv[++i], nullptr, 0);
   };
 
   for (int i = 1; i < argc; i++) {
-    if (!strcmp(argv[i], "-t"))
+    if (!strcmp(argv[i], "--frame-fd") && i + 1 < argc)
+      frameFd = fdArg(i);
+    else if (!strcmp(argv[i], "--key-fd") && i + 1 < argc)
+      keyFd = fdArg(i);
+    else if (!strcmp(argv[i], "--profile") && i + 1 < argc)
+      profileFile = argv[++i];
+    else if (!strcmp(argv[i], "--profile-after") && i + 1 < argc)
+      profileAfter = numArg(i);
+    else if (!strcmp(argv[i], "-t"))
       cfg.trace = true;
     else if (!strcmp(argv[i], "-r"))
       cfg.dumpRegs = true;
@@ -112,6 +131,7 @@ int main(int argc, char **argv) {
       mem.loadWords(loadHexFile(file));
   };
 
+  display::configure(frameFd, keyFd);
   MemorySystem msys(cfg);
   OoOCore core(cfg, msys);
   loadInto(msys.backing);
@@ -128,7 +148,7 @@ int main(int argc, char **argv) {
     loadInto(ref->mem);
     core.onCommit = [&](const CommitRecord &pipe) {
       CommitRecord refRec;
-      if (pipe.instruction == 0x00000073 && ref->reg(17) == 5 &&
+      if (pipe.instruction == 0x00000073 && syscallReturnsInput(ref->reg(17)) &&
           pipe.registerWrite)
         ref->replayInput = pipe.registerWrite->value;
       if (!ref->step(&refRec)) {
@@ -149,7 +169,23 @@ int main(int argc, char **argv) {
     };
   }
 
+  // The profiler rides the same commit hook, after the checker if any
+  std::optional<GuestProfile> profile;
+  if (profileFile) {
+    profile.emplace(profileAfter);
+    core.onCommit = [&, check = std::move(core.onCommit)](const CommitRecord &rec) {
+      if (check)
+        check(rec);
+      profile->record(rec, core.cycles(), display::framesPresented);
+    };
+  }
+
   int code = core.run();
+
+  if (profile && !profile->write(profileFile, display::framesPresented)) {
+    perror(profileFile);
+    return 1;
+  }
 
   if (cfg.diffCheck && code != 2) { // a blown cycle budget isn't architectural
     if (!ref->halted() || ref->exitCode() != code) {

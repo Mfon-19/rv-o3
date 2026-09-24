@@ -18,6 +18,7 @@
 
 #include <cstdint>
 
+#include "core/predictor.h"
 #include "core/ring.h"
 #include "isa/isa.h"
 
@@ -34,13 +35,14 @@ struct RobEntry {
   // commits; a garbage address from the wrong path must not kill the run
   uint8_t fault = 0; // 0 none, 1 misaligned, 2 out of bounds
   // Branch bookkeeping: what fetch predicted, what execute resolved,
-  // and the predictor snapshot (counter index, pre-shift history) so
-  // training touches the counter the prediction consulted and a
-  // mispredict can rewind the speculative history
+  // and the predictor snapshot (counter index, pre-update checkpoint) so
+  // training touches the state the prediction consulted and a flush
+  // can rewind the speculative history and RAS
   bool isBranch = false;
   bool predictedTaken = false, actualTaken = false;
   uint32_t predictedTarget = 0, actualTarget = 0;
-  uint32_t predIdx = 0, ghrBefore = 0;
+  uint32_t predIdx = 0;
+  Predictor::Checkpoint predBefore;
   // Syscall argument registers captured at dispatch (the map is
   // architectural there because the ROB was empty), read at commit
   uint8_t sysA0 = 0, sysA7 = 0;

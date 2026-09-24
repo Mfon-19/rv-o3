@@ -33,7 +33,7 @@ public:
 
   Memory mem;
 
-  // A differential shadow consumes the primary core's recorded input byte.
+  // A differential shadow consumes the primary core's recorded byte/key event.
   uint32_t replayInput = UINT32_MAX;
 
   // Execute one instruction and optionally describe it in *rec.

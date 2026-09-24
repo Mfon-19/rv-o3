@@ -9,7 +9,7 @@
 //      1 x branch unit   latency 1, pipelined
 //      1 x multiplier    latency mulLatency, pipelined (configurable)
 //      1 x divider       latency divLatency, non-pipelined (busy throughout)
-//      1 x AGU           latency 1; drains to the LSQ, not a WB port
+//      N x AGU           latency 1; drains to the LSQ, not a WB port
 //
 // The result VALUE is computed by execute() at issue (semantics stay
 // in isa/); a unit only delays the result's visibility. Every unit ends
@@ -82,14 +82,15 @@ struct FuUnit {
 
   // Clock edge: advance one cycle. While the output slot is occupied a
   // pipelined unit freezes entirely (nothing shifts, bubbles included)
-  // and a non-pipelined unit keeps its finished result parked inside
-  void tick() {
+  // and a non-pipelined unit keeps its finished result parked inside.
+  // Returns true exactly when a new output becomes ready for writeback
+  bool tick() {
     if (!busy())
-      return;
+      return false;
     busyCycles++;
     if (pipelined) {
       if (out.valid)
-        return;
+        return false;
       // The last stage becomes the next input slot. Advancing the index
       // moves every op one logical stage without copying the records.
       inputSlot = inputSlot ? inputSlot - 1 : latency - 1;
@@ -98,11 +99,14 @@ struct FuUnit {
         out = last;
         last.valid = false;
         inFlight--;
+        return true;
       }
     } else if (--remaining == 0) {
       out = cur; // canAccept() kept out empty while cur ran
       cur.valid = false;
+      return true;
     }
+    return false;
   }
 
   // Squash: kill every in-flight op younger than seq. Their results

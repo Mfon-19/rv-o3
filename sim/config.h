@@ -46,6 +46,8 @@ struct SimConfig {
 
   // Functional units
   uint32_t aluCount = 2;    // 1-cycle pipelined integer ALUs
+  uint32_t aguCount = 1;    // 1-cycle pipelined address-generation units
+  uint32_t dataPorts = 1;   // total new core load/store accesses per cycle
   uint32_t mulLatency = 3;  // multiplier result latency
   bool mulPipelined = true; // one new multiply may start per cycle
   uint32_t divLatency = 12; // divider occupancy (non-pipelined)
@@ -60,6 +62,7 @@ struct SimConfig {
   uint32_t physRegs = 0;      // 0 = derive 32 + robSize (validateConfig);
                               // explicit values allow pressure studies
   uint32_t fetchQSize = 8;    // fetched instructions waiting to dispatch
+  uint32_t fetchBytes = 0;    // 0 = derive from width; otherwise 8/16/32/64
   bool usePredictor = true;   // false: static not-taken (bring-up mode)
   MemOrder memOrder = MemOrder::Speculative; // see the enum above
   bool depPredictor = false;  // Speculative mode: loads that replayed
@@ -68,11 +71,22 @@ struct SimConfig {
   uint32_t phtBits = 10;      // gshare: 2^phtBits two-bit counters
   uint32_t ghrBits = 0;       // history bits; 0 = plain bimodal
   uint32_t btbEntries = 64;
+  uint32_t btbWays = 1;       // 1 = direct-mapped; more ways use LRU
   uint32_t rasEntries = 8;
+  bool rasRepair = false;     // restore the RAS top after a flush
+  // TAGE direction prediction (core/predictor.h): 0 tagged tables keeps
+  // gshare. With TAGE, phtBits sizes the bimodal base and ghrBits is unused
+  uint32_t tageTables = 0;
+  uint32_t tageTableBits = 10; // 2^bits entries per tagged table
+  uint32_t tageTagBits = 11;
+  uint32_t tageMinHist = 4;    // history lengths grow geometrically
+  uint32_t tageMaxHist = 128;  // from the shortest to the longest table
 
   // Cache fetches use aligned power-of-two blocks. Intermediate core
   // widths share the next larger fetch block (5..8 use 32 bytes).
   uint32_t fetchBlockBytes() const {
+    if (fetchBytes)
+      return fetchBytes;
     return width <= 2 ? 8 : width <= 4 ? 16 : 32;
   }
 };

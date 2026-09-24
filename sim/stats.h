@@ -31,6 +31,9 @@ struct Stats {
   uint64_t issuedOps = 0;      // total ops issued (for average issue width)
   uint64_t dataStallCycles = 0; // cycles some issued load was waiting on
                                 // the cache
+  uint64_t badFetchWaitCycles = 0; // fetch waiting at a misaligned or
+                                    // out-of-memory target for a squash
+                                    // (or, if it is real, a fault)
 
   // Per-cycle occupancy sums, divided by cycles at print time
   uint64_t robOccSum = 0, iqOccSum = 0, lsqOccSum = 0, sbOccSum = 0;

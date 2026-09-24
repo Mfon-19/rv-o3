@@ -33,13 +33,12 @@
 
 #pragma once
 
+#include <cstdint>
 #include <deque>
+#include <vector>
 
 #include "memory/request.h"
 #include "sim/config.h" // CacheConfig
-
-#include <cstdint>
-#include <vector>
 
 struct CacheStats {
   uint64_t accesses = 0;
@@ -68,7 +67,8 @@ public:
   }
   void access(const MemRequest &req) override;
   bool hasResponse() const override { return !respQ.empty(); }
-  MemResponse response() override;
+  const MemResponse &frontResponse() const override { return respQ.front(); }
+  void popResponse() override { respQ.pop_front(); }
   void tick() override;
 
   // A completion from the level below (refill line or writeback ack),
@@ -97,7 +97,7 @@ private:
   };
   struct WbEntry {
     uint32_t addr = 0;
-    std::vector<uint8_t> line;
+    Line line;
   };
   struct HitTxn {
     MemResponse resp;
@@ -105,21 +105,15 @@ private:
   };
   struct PendingInstall { // refill returned while the wb queue was full
     uint32_t mshrIdx;
-    ReadPayload line;
+    Line line;
   };
 
-  uint32_t setOf(uint32_t addr) const {
-    return binaryGeometry ? (addr >> lineShift) & (sets - 1)
-                          : (addr / cfg.lineBytes) % sets;
-  }
-  uint32_t tagOf(uint32_t addr) const {
-    return binaryGeometry ? addr >> tagShift : (addr / cfg.lineBytes) / sets;
-  }
-  uint32_t offsetOf(uint32_t addr) const {
-    return binaryGeometry ? addr & (cfg.lineBytes - 1) : addr % cfg.lineBytes;
-  }
+  // Line size and set count are powers of two (validateConfig)
+  uint32_t setOf(uint32_t addr) const { return (addr >> lineShift) & (sets - 1); }
+  uint32_t tagOf(uint32_t addr) const { return addr >> tagShift; }
+  uint32_t offsetOf(uint32_t addr) const { return addr & (cfg.lineBytes - 1); }
   uint32_t lineAddrOf(uint32_t set, uint32_t way) const {
-    return (tags[set * cfg.ways + way] * sets + set) * cfg.lineBytes;
+    return (tags[set * cfg.ways + way] << tagShift) | (set << lineShift);
   }
   uint8_t *lineData(uint32_t set, uint32_t way) {
     return data.data() + (size_t)(set * cfg.ways + way) * cfg.lineBytes;
@@ -136,23 +130,20 @@ private:
   int freeMshr() const;
   int mshrFor(uint32_t lineAddr) const;
 
-  // Perform one request on a resident line; returns the response
-  MemResponse performOnLine(const MemRequest &req, uint32_t set,
-                            uint32_t way);
+  // Perform one request directly into its reserved response slot
+  void performOnLine(const MemRequest &req, uint32_t set, uint32_t way,
+                     MemResponse &resp);
   // Put a line into the way picked for lineAddr, evicting a dirty
   // occupant to the wb queue. False, changing nothing, if that queue
   // has no room for the victim
   bool installLine(uint32_t lineAddr, const uint8_t *src, bool isDirty,
                    uint32_t &set, uint32_t &way);
-  bool tryInstall(uint32_t mshrIdx, const ReadPayload &line);
-  void finishHit(MemResponse &&resp);
+  bool tryInstall(uint32_t mshrIdx, const Line &line);
+  MemResponse &reserveHit();
 
   CacheConfig cfg;
   uint32_t sets;
-  // Common power-of-two geometries need no host integer division. Keep
-  // the general path for valid, non-power-of-two configurations.
-  bool binaryGeometry;
-  unsigned lineShift = 0, tagShift = 0;
+  unsigned lineShift, tagShift;
   MemPort *below;
   uint8_t srcId;
 
@@ -168,7 +159,7 @@ private:
   uint32_t pendingMisses = 0; // occupied MSHRs, including pending installs
   std::deque<WbEntry> wbq;
   std::deque<PendingInstall> pendingInstalls;
-  std::deque<HitTxn> hitPipe;
+  std::deque<HitTxn> hitPipe; // hits waiting out hitLatency, in order
   std::deque<MemResponse> respQ;
   uint64_t tickCount = 0;
 };

@@ -1,13 +1,22 @@
 // The issue queue: where dispatched instructions wait for their
 // operands and their functional unit.
 //
-// Each entry tracks its two source physical registers and a ready bit
-// per source. When a result writes back, its physical register number
-// is broadcast to every entry here (the wakeup); any source waiting on
-// that register flips to ready. Select takes the OLDEST fully ready
-// entries whose unit can accept, up to issue width; favoring the
-// oldest keeps long dependency chains moving and makes starvation
-// impossible.
+// Select takes the OLDEST fully ready entries whose unit can accept, up
+// to issue width; favoring the oldest keeps long dependency chains moving
+// and makes starvation impossible.
+//
+// Entries live at their ROB slot, so visiting slots from the ROB head is
+// program order. Their state is kept as bitmaps over those slots (one bit
+// per slot, 64 per word) so wakeup and select work a word at a time
+// instead of visiting every entry:
+//   occupied     the slot holds a waiting instruction
+//   blocked1/2   its source 1/2 is still waiting for a value
+//   ready        occupied, and neither source blocked
+//   wait1/2      one row per physical register p: the slots whose source
+//                1/2 waits on p (row p is words [p*words, (p+1)*words))
+// Writeback of p clears row p of wait1 and wait2, unblocks those slots,
+// and marks the ones with nothing else outstanding ready. release()
+// removes an entry from every bitmap when it issues or is squashed.
 
 #pragma once
 
@@ -23,7 +32,6 @@ struct IqEntry {
   uint32_t robIdx = 0, lsqIdx = 0;
   uint8_t ps1 = 0, ps2 = 0;
   FuKind unit = FuKind::NONE;
-  bool ready1 = true, ready2 = true;
   bool valid = false;
 };
 
@@ -34,6 +42,7 @@ struct IssueQueue {
   IssueQueue(uint32_t capacity, uint32_t robSize, uint32_t physRegs)
       : e(robSize), capacity(capacity), words(((size_t)robSize + 63) / 64),
         occupied(words, 0), ready(words, 0),
+        blocked1(words, 0), blocked2(words, 0),
         wait1((size_t)physRegs * words, 0), wait2(wait1.size(), 0) {}
 
   bool full() const { return n == capacity; }
@@ -51,34 +60,45 @@ struct IssueQueue {
     return &q;
   }
 
-  // Dispatch calls this once, after filling the source registers and ready
-  // flags. Waiter masks let writeback visit only consumers of its register.
-  void track(IqEntry *q) {
+  // Dispatch supplies each source's readiness once; a source that is not
+  // ready is recorded against the register it waits on
+  void track(IqEntry *q, bool ready1, bool ready2) {
     const size_t idx = (size_t)(q - e.data()), w = idx / 64;
     const uint64_t bit = uint64_t{1} << (idx % 64);
-    if (!q->ready1)
+    if (!ready1) {
       wait1[(size_t)q->ps1 * words + w] |= bit;
-    if (!q->ready2)
+      blocked1[w] |= bit;
+    }
+    if (!ready2) {
       wait2[(size_t)q->ps2 * words + w] |= bit;
-    if (q->ready1 && q->ready2)
+      blocked2[w] |= bit;
+    }
+    if (ready1 && ready2)
       ready[w] |= bit;
+  }
+
+  bool sourceReady(uint32_t slot, bool second) const {
+    return !((second ? blocked2 : blocked1)[slot / 64] &
+             (uint64_t{1} << (slot % 64)));
   }
 
   void release(IqEntry *q) {
     const size_t idx = (size_t)(q - e.data()), w = idx / 64;
     const uint64_t bit = uint64_t{1} << (idx % 64);
-    if (!q->ready1)
+    if (blocked1[w] & bit)
       wait1[(size_t)q->ps1 * words + w] &= ~bit;
-    if (!q->ready2)
+    if (blocked2[w] & bit)
       wait2[(size_t)q->ps2 * words + w] &= ~bit;
+    blocked1[w] &= ~bit;
+    blocked2[w] &= ~bit;
     occupied[w] &= ~bit;
     ready[w] &= ~bit;
     q->valid = false;
     n--;
   }
 
-  // The visitor may release its current entry. False stops after the last
-  // issue winner, avoiding work on younger entries that cannot issue today.
+  // Visit ready entries oldest first. The visitor may release the entry
+  // it is given; returning false stops the walk
   template <class Visitor> void visitReady(uint32_t robHead, Visitor visit) {
     // Visit the head word's upper bits, wrap through the remaining words,
     // then its lower bits. This is program order without sorting.
@@ -100,19 +120,11 @@ struct IssueQueue {
       const size_t idx = (size_t)preg * words + w;
       const uint64_t first = wait1[idx], second = wait2[idx];
       wait1[idx] = wait2[idx] = 0;
-      uint64_t bits = first | second;
-      while (bits) {
-        const unsigned b = __builtin_ctzll(bits);
-        const uint64_t bit = uint64_t{1} << b;
-        IqEntry &q = e[w * 64 + b];
-        if (first & bit)
-          q.ready1 = true;
-        if (second & bit)
-          q.ready2 = true;
-        if (q.ready1 && q.ready2)
-          ready[w] |= bit;
-        bits &= bits - 1;
-      }
+      // Wake every consumer with word operations, without fetching and
+      // updating each IQ entry. Only newly unblocked entries become ready.
+      blocked1[w] &= ~first;
+      blocked2[w] &= ~second;
+      ready[w] |= (first | second) & ~(blocked1[w] | blocked2[w]);
     }
   }
 
@@ -141,6 +153,6 @@ private:
 
   uint32_t capacity;
   size_t words;
-  std::vector<uint64_t> occupied, ready, wait1, wait2;
+  std::vector<uint64_t> occupied, ready, blocked1, blocked2, wait1, wait2;
   uint32_t n = 0;
 };

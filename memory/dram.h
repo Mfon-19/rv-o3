@@ -29,11 +29,12 @@ public:
   bool canAccept() const override { return !acceptedThisCycle; }
   void access(const MemRequest &req) override;
   bool hasResponse() const override { return !respQ.empty(); }
-  MemResponse response() override;
+  const MemResponse &frontResponse() const override { return respQ.front(); }
+  void popResponse() override { respQ.pop_front(); }
   void tick() override;
 
 private:
-  MemResponse perform(const MemRequest &req); // read/write the backing store
+  void perform(const MemRequest &req, MemResponse &r); // read/write the backing store
 
   Memory &backing;
   uint32_t latency;
@@ -43,6 +44,6 @@ private:
     MemResponse resp;
     uint64_t readyAt;
   };
-  std::deque<Txn> inflight;
+  std::deque<Txn> inflight; // fixed latency keeps these in completion order
   std::deque<MemResponse> respQ;
 };

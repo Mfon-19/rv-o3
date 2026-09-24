@@ -1,0 +1,14 @@
+# A slow older branch must squash a younger JALR to misaligned address 2.
+# In flat memory the JALR resolves first; faulting at fetch is premature.
+# Expected: exit 0, differential check passes.
+00100093   # addi x1, x0, 1
+00200113   # addi x2, x0, 2
+0210c1b3   # div x3, x1, x1
+00118a63   # beq x3, x1, +20
+00010067   # jalr x0, 0(x2) (wrong path)
+00000013
+00000013
+00000013
+00000513   # addi a0, x0, 0
+05d00893   # addi a7, x0, 93
+00000073

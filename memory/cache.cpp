@@ -1,7 +1,6 @@
 #include "memory/cache.h"
 
-#include <cstdio>
-#include <cstdlib>
+#include <bit>
 #include <cstring>
 
 // Tag on this cache's own writebacks to the level below; the ack is dropped
@@ -10,26 +9,12 @@ static constexpr uint64_t kWbTag = UINT64_MAX;
 Cache::Cache(const char *name, const CacheConfig &cfg, MemPort *below,
              uint8_t srcId)
     : name(name), cfg(cfg), below(below), srcId(srcId) {
-  if (cfg.lineBytes < 4 || cfg.ways == 0 ||
-      cfg.sizeBytes % (cfg.lineBytes * cfg.ways) != 0 ||
-      cfg.sizeBytes / (cfg.lineBytes * cfg.ways) == 0 || cfg.mshrs == 0 ||
-      cfg.wbq == 0) {
-    fprintf(stderr,
-            "fatal: %s: invalid cache geometry "
-            "(%u bytes, %u-way, %u-byte lines, %u mshrs, %u wbq)\n",
-            name, cfg.sizeBytes, cfg.ways, cfg.lineBytes, cfg.mshrs,
-            cfg.wbq);
-    exit(1);
-  }
+  // validateConfig has checked the geometry
   if (this->cfg.hitLatency == 0)
     this->cfg.hitLatency = 1;
   sets = cfg.sizeBytes / (cfg.lineBytes * cfg.ways);
-  binaryGeometry = (cfg.lineBytes & (cfg.lineBytes - 1)) == 0 &&
-                   (sets & (sets - 1)) == 0;
-  if (binaryGeometry) {
-    lineShift = __builtin_ctz(cfg.lineBytes);
-    tagShift = lineShift + __builtin_ctz(sets);
-  }
+  lineShift = std::countr_zero(cfg.lineBytes);
+  tagShift = lineShift + std::countr_zero(sets);
   const size_t lines = (size_t)sets * cfg.ways;
   data.assign(lines * cfg.lineBytes, 0);
   tags.assign(lines, invalidTag);
@@ -78,11 +63,10 @@ int Cache::mshrFor(uint32_t lineAddr) const {
 
 // Reads capture their data now; writes take effect now. The response
 // echoes src and tag so the requester can match it
-MemResponse Cache::performOnLine(const MemRequest &req, uint32_t set,
-                                 uint32_t way) {
+void Cache::performOnLine(const MemRequest &req, uint32_t set,
+                          uint32_t way, MemResponse &resp) {
   uint8_t *line = lineData(set, way);
   const uint32_t off = offsetOf(req.addr);
-  MemResponse resp;
   resp.src = req.src;
   resp.tag = req.tag;
   if (req.isWrite) {
@@ -94,8 +78,8 @@ MemResponse Cache::performOnLine(const MemRequest &req, uint32_t set,
     }
     dirty[set * cfg.ways + way] = 1;
   } else {
-    if (req.size > 4) { // line refill for an upper cache, or a fetch pair
-      resp.rline.assign(line + off, line + off + req.size);
+    if (req.size > 4) { // line refill for an upper cache, or a fetch block
+      memcpy(resp.rline.data(), line + off, req.size);
     } else {
       uint32_t v = 0;
       for (uint32_t b = 0; b < req.size; b++)
@@ -104,15 +88,15 @@ MemResponse Cache::performOnLine(const MemRequest &req, uint32_t set,
     }
   }
   touchLRU(set, way);
-  return resp;
 }
 
-void Cache::finishHit(MemResponse &&resp) {
+MemResponse &Cache::reserveHit() {
   stats.latencySum += cfg.hitLatency;
   if (cfg.hitLatency == 1)
-    respQ.push_back(std::move(resp));
-  else
-    hitPipe.push_back(HitTxn{std::move(resp), tickCount + cfg.hitLatency - 1});
+    return respQ.emplace_back();
+  HitTxn &hit = hitPipe.emplace_back();
+  hit.readyAt = tickCount + cfg.hitLatency - 1;
+  return hit.resp;
 }
 
 // Install a line in the way victimWay picks for it. A dirty occupant
@@ -131,7 +115,7 @@ bool Cache::installLine(uint32_t lineAddr, const uint8_t *src, bool isDirty,
     // restore from the writeback queue can still cancel this entry
     WbEntry wb;
     wb.addr = lineAddrOf(set, way);
-    wb.line.assign(lineData(set, way), lineData(set, way) + cfg.lineBytes);
+    memcpy(wb.line.data(), lineData(set, way), cfg.lineBytes);
     wbq.push_back(std::move(wb));
   }
   memcpy(lineData(set, way), src, cfg.lineBytes);
@@ -150,7 +134,7 @@ void Cache::access(const MemRequest &req) {
     stats.hits++;
     if (pendingMisses)
       stats.hitUnderMiss++;
-    finishHit(performOnLine(req, set, (uint32_t)way));
+    performOnLine(req, set, (uint32_t)way, reserveHit());
     return;
   }
 
@@ -165,7 +149,7 @@ void Cache::access(const MemRequest &req) {
       wbq.erase(wbq.begin() + i);
       stats.hits++;
       stats.wbqRestores++;
-      finishHit(performOnLine(req, s, w));
+      performOnLine(req, s, w, reserveHit());
       return;
     }
   }
@@ -187,10 +171,9 @@ void Cache::access(const MemRequest &req) {
     uint32_t s, w; // canAccept() guaranteed queue room for our own victim
     installLine(lineAddr, req.wline.data(), true, s, w);
     touchLRU(s, w);
-    MemResponse ack;
+    MemResponse &ack = reserveHit();
     ack.src = req.src;
     ack.tag = req.tag;
-    finishHit(std::move(ack));
     return;
   }
 
@@ -214,7 +197,7 @@ void Cache::access(const MemRequest &req) {
 // every request that was waiting for it, in arrival order. Returns
 // false if the victim couldn't be evicted yet (writeback queue full);
 // the MSHR stays and the caller retries
-bool Cache::tryInstall(uint32_t mshrIdx, const ReadPayload &line) {
+bool Cache::tryInstall(uint32_t mshrIdx, const Line &line) {
   Mshr &m = mshrs[mshrIdx];
   uint32_t set, way;
   if (!installLine(m.lineAddr, line.data(), false, set, way))
@@ -222,7 +205,7 @@ bool Cache::tryInstall(uint32_t mshrIdx, const ReadPayload &line) {
   stats.bytesRead += cfg.lineBytes;
   for (Waiting &w : m.waiting) {
     stats.latencySum += tickCount - w.issueTick + 1;
-    respQ.push_back(performOnLine(w.req, set, way));
+    performOnLine(w.req, set, way, respQ.emplace_back());
   }
   // Keep the waiting-list allocation for the next miss in this slot.
   m.waiting.clear();
@@ -245,7 +228,7 @@ void Cache::tick() {
   // All hits have the same latency, so their deadlines are in order.
   // Pending responses stay in place until the first one is ready.
   while (!hitPipe.empty() && hitPipe.front().readyAt <= tickCount) {
-    respQ.push_back(std::move(hitPipe.front().resp));
+    respQ.push_back(hitPipe.front().resp);
     hitPipe.pop_front();
   }
   // installs that were waiting for writeback-queue room
@@ -269,7 +252,7 @@ void Cache::tick() {
       wb.addr = wbq.front().addr;
       wb.size = cfg.lineBytes;
       wb.isWrite = true;
-      wb.wline = std::move(wbq.front().line);
+      wb.wline = wbq.front().line;
       wb.src = srcId;
       wb.tag = kWbTag;
       wbq.pop_front();
@@ -289,12 +272,6 @@ void Cache::tick() {
     stats.overlapCycles++;
   stats.mshrOccSum += pendingMisses;
   stats.ticks++;
-}
-
-MemResponse Cache::response() {
-  MemResponse r = std::move(respQ.front());
-  respQ.pop_front();
-  return r;
 }
 
 bool Cache::peek8(uint32_t addr, uint8_t &out) const {

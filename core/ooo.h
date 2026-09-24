@@ -12,7 +12,8 @@
 //
 // Microarchitecture
 //      - Fetch pulls one aligned block per cycle (width*4 bytes rounded
-//        up to a power of two, minimum 8) into a small queue. A direction
+//        up to a power of two, minimum 8, or explicit fetchBytes) into a
+//        small queue. A direction
 //        table, a branch target buffer, and a return-address stack steer
 //        the next block, so correctly predicted taken branches cost nothing
 //      - Rename (in order) maps each source register to the physical
@@ -63,7 +64,6 @@
 
 #pragma once
 
-#include <array>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -94,6 +94,9 @@ public:
   // The architectural value of register i, read through the rename map
   uint32_t reg(int i) const { return prf.val[rmap.map[i]]; }
 
+  // Cycles simulated so far (the current cycle while a stage is running)
+  uint64_t cycles() const { return stats.cycles; }
+
   // Called once per committed instruction, in commit order. Null by
   // default; the differential checker plugs in here
   std::function<void(const CommitRecord &)> onCommit;
@@ -120,23 +123,13 @@ private:
   // functional units
   std::vector<FuUnit> alus;
   FuUnit brUnit, mulUnit, divUnit;
-  FuUnit agu;                  // address generation; drains to the LSQ
-  std::vector<FuUnit *> units; // all of the above, for flush and tick
+  std::vector<FuUnit> agus;    // address generation; drains to the LSQ
+  std::vector<FuUnit *> units; // WB-producing units, for flush and tick
 
-  // Reused writeback candidates; these pointers do not own entries.
-  std::vector<FuOp *> wbScratch;
-
-  // Host-only memoization of pure decode/classification. Always compare
-  // the fetched bits, so replacement and self-modifying code stay correct.
-  struct DispatchInfo {
-    Instr ins;
-    FuKind unit = FuKind::NONE;
-    bool memory = false, hasDest = false;
-    bool reads1 = false, reads2 = false;
-    bool valid = false;
-  };
-  std::array<DispatchInfo, 64> decodeCache{};
-  void fillDispatchInfo(DispatchInfo &entry, uint32_t raw);
+  // Results waiting for a writeback port: pointers to the output slots of
+  // the units and loadOuts. An entry is added when its slot fills and
+  // removed at writeback, or at a flush once its slot is invalidated
+  std::vector<FuOp *> wbReady;
 
   // fetch state: at most one block request is outstanding at a time
   uint32_t pc = 0;      // next address fetch will request
@@ -145,7 +138,8 @@ private:
     uint32_t pc = 0, raw = 0;
     bool predTaken = false;
     uint32_t predTarget = 0;
-    uint32_t predIdx = 0, ghrBefore = 0; // predictor snapshot
+    uint32_t predIdx = 0;             // gshare counter the prediction used
+    Predictor::Checkpoint predBefore; // predictor state before it
   };
   Ring<Fetched> fetchQ;
   bool fOutstanding = false, fStale = false; // stale: squashed while in flight

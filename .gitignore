@@ -1,7 +1,7 @@
 # Project executable
 /rvsim
 
-# Local planning notes (not part of the published repo)
+# Local planning notes
 /doc/
 
 # Freestanding C demo outputs (object files are covered by *.o below)

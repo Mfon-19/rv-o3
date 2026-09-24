@@ -7,7 +7,3 @@ static inline uint32_t rv_call(uint32_t number, uint32_t argument) {
     __asm__ volatile("ecall" : "+r"(a0) : "r"(a7) : "memory");
     return a0;
 }
-
-static inline void rv_print(const char *text) {
-    rv_call(3, (uint32_t)(uintptr_t)text);
-}

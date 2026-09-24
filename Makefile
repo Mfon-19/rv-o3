@@ -1,5 +1,5 @@
-CXX ?= g++
-CXXFLAGS ?= -std=c++17 -O2 -flto -Wall -Wextra
+CXX ?= c++
+CXXFLAGS ?= -std=c++20 -O2 -flto -Wall -Wextra
 CXXFLAGS += -I. -MMD -MP
 
 SRCS := isa/decode.cpp isa/disasm.cpp isa/execute.cpp \
@@ -7,7 +7,6 @@ SRCS := isa/decode.cpp isa/disasm.cpp isa/execute.cpp \
         memory/dram.cpp memory/cache.cpp memory/system.cpp \
         sim/config.cpp sim/loader.cpp sim/main.cpp
 OBJS := $(SRCS:.cpp=.o)
-DEPS := $(OBJS:.o=.d)
 
 rvsim: $(OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $(OBJS)
@@ -15,90 +14,70 @@ rvsim: $(OBJS)
 %.o: %.cpp Makefile
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
--include $(DEPS)
+-include $(OBJS:.o=.d)
 
-# Optional GCC profile-guided build. Keep training and profile use at -O2:
-# changing optimization levels can invalidate GCC's control-flow counters.
-# Rebuild and retrain each time, so profiles never silently outlive the source.
+# Profile-guided build with Clang: build an instrumented simulator, run
+# training workloads, merge their counts, and rebuild with them. Train on
+# the workload you care about, for example Doom on its core:
+#   make pgo PGO_IMAGE=doom/build/doom.bin PGO_CONFIG=configs/doom.cfg
+# Exit status 2 (cycle budget reached) still yields usable counts.
 PGO_IMAGE ?= bench/mm64.bin
+PGO_CONFIG ?=
 PGO_CYCLES ?= 200000000
-PGO_MEMORY ?= 67108864
-PGO_CXXFLAGS = $(filter-out -MMD -MP -flto,$(CXXFLAGS))
+PGO_CXX ?= $(if $(findstring clang,$(shell $(CXX) --version 2>/dev/null)),$(CXX),clang++)
+LLVM_PROFDATA ?= $(shell $(PGO_CXX) -print-prog-name=llvm-profdata)
+PGO_DIR := build/pgo
+PGO_FLAGS := -std=c++20 -O2 -I. -Wall -Wextra
 .PHONY: pgo
 pgo: bench
-	@test -r "$(PGO_IMAGE)" || { echo "PGO_IMAGE must name a readable program" >&2; exit 1; }
-	@mkdir -p build/pgo/counts
-	@rm -f build/pgo/counts/*.gcda
-	$(CXX) $(PGO_CXXFLAGS) -fprofile-generate=$(abspath build/pgo/counts) -o build/pgo/rvsim $(SRCS)
-	@: > build/pgo/train-stdout.txt
-	@: > build/pgo/train-stderr.txt
-	@for image in "$(PGO_IMAGE)" bench/mm64.bin bench/branchy.bin bench/mlpbench.bin; do \
-		echo "PGO training: $$image"; status=0; \
-		build/pgo/rvsim -m $(PGO_MEMORY) -c $(PGO_CYCLES) "$$image" </dev/null \
-			>>build/pgo/train-stdout.txt 2>>build/pgo/train-stderr.txt || status=$$?; \
-		if [ $$status -ne 0 ] && [ $$status -ne 2 ]; then \
-			cat build/pgo/train-stderr.txt >&2; exit $$status; \
-		fi; \
+	rm -rf $(PGO_DIR) && mkdir -p $(PGO_DIR)
+	$(PGO_CXX) $(PGO_FLAGS) -fprofile-instr-generate -o $(PGO_DIR)/instrumented $(SRCS)
+	@for run in "$(if $(PGO_CONFIG),-C $(PGO_CONFIG)) $(PGO_IMAGE)" \
+	            bench/branchy.bin bench/mlpbench.bin "-d bench/qsortb.bin"; do \
+		echo "PGO training: $$run"; \
+		LLVM_PROFILE_FILE=$(PGO_DIR)/%p.profraw $(PGO_DIR)/instrumented \
+			-m 67108864 -c $(PGO_CYCLES) --frame-fd 3 --key-fd 4 $$run \
+			3>/dev/null 4</dev/null </dev/null >/dev/null 2>>$(PGO_DIR)/train.log; \
+		status=$$?; [ $$status -le 2 ] || { tail -5 $(PGO_DIR)/train.log; exit 1; }; \
 	done
-	@build/pgo/rvsim -O width=8 -O aluCount=8 -O wbPorts=8 -O fetchQSize=16 bench/mm64.bin \
-		</dev/null >>build/pgo/train-stdout.txt 2>>build/pgo/train-stderr.txt
-	@build/pgo/rvsim -d -O flatMemory=1 bench/branchy.bin \
-		</dev/null >>build/pgo/train-stdout.txt 2>>build/pgo/train-stderr.txt
-	$(CXX) $(PGO_CXXFLAGS) -flto -fno-tracer -fprofile-use=$(abspath build/pgo/counts) \
-		-Werror=coverage-mismatch -Werror=missing-profile -o build/pgo/rvsim $(SRCS)
+	$(LLVM_PROFDATA) merge -o $(PGO_DIR)/code.profdata $(PGO_DIR)/*.profraw
+	$(PGO_CXX) $(PGO_FLAGS) -flto -fprofile-instr-use=$(PGO_DIR)/code.profdata \
+		-o $(PGO_DIR)/rvsim $(SRCS)
+	@echo "PGO simulator: $(PGO_DIR)/rvsim"
 
-# Run every bundled program under -d, checking the core's commit stream
-# against the reference model instruction by instruction. Each .hex
-# file's header says what it exercises and what it should print.
-.PHONY: test testinput testhost testdecode
-testdecode: rvsim
-	python3 tests/decode_cache.py
+# The standing regression suite: unit tests, targeted scripts, and every
+# directed program under -d (the core's commit stream checked against the
+# reference model instruction by instruction)
+.PHONY: test
+test: rvsim build/tests/units
+	./build/tests/units
+	python3 tests/interface.py
+	python3 tests/microarchitecture.py
+	@for t in tests/*.hex $(wildcard cdemo/demo.bin); do \
+		./rvsim -d $$t >/dev/null 2>/tmp/rvsim-test.err \
+			|| { echo "FAIL: $$t"; tail -4 /tmp/rvsim-test.err; exit 1; }; \
+	done; echo "directed programs: all pass under -d"
 
-testinput: rvsim
-	python3 tests/syscall_input.py
-
-build/tests/host_structures: tests/host_structures.cpp core/fu.h core/iq.h core/lsq.h core/ring.h memory/request.h isa/isa.h
+build/tests/units: tests/units.cpp memory/cache.cpp memory/dram.cpp $(wildcard core/*.h memory/*.h)
 	@mkdir -p build/tests
-	$(CXX) $(CXXFLAGS) -UNDEBUG -o $@ $<
+	$(CXX) $(CXXFLAGS) -o $@ tests/units.cpp memory/cache.cpp memory/dram.cpp
 
-testhost: build/tests/host_structures
-	./build/tests/host_structures
-
-test: rvsim testinput testhost testdecode
-	@for t in tests/*.hex; do \
-		echo "== $$t"; ./rvsim -d $$t || exit 1; \
-	done
-	@if [ -f cdemo/demo.bin ]; then \
-		echo "== cdemo/demo.bin"; ./rvsim -d cdemo/demo.bin || exit 1; \
-	fi
-
-# Randomized differential testing: SEEDS programs full of aliasing loads
-# and stores (tests/randgen.py), each checked against the reference
-# model. Directed tests can't enumerate the interleavings that
-# load-speculation and MSHR bugs hide in; these get close.
+# Randomized differential testing: programs full of aliasing loads and
+# stores (tests/randgen.py), each checked against the reference model.
+# Directed tests can't enumerate the interleavings that load-speculation
+# and MSHR bugs hide in; these get close
 SEEDS ?= 50
-RANDDIR ?= /tmp/rvsim-randtest
 .PHONY: randtest
 randtest: rvsim
-	@mkdir -p $(RANDDIR)
 	@for s in $$(seq 1 $(SEEDS)); do \
-		python3 tests/randgen.py $$s 120 > $(RANDDIR)/r$$s.hex; \
-		./rvsim -d $(RANDDIR)/r$$s.hex >/dev/null 2>$(RANDDIR)/r$$s.err \
-			|| { echo "FAIL seed $$s ($(RANDDIR)/r$$s.hex)"; \
-			     tail -4 $(RANDDIR)/r$$s.err; exit 1; }; \
-	done
-	@echo "randtest: $(SEEDS) random programs verified"
+		python3 tests/randgen.py $$s 120 > /tmp/rvsim-rand.hex; \
+		./rvsim -d /tmp/rvsim-rand.hex >/dev/null 2>/tmp/rvsim-rand.err \
+			|| { echo "FAIL seed $$s"; tail -4 /tmp/rvsim-rand.err; exit 1; }; \
+	done; echo "randtest: $(SEEDS) random programs verified"
 
-# The directed suite re-run under a spread of configurations (widths,
-# window sizes, memory modes) via -O overrides; see tools/configtest.sh
-.PHONY: configtest
-configtest: rvsim
-	@sh tools/configtest.sh
-
-# Benchmarks: each runs under -d in all three memory-ordering modes AND
-# its output is compared against a natively compiled host build, an
-# oracle that shares no code with the simulator, so it checks the ISA
-# semantics that the (shared) reference model cannot
+# Benchmarks run under -d in all three memory-ordering modes AND must
+# match a natively compiled build of the same source, an oracle that
+# shares no code with the simulator
 .PHONY: bench benchtest
 bench:
 	@$(MAKE) -s -C bench
@@ -108,17 +87,14 @@ benchtest: rvsim bench
 		for mode in conservative bypass speculative; do \
 			./rvsim -d -O memOrder=$$mode bench/$$b.bin \
 				> /tmp/rvbench-got.txt 2>/tmp/rvbench-err.txt \
-				|| { echo "FAIL: $$b ($$mode)"; \
-				     tail -4 /tmp/rvbench-err.txt; exit 1; }; \
+				|| { echo "FAIL: $$b ($$mode)"; tail -4 /tmp/rvbench-err.txt; exit 1; }; \
 			cmp -s /tmp/rvbench-exp.txt /tmp/rvbench-got.txt \
-				|| { echo "FAIL: $$b ($$mode) differs from host oracle"; \
-				     diff /tmp/rvbench-exp.txt /tmp/rvbench-got.txt | head -4; \
-				     exit 1; }; \
+				|| { echo "FAIL: $$b ($$mode) differs from the native build"; exit 1; }; \
 		done; \
-		echo "== $$b ok (-d x3 modes, host oracle matches)"; \
+		echo "$$b: ok"; \
 	done
 
 .PHONY: clean
 clean:
-	rm -f rvsim $(OBJS) $(DEPS)
-	rm -f build/tests/host_structures build/tests/host_structures.d
+	rm -f rvsim $(OBJS) $(OBJS:.o=.d)
+	rm -rf build/tests $(PGO_DIR)
