@@ -46,6 +46,7 @@ struct ConfigOption {
   _("l2.mshrs",      OptionKind::U32,       l2.mshrs)                       \
   _("l2.wbq",        OptionKind::U32,       l2.wbq)                         \
   _("aluCount",      OptionKind::U32,       aluCount)                       \
+  _("branchCount",   OptionKind::U32,       branchCount)                    \
   _("aguCount",      OptionKind::U32,       aguCount)                       \
   _("dataPorts",     OptionKind::U32,       dataPorts)                      \
   _("mulLatency",    OptionKind::U32,       mulLatency)                     \
@@ -257,7 +258,7 @@ void validateConfig(SimConfig &config) {
   // Physical register IDs are stored in uint8_t with 0xFF reserved as kNoReg.
   requireValid(config.physRegs >= 33 && config.physRegs <= 255,
                "physRegs must be in 33..255");
-  requireValid(config.width >= 1 && config.width <= 8, "width must be in 1..8");
+  requireValid(config.width >= 1 && config.width <= 16, "width must be in 1..16");
 
   const uint32_t fetchBytes = config.fetchBlockBytes();
   requireValid(fetchBytes >= 8 && fetchBytes <= 64 && std::has_single_bit(fetchBytes),
@@ -266,9 +267,10 @@ void validateConfig(SimConfig &config) {
   requireValid(config.robSize >= 1 && config.iqSize >= 1 &&
                    config.lsqSize >= 1 && config.sbSize >= 1,
                "queue sizes must be >= 1");
-  requireValid(config.aluCount >= 1 && config.aluCount <= 8 &&
-                   config.aguCount >= 1 && config.aguCount <= 8 &&
-                   config.dataPorts >= 1 && config.dataPorts <= 8 &&
+  requireValid(config.aluCount >= 1 && config.aluCount <= 16 &&
+                   config.branchCount >= 1 && config.branchCount <= 8 &&
+                   config.aguCount >= 1 && config.aguCount <= 16 &&
+                   config.dataPorts >= 1 && config.dataPorts <= 16 &&
                    config.wbPorts >= 1 && config.mulLatency >= 1 && config.divLatency >= 1,
                "invalid execution unit or port counts");
 

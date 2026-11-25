@@ -8,6 +8,7 @@ It is fast and complete enough to run **Doom** as an RV32IM guest binary inside 
 
 ```sh
 make
+make pgo                      # optional Clang PGO build for maximum FPS
 ./rvsim tests/sum.hex         # runs program, prints output + stats
 ./rvsim -d tests/sum.hex      # runs with lockstep differential verification
 make test                     # unit tests + directed .hex programs under -d
@@ -59,7 +60,7 @@ The simulator requires only a C++20 compiler. Building `bench/` and `cdemo/` req
 
 - **Fetch & Branch Prediction**: Fetches one aligned block per cycle, steered by a set-associative BTB, a Return Address Stack (with optional squash repair), and either a bimodal/gshare PHT or a geometric-history TAGE predictor.
 - **Rename & Dispatch**: Allocates fresh physical registers from a free list to eliminate WAW/WAR hazards, and allocates ROB, IQ, and LSQ slots up to `width` instructions per cycle. System operations (`ecall`, `ebreak`, `fence`, `illegal`) serialize on an empty pipeline.
-- **Execution**: Configurable 1-cycle ALUs, branch unit, pipelined/non-pipelined multiplier, non-pipelined divider, and 1-cycle AGUs.
+- **Execution**: Configurable 1-cycle ALUs, branch units (`branchCount`), pipelined/non-pipelined multiplier, non-pipelined divider, and 1-cycle AGUs.
 - **Memory Ordering (`memOrder`)**:
   - `conservative`: loads wait for all older store addresses and issue in order.
   - `bypass`: loads bypass proven non-overlapping older stores.
@@ -116,7 +117,7 @@ Every core and cache parameter lives in `SimConfig` ([sim/config.h](sim/config.h
 
 ```sh
 ./rvsim -p                                           # print active configuration
-./rvsim -C configs/doom.cfg doom/build/doom.bin      # 8-wide TAGE + 1 MiB L2 core
+./rvsim -C configs/doom.cfg doom/build/doom.bin      # high-FPS Doom configuration
 ./rvsim -O robSize=128 -O memOrder=bypass prog.bin   # override settings
 ```
 
@@ -163,7 +164,7 @@ sim/      config.h, config.cpp         SimConfig, file parser, -O overrides, val
           syscall.h                    Guest ECALL handler and host display pipe I/O
           display_protocol.h           Shared RVF1 frame & key ABI (shared with doom/)
           main.cpp                     CLI driver, .hex/.bin loader, differential harness
-configs/  doom.cfg                     8-wide core configuration for Doom
+configs/  doom.cfg                     High-FPS core configuration for Doom
 tests/    units.cpp, *.hex             Unit tests and directed RV32IM regression programs
 bench/    *.c, bench.h, Makefile       6 freestanding RV32IM microbenchmarks
 cdemo/    demo.c, start.S, linker.ld   Freestanding C demo and shared RISC-V toolchain rules

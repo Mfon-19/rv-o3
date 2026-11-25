@@ -34,12 +34,27 @@ inline bool overlaps(uint32_t addrA, uint32_t sizeA, uint32_t addrB,
   return addrA + sizeA > addrB && addrB + sizeB > addrA;
 }
 
+// 64-bucket word-address signature used to skip older-store disambiguation scans
+// when no older store targets the same 4-byte word bucket.
+inline uint64_t wordBucketMask(uint32_t addr, uint32_t size) {
+  const uint64_t first = 1ull << ((addr >> 2) & 63u);
+  const uint32_t endAddr = addr + size - 1;
+  return first | (1ull << ((endAddr >> 2) & 63u));
+}
+
 class LSQ : public Ring<LsqEntry> {
 public:
-  explicit LSQ(uint32_t capacity) : Ring(capacity), generationCounter(capacity, 0) {}
+  explicit LSQ(uint32_t capacity)
+      : Ring(capacity), generationCounter(std::bit_ceil(capacity ? capacity : 1u), 0) {}
 
   uint32_t alloc() {
     const uint32_t idx = Ring::alloc();
+    at(idx).generation = ++generationCounter[idx];
+    return idx;
+  }
+
+  uint32_t allocRaw() {
+    const uint32_t idx = Ring::allocRaw();
     at(idx).generation = ++generationCounter[idx];
     return idx;
   }

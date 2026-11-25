@@ -9,7 +9,8 @@
 MemorySystem::MemorySystem(const SimConfig &config)
     : backing(config.memBytes),
       flat(config.flatMemory),
-      dram(backing, flat ? config.flatLatency : config.dramLatency) {
+      dram(backing, flat ? config.flatLatency : config.dramLatency,
+           flat ? config.dataPorts : 1) {
   if (flat) {
     flatInstrMem.emplace(backing, config.flatLatency);
     imem = &*flatInstrMem;

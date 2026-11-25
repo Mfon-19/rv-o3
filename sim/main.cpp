@@ -48,8 +48,12 @@ void loadProgram(Memory &memory, const char *path) {
   }
 
   if (isBinary) {
-    memory.loadBytes(std::vector<uint8_t>(std::istreambuf_iterator<char>(file),
-                                          std::istreambuf_iterator<char>()));
+    file.seekg(0, std::ios::end);
+    const std::streamoff fileSize = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    memory.check(0, (uint32_t)fileSize, "program image");
+    file.read((char *)memory.bytes.data(), fileSize);
     return;
   }
 

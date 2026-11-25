@@ -1,20 +1,35 @@
-// Memory bus protocol (MemRequest, MemResponse, MemPort), flat byte-addressed
-// backing store (Memory), and fixed-latency pipelined DRAM model.
+// Memory bus protocol (MemRequest, MemResponse, MemPort), compact circular
+// FastQueue, flat byte-addressed backing store (Memory), and pipelined DRAM.
 
 #pragma once
 
 #include <array>
+#include <bit>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <deque>
 #include <vector>
 
 constexpr uint32_t kMaxLineBytes = 128;
 using Line = std::array<uint8_t, kMaxLineBytes>;
 
 inline uint32_t readLittleEndian(const uint8_t *bytes, uint32_t size) {
+  if constexpr (std::endian::native == std::endian::little) {
+    if (size == 4) {
+      uint32_t value;
+      memcpy(&value, bytes, 4);
+      return value;
+    }
+    if (size == 2) {
+      uint16_t value;
+      memcpy(&value, bytes, 2);
+      return value;
+    }
+    if (size == 1)
+      return bytes[0];
+  }
+
   uint32_t value = 0;
   for (uint32_t i = 0; i < size; i++)
     value |= (uint32_t)bytes[i] << (8 * i);
@@ -22,9 +37,82 @@ inline uint32_t readLittleEndian(const uint8_t *bytes, uint32_t size) {
 }
 
 inline void writeLittleEndian(uint8_t *bytes, uint32_t size, uint32_t value) {
+  if constexpr (std::endian::native == std::endian::little) {
+    if (size == 4) {
+      memcpy(bytes, &value, 4);
+      return;
+    }
+    if (size == 2) {
+      uint16_t half = (uint16_t)value;
+      memcpy(bytes, &half, 2);
+      return;
+    }
+    if (size == 1) {
+      bytes[0] = (uint8_t)value;
+      return;
+    }
+  }
+
   for (uint32_t i = 0; i < size; i++)
     bytes[i] = (uint8_t)(value >> (8 * i));
 }
+
+// Growable power-of-two circular queue replacing std::deque on hot paths to
+// avoid segmented-block heap chasing.
+template <class T>
+class FastQueue {
+public:
+  explicit FastQueue(size_t initialCap = 8) : storage(initialCap), mask(initialCap - 1) {}
+
+  bool empty() const { return count == 0; }
+  size_t size() const { return count; }
+
+  T &front() { return storage[head]; }
+  const T &front() const { return storage[head]; }
+
+  T &operator[](size_t offset) { return storage[(head + offset) & mask]; }
+  const T &operator[](size_t offset) const { return storage[(head + offset) & mask]; }
+
+  T &emplaceBack() {
+    if (count == storage.size())
+      grow();
+
+    T &slot = storage[(head + count) & mask];
+    count++;
+    return slot;
+  }
+
+  void pushBack(const T &value) { emplaceBack() = value; }
+
+  void popFront() {
+    head = (head + 1) & mask;
+    count--;
+  }
+
+  void eraseAt(size_t offset) {
+    for (size_t i = offset; i + 1 < count; i++)
+      storage[(head + i) & mask] = std::move(storage[(head + i + 1) & mask]);
+    count--;
+  }
+
+private:
+  void grow() {
+    const size_t newCap = storage.size() * 2;
+    std::vector<T> next(newCap);
+
+    for (size_t i = 0; i < count; i++)
+      next[i] = std::move(storage[(head + i) & mask]);
+
+    storage = std::move(next);
+    head = 0;
+    mask = newCap - 1;
+  }
+
+  std::vector<T> storage;
+  size_t head = 0;
+  size_t count = 0;
+  size_t mask = 0;
+};
 
 // A single memory transaction; accesses > 4 bytes transfer via writeLine/readLine.
 struct MemRequest {
@@ -42,7 +130,19 @@ struct MemResponse {
   uint64_t tag = 0;
   uint32_t readData = 0;
   uint8_t src = 0;
+  bool hasLine = false;
 };
+
+// Copies a response while skipping the 128-byte line payload on scalar accesses.
+inline void copyMemResponse(MemResponse &dst, const MemResponse &src) {
+  dst.tag = src.tag;
+  dst.readData = src.readData;
+  dst.src = src.src;
+  dst.hasLine = src.hasLine;
+
+  if (src.hasLine)
+    dst.readLine = src.readLine;
+}
 
 // Uniform nonblocking port interface implemented by caches and DRAM.
 struct MemPort {
@@ -89,7 +189,7 @@ struct Memory {
     writeLittleEndian(bytes.data() + addr, size, value);
   }
 
-  uint8_t load8(uint32_t addr) const { return (uint8_t)load(addr, 1); }
+  uint8_t load8(uint32_t addr) const { return bytes[addr]; }
   uint32_t load32(uint32_t addr) const { return load(addr, 4); }
 
   void loadWords(const std::vector<uint32_t> &words) {
@@ -103,27 +203,29 @@ struct Memory {
   }
 };
 
-// Pipelined DRAM accepting at most one request per cycle and returning
+// Pipelined DRAM accepting up to `maxPorts` requests per cycle and returning
 // responses after `latency` cycles.
-class DRAM : public MemPort {
+class DRAM final : public MemPort {
 public:
-  DRAM(Memory &backing, uint32_t latency)
-      : backing(backing), latency(latency ? latency : 1) {}
+  DRAM(Memory &backing, uint32_t latency, uint32_t maxPorts = 1)
+      : backing(backing),
+        latency(latency ? latency : 1),
+        maxPorts(maxPorts ? maxPorts : 1) {}
 
-  bool canAccept() const override { return !acceptedThisCycle; }
+  bool canAccept() const override { return acceptedThisCycle < maxPorts; }
   bool hasResponse() const override { return !responseQueue.empty(); }
   const MemResponse &frontResponse() const override { return responseQueue.front(); }
-  void popResponse() override { responseQueue.pop_front(); }
+  void popResponse() override { responseQueue.popFront(); }
 
   void access(const MemRequest &req) override {
-    acceptedThisCycle = true;
+    acceptedThisCycle++;
 
     // Latency 1 completes immediately in the same cycle; higher latencies
     // release responses on future ticks.
     if (latency == 1) {
-      perform(req, responseQueue.emplace_back());
+      perform(req, responseQueue.emplaceBack());
     } else {
-      PendingTransaction &txn = inFlight.emplace_back();
+      PendingTransaction &txn = inFlight.emplaceBack();
       txn.readyAt = tickCount + latency - 1;
       perform(req, txn.response);
     }
@@ -131,11 +233,11 @@ public:
 
   void tick() override {
     tickCount++;
-    acceptedThisCycle = false;
+    acceptedThisCycle = 0;
 
     while (!inFlight.empty() && inFlight.front().readyAt <= tickCount) {
-      responseQueue.push_back(inFlight.front().response);
-      inFlight.pop_front();
+      copyMemResponse(responseQueue.emplaceBack(), inFlight.front().response);
+      inFlight.popFront();
     }
   }
 
@@ -150,6 +252,7 @@ private:
     response.tag = req.tag;
 
     if (req.size <= 4) {
+      response.hasLine = false;
       if (req.isWrite)
         backing.store(req.addr, req.size, req.writeData);
       else
@@ -158,6 +261,7 @@ private:
     }
 
     backing.check(req.addr, req.size, req.isWrite ? "store" : "load");
+    response.hasLine = !req.isWrite;
 
     if (req.isWrite)
       memcpy(backing.bytes.data() + req.addr, req.writeLine.data(), req.size);
@@ -167,8 +271,9 @@ private:
 
   Memory &backing;
   uint32_t latency;
+  uint32_t maxPorts;
   uint64_t tickCount = 0;
-  bool acceptedThisCycle = false;
-  std::deque<PendingTransaction> inFlight;
-  std::deque<MemResponse> responseQueue;
+  uint32_t acceptedThisCycle = 0;
+  FastQueue<PendingTransaction> inFlight;
+  FastQueue<MemResponse> responseQueue;
 };

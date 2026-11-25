@@ -124,11 +124,11 @@ void present(uint32_t descriptorAddr, size_t memoryBytes, ReadByte readByte,
   if (frameFd < 0)
     fail("frame syscall requires --frame-fd and --key-fd");
 
-  std::vector<uint8_t> packet(12);
+  std::vector<uint8_t> packet(12 + pixelBytes);
   writeLittleEndian(packet.data(), 4, RV_FRAME_MAGIC);
   writeLittleEndian(packet.data() + 4, 4, width);
   writeLittleEndian(packet.data() + 8, 4, height);
-  packet.reserve(12 + pixelBytes);
+  uint8_t *dst = packet.data() + 12;
 
   if (isIndexed) {
     uint8_t palette[256 * 4];
@@ -137,11 +137,11 @@ void present(uint32_t descriptorAddr, size_t memoryBytes, ReadByte readByte,
 
     for (size_t i = 0; i < pixelCount; i++) {
       const uint8_t *colorEntry = palette + 4 * readByte(pixelAddr + uint32_t(i));
-      packet.insert(packet.end(), colorEntry, colorEntry + 4);
+      memcpy(dst + i * 4, colorEntry, 4);
     }
   } else {
     for (size_t i = 0; i < pixelBytes; i++)
-      packet.push_back(readByte(pixelAddr + uint32_t(i)));
+      dst[i] = readByte(pixelAddr + uint32_t(i));
   }
 
   size_t bytesSent = 0;

@@ -13,10 +13,10 @@ constexpr uint8_t kNoReg = 0xFF;
 // In-flight operation carrying pre-computed execute() outputs through unit latency.
 struct FuOp {
   uint64_t seq = 0;
-  uint32_t robIdx = 0;
   uint32_t value = 0;
-  uint32_t lsqIdx = 0;
   uint32_t target = 0;
+  uint16_t robIdx = 0;
+  uint16_t lsqIdx = 0;
   uint8_t destPhysReg = kNoReg;
   bool valid = false;
   bool redirect = false;
@@ -37,26 +37,32 @@ struct FuUnit {
 
   FuUnit(const char *name, uint32_t latency, bool pipelined)
       : name(name), latency(latency), pipelined(pipelined) {
-    if (pipelined)
+    // Single-cycle pipelined units reuse `currentOp` inline to avoid heap chasing.
+    if (pipelined && latency > 1)
       stages.resize(latency);
   }
 
-  bool busy() const { return pipelined ? inFlight != 0 : currentOp.valid; }
+  bool busy() const {
+    return (pipelined && latency > 1) ? inFlight != 0 : currentOp.valid;
+  }
 
   bool canAccept() const {
-    return pipelined ? !stages[inputSlot].valid
-                     : (!currentOp.valid && !output.valid);
+    if (!pipelined)
+      return !currentOp.valid && !output.valid;
+    return latency == 1 ? !currentOp.valid : !stages[inputSlot].valid;
   }
 
   void accept(const FuOp &op) {
     opCount++;
 
-    if (pipelined) {
-      stages[inputSlot] = op;
-      inFlight++;
-    } else {
+    if (!pipelined) {
       currentOp = op;
       remaining = latency;
+    } else if (latency == 1) {
+      currentOp = op;
+    } else {
+      stages[inputSlot] = op;
+      inFlight++;
     }
   }
 
@@ -71,6 +77,12 @@ struct FuUnit {
       // Stall pipeline advance while writeback has not consumed `output`.
       if (output.valid)
         return false;
+
+      if (latency == 1) {
+        output = currentOp;
+        currentOp.valid = false;
+        return true;
+      }
 
       // Rotating ring index avoids shifting the stages vector every cycle.
       inputSlot = inputSlot ? inputSlot - 1 : latency - 1;

@@ -28,19 +28,25 @@ Cache::Cache(const char *name, const CacheConfig &config, MemPort *lowerLevel,
 }
 
 int Cache::findWay(uint32_t set, uint32_t tag) const {
-  for (uint32_t way = 0; way < config.ways; way++) {
-    if (tags[set * config.ways + way] == tag)
+  const uint32_t ways = config.ways;
+  const uint32_t *setTags = tags.data() + set * ways;
+
+  for (uint32_t way = 0; way < ways; way++) {
+    if (setTags[way] == tag)
       return (int)way;
   }
+
   return -1;
 }
 
 uint32_t Cache::victimWay(uint32_t set) const {
+  const uint32_t ways = config.ways;
+  const uint32_t base = set * ways;
   uint32_t victim = 0;
   uint64_t oldest = UINT64_MAX;
 
-  for (uint32_t way = 0; way < config.ways; way++) {
-    const uint32_t lineIndex = set * config.ways + way;
+  for (uint32_t way = 0; way < ways; way++) {
+    const uint32_t lineIndex = base + way;
     if (tags[lineIndex] == kInvalidTag)
       return way;
 
@@ -73,34 +79,37 @@ bool Cache::mergeIntoMshr(uint32_t lineAddr, const MemRequest &req) {
 
 void Cache::performOnLine(const MemRequest &req, uint32_t set, uint32_t way,
                           MemResponse &response) {
-  uint8_t *line = lineData(set, way);
+  const uint32_t lineIndex = set * config.ways + way;
+  uint8_t *line = data.data() + (size_t)lineIndex * config.lineBytes;
   const uint32_t offset = offsetOf(req.addr);
   response.src = req.src;
   response.tag = req.tag;
 
   if (req.isWrite) {
+    response.hasLine = false;
     if (req.size == config.lineBytes)
       memcpy(line, req.writeLine.data(), config.lineBytes);
     else
       writeLittleEndian(line + offset, req.size, req.writeData);
 
-    dirty[set * config.ways + way] = 1;
+    dirty[lineIndex] = 1;
+  } else if (req.size > 4) {
+    response.hasLine = true;
+    memcpy(response.readLine.data(), line + offset, req.size);
   } else {
-    if (req.size > 4)
-      memcpy(response.readLine.data(), line + offset, req.size);
-    else
-      response.readData = readLittleEndian(line + offset, req.size);
+    response.hasLine = false;
+    response.readData = readLittleEndian(line + offset, req.size);
   }
 
-  lru[set * config.ways + way] = ++lruTick;
+  lru[lineIndex] = ++lruTick;
 }
 
 MemResponse &Cache::reserveHit() {
   stats.latencySum += config.hitLatency;
   if (config.hitLatency == 1)
-    return responseQueue.emplace_back();
+    return responseQueue.emplaceBack();
 
-  PendingHit &hit = hitPipeline.emplace_back();
+  PendingHit &hit = hitPipeline.emplaceBack();
   hit.readyAt = tickCount + config.hitLatency - 1;
   return hit.response;
 }
@@ -118,9 +127,9 @@ bool Cache::installLine(uint32_t lineAddr, const uint8_t *srcData, bool isDirty,
       return false;
 
     stats.dirtyEvictions++;
-    WritebackEntry writeback{lineAddrOf(outSet, outWay), {}};
+    WritebackEntry &writeback = writebackQueue.emplaceBack();
+    writeback.addr = lineAddrOf(outSet, outWay);
     memcpy(writeback.line.data(), lineData(outSet, outWay), config.lineBytes);
-    writebackQueue.push_back(std::move(writeback));
   }
 
   memcpy(lineData(outSet, outWay), srcData, config.lineBytes);
@@ -129,10 +138,99 @@ bool Cache::installLine(uint32_t lineAddr, const uint8_t *srcData, bool isDirty,
   return true;
 }
 
+bool Cache::tryAccessWordImmediate(uint32_t addr, uint32_t size, bool isWrite,
+                                   uint32_t writeData, uint32_t &outReadData) {
+  if (config.hitLatency != 1)
+    return false;
+
+  const uint32_t set = setOf(addr);
+  const int way = findWay(set, tagOf(addr));
+  if (way < 0)
+    return false;
+
+  stats.accesses++;
+  stats.hits++;
+  stats.latencySum++;
+  if (pendingMisses)
+    stats.hitUnderMiss++;
+
+  const uint32_t lineIndex = set * config.ways + (uint32_t)way;
+  uint8_t *line = data.data() + (size_t)lineIndex * config.lineBytes;
+  const uint32_t offset = offsetOf(addr);
+
+  if (isWrite) {
+    writeLittleEndian(line + offset, size, writeData);
+    dirty[lineIndex] = 1;
+  } else {
+    outReadData = readLittleEndian(line + offset, size);
+  }
+
+  lru[lineIndex] = ++lruTick;
+  return true;
+}
+
+const uint8_t *Cache::tryFetchLineImmediate(uint32_t addr) {
+  if (config.hitLatency != 1)
+    return nullptr;
+
+  const uint32_t set = setOf(addr);
+  const int way = findWay(set, tagOf(addr));
+  if (way < 0)
+    return nullptr;
+
+  stats.accesses++;
+  stats.hits++;
+  stats.latencySum++;
+  if (pendingMisses)
+    stats.hitUnderMiss++;
+
+  const uint32_t lineIndex = set * config.ways + (uint32_t)way;
+  lru[lineIndex] = ++lruTick;
+  return data.data() + (size_t)lineIndex * config.lineBytes + offsetOf(addr);
+}
+
+void Cache::accessWord(uint32_t addr, uint32_t size, bool isWrite,
+                       uint32_t writeData, uint64_t tag) {
+  const uint32_t set = setOf(addr);
+  const int way = findWay(set, tagOf(addr));
+
+  if (way >= 0) {
+    stats.accesses++;
+    stats.hits++;
+    if (pendingMisses)
+      stats.hitUnderMiss++;
+
+    const uint32_t lineIndex = set * config.ways + (uint32_t)way;
+    uint8_t *line = data.data() + (size_t)lineIndex * config.lineBytes;
+    const uint32_t offset = offsetOf(addr);
+    MemResponse &response = reserveHit();
+    response.src = 0;
+    response.tag = tag;
+    response.hasLine = false;
+
+    if (isWrite) {
+      writeLittleEndian(line + offset, size, writeData);
+      dirty[lineIndex] = 1;
+    } else {
+      response.readData = readLittleEndian(line + offset, size);
+    }
+
+    lru[lineIndex] = ++lruTick;
+    return;
+  }
+
+  MemRequest req;
+  req.addr = addr;
+  req.size = size;
+  req.isWrite = isWrite;
+  req.writeData = writeData;
+  req.tag = tag;
+  access(req);
+}
+
 void Cache::access(const MemRequest &req) {
   stats.accesses++;
 
-  const uint32_t lineAddr = req.addr - offsetOf(req.addr);
   const uint32_t set = setOf(req.addr);
   const int way = findWay(set, tagOf(req.addr));
 
@@ -145,12 +243,14 @@ void Cache::access(const MemRequest &req) {
     return;
   }
 
+  const uint32_t lineAddr = req.addr - offsetOf(req.addr);
+
   // Restore a dirty victim still waiting in the writeback queue before it drains.
   for (size_t i = 0; i < writebackQueue.size(); i++) {
     if (writebackQueue[i].addr == lineAddr) {
       uint32_t installedSet = 0, installedWay = 0;
       installLine(lineAddr, writebackQueue[i].line.data(), true, installedSet, installedWay);
-      writebackQueue.erase(writebackQueue.begin() + i);
+      writebackQueue.eraseAt(i);
       stats.hits++;
       performOnLine(req, installedSet, installedWay, reserveHit());
       return;
@@ -158,7 +258,7 @@ void Cache::access(const MemRequest &req) {
   }
 
   stats.misses++;
-  if (mergeIntoMshr(lineAddr, req))
+  if (pendingMisses && mergeIntoMshr(lineAddr, req))
     return;
 
   // Full-line writebacks from an upper level overwrite the entire line and
@@ -170,6 +270,7 @@ void Cache::access(const MemRequest &req) {
     MemResponse &ack = reserveHit();
     ack.src = req.src;
     ack.tag = req.tag;
+    ack.hasLine = false;
     return;
   }
 
@@ -195,7 +296,7 @@ bool Cache::tryInstall(uint32_t mshrIndex, const Line &line) {
   // Replay all merged waiting requests in arrival order against the new line.
   for (WaitingRequest &waiter : mshr.waiting) {
     stats.latencySum += tickCount - waiter.issueTick + 1;
-    performOnLine(waiter.req, installedSet, installedWay, responseQueue.emplace_back());
+    performOnLine(waiter.req, installedSet, installedWay, responseQueue.emplaceBack());
   }
 
   mshr.waiting.clear();
@@ -210,21 +311,29 @@ void Cache::deliverBelowResponse(const MemResponse &response) {
   if (response.tag == kWritebackTag)
     return;
 
-  if (!tryInstall((uint32_t)response.tag, response.readLine))
-    pendingInstalls.push_back(PendingInstall{(uint32_t)response.tag, response.readLine});
+  if (!tryInstall((uint32_t)response.tag, response.readLine)) {
+    PendingInstall &slot = pendingInstalls.emplaceBack();
+    slot.mshrIndex = (uint32_t)response.tag;
+    slot.line = response.readLine;
+  }
 }
 
 void Cache::tick() {
   tickCount++;
 
+  if (hitPipeline.empty() && pendingInstalls.empty() &&
+      pendingMisses == 0 && writebackQueue.empty()) {
+    return;
+  }
+
   while (!hitPipeline.empty() && hitPipeline.front().readyAt <= tickCount) {
-    responseQueue.push_back(hitPipeline.front().response);
-    hitPipeline.pop_front();
+    copyMemResponse(responseQueue.emplaceBack(), hitPipeline.front().response);
+    hitPipeline.popFront();
   }
 
   while (!pendingInstalls.empty() &&
          tryInstall(pendingInstalls.front().mshrIndex, pendingInstalls.front().line)) {
-    pendingInstalls.pop_front();
+    pendingInstalls.popFront();
   }
 
   // Arbitrate the lower-level port: prioritize writebacks when the WBQ is full
@@ -233,10 +342,12 @@ void Cache::tick() {
     const bool prioritizeWriteback = writebackQueue.size() >= config.wbq;
     int refillIndex = -1;
 
-    for (size_t i = 0; i < mshrs.size(); i++) {
-      if (mshrs[i].valid && !mshrs[i].refillSent) {
-        refillIndex = (int)i;
-        break;
+    if (pendingMisses) {
+      for (size_t i = 0; i < mshrs.size(); i++) {
+        if (mshrs[i].valid && !mshrs[i].refillSent) {
+          refillIndex = (int)i;
+          break;
+        }
       }
     }
 
@@ -249,7 +360,7 @@ void Cache::tick() {
       writebackReq.src = srcId;
       writebackReq.tag = kWritebackTag;
 
-      writebackQueue.pop_front();
+      writebackQueue.popFront();
       lowerLevel->access(writebackReq);
     } else if (refillIndex >= 0) {
       MemRequest refillReq;
@@ -271,7 +382,8 @@ bool Cache::peek8(uint32_t addr, uint8_t &outByte) const {
     return true;
   }
 
-  for (const WritebackEntry &entry : writebackQueue) {
+  for (size_t i = 0; i < writebackQueue.size(); i++) {
+    const WritebackEntry &entry = writebackQueue[i];
     if (addr >= entry.addr && addr < entry.addr + config.lineBytes) {
       outByte = entry.line[addr - entry.addr];
       return true;

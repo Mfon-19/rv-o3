@@ -4,7 +4,6 @@
 #pragma once
 
 #include <cstdint>
-#include <deque>
 #include <vector>
 
 #include "memory/memory.h"
@@ -20,7 +19,7 @@ struct CacheStats {
   uint64_t latencySum = 0;
 };
 
-class Cache : public MemPort {
+class Cache final : public MemPort {
 public:
   Cache(const char *name, const CacheConfig &config, MemPort *lowerLevel,
         uint8_t srcId);
@@ -31,9 +30,18 @@ public:
   }
 
   void access(const MemRequest &req) override;
+
+  // Fast scalar L1D access avoiding 128-byte MemRequest line setup on hits.
+  void accessWord(uint32_t addr, uint32_t size, bool isWrite, uint32_t writeData,
+                  uint64_t tag);
+
+  // Single-cycle direct hit fast paths bypassing responseQueue on L1D/L1I hits.
+  bool tryAccessWordImmediate(uint32_t addr, uint32_t size, bool isWrite,
+                              uint32_t writeData, uint32_t &outReadData);
+  const uint8_t *tryFetchLineImmediate(uint32_t addr);
   bool hasResponse() const override { return !responseQueue.empty(); }
   const MemResponse &frontResponse() const override { return responseQueue.front(); }
-  void popResponse() override { responseQueue.pop_front(); }
+  void popResponse() override { responseQueue.popFront(); }
   void tick() override;
 
   // Delivers a line refill returned by the lower memory level.
@@ -115,9 +123,9 @@ private:
 
   std::vector<Mshr> mshrs;
   uint32_t pendingMisses = 0;
-  std::deque<WritebackEntry> writebackQueue;
-  std::deque<PendingInstall> pendingInstalls;
-  std::deque<PendingHit> hitPipeline;
-  std::deque<MemResponse> responseQueue;
+  FastQueue<WritebackEntry> writebackQueue;
+  FastQueue<PendingInstall> pendingInstalls;
+  FastQueue<PendingHit> hitPipeline;
+  FastQueue<MemResponse> responseQueue;
   uint64_t tickCount = 0;
 };

@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <vector>
@@ -90,6 +91,16 @@ public:
   std::function<void(const CommitRecord &)> onCommit;
 
 private:
+  static constexpr uint32_t kDecodeCacheSize = 4096;
+  static constexpr uint32_t kMaxWbReady = 256;
+
+  struct DecodedEntry {
+    Instr instr;
+    FuKind unit = FuKind::NONE;
+    uint8_t flags = 0; // bit0=writesRd, bit1=usesRs1, bit2=usesRs2, bit3=isStore
+    uint8_t memSize = 4;
+  };
+
   struct FetchedInstr {
     uint32_t pc = 0;
     uint32_t raw = 0;
@@ -99,18 +110,21 @@ private:
     Predictor::Checkpoint predCheckpoint;
   };
 
+  const DecodedEntry &decodeCached(uint32_t instrPc, uint32_t raw);
   void commitStage();
   void writebackStage();
   void recover(uint64_t keepSeq);
   void aguDrain();
   void violationScan(const LsqEntry &store);
+  void reportLoad(uint32_t lsqSlot, LsqEntry &entry);
   void drainDataResponses();
   void lsqOperate();
-  FuUnit *acquireUnit(FuKind kind, size_t &nextAlu, size_t &nextAgu);
+  [[gnu::always_inline]] bool tryIssueEntry(const IqEntry &entry,
+                                            size_t &nextAlu, size_t &nextBranch);
   void issueStage();
   void dispatchStage();
   void fetchStage();
-  void processFetch(const MemResponse &response);
+  void processFetch(const uint8_t *blockData);
   void stepCycle();
   void printStats() const;
 
@@ -118,6 +132,9 @@ private:
   MemorySystem &memSystem;
   MemPort *imem = nullptr;
   MemPort *dmem = nullptr;
+  Cache *l1iCache = nullptr;
+  Cache *l1dCache = nullptr;
+  const bool flatFastPath;
 
   RenameMap renameMap;
   FreeList freeList;
@@ -128,16 +145,43 @@ private:
   StoreBuffer storeBuffer;
   Predictor predictor;
 
+  struct PendingAgu {
+    uint64_t seq = 0;
+    uint32_t addr = 0;
+    uint16_t robIdx = 0;
+    uint16_t lsqIdx = 0;
+  };
+
   std::vector<FuUnit> alus;
-  FuUnit branchUnit;
+  std::vector<FuUnit> branchUnits;
   FuUnit mulUnit;
   FuUnit divUnit;
-  std::vector<FuUnit> agus;
   std::vector<FuUnit *> execUnits;
+  uint32_t branchExecBegin = 0;
+  uint32_t branchExecEnd = 0;
+  uint32_t mulExecIdx = 0;
+  uint32_t divExecIdx = 0;
+  uint64_t activeExecMask = 0;
 
-  std::vector<FuOp *> wbReady;
+  std::array<PendingAgu, 16> pendingAgu{};
+  uint32_t pendingAguCount = 0;
+
+  std::array<FuOp *, kMaxWbReady> wbReady{};
+  uint32_t wbReadyCount = 0;
+  uint32_t wbBranchCount = 0;
   std::vector<FuOp> loadOutputs;
   uint32_t storeBufferTxnCounter = 0;
+
+  // Incremental LSQ state counters used to skip unnecessary per-cycle scans.
+  uint32_t lsqUnknownStores = 0;
+  uint32_t lsqStoresWaitingData = 0;
+  uint32_t lsqReadyLoads = 0;
+  uint32_t lsqSpecIssuedLoads = 0;
+  const bool lsqUseWaitMask;
+  std::array<uint64_t, 256> storeDataWaitMask{};
+
+  // Direct-mapped PC-indexed decode cache verified against raw word on hit.
+  std::array<DecodedEntry, kDecodeCacheSize> decodeCache{};
 
   uint32_t pc = 0;
   const uint32_t fetchBlockBytes;

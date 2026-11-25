@@ -2,7 +2,7 @@
 
 The Doom engine, game logic, and software renderer run as RV32IM instructions on `rvsim`'s cycle-level out-of-order core, streaming finished frames to a native SDL3 window (`doom-viewer`). Because the full game executes on the simulated CPU, host simulation speed determines the frame rate.
 
-By default, `doom/run.py` launches `rvsim` with [configs/doom.cfg](../configs/doom.cfg): an 8-wide core with a 128-entry ROB, dual AGUs and data ports, 64-byte fetch, an 8-table TAGE branch predictor with RAS repair, a 4-way BTB, and a 1 MiB L2 cache. Pass `--config default` to run on the built-in 2-wide core instead.
+By default, `doom/run.py` launches `rvsim` with [configs/doom.cfg](../configs/doom.cfg): a high-FPS 4-wide out-of-order core tuned for maximum host frame rate (flat 1-cycle multi-port memory, compact queues, dual branch/AGU/data ports, 8192-entry BTB + 16-bit gshare, and bypass memory ordering). Pass `--config default` to run on the built-in 2-wide cached core instead. For even higher FPS, build `rvsim` with `make pgo`.
 
 Three guest-side optimizations reduce simulated instruction count without changing rendered output:
 

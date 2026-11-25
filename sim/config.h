@@ -36,6 +36,7 @@ struct SimConfig {
   CacheConfig l2{256 * 1024, 8, 64, 4, 4, 4};
 
   uint32_t aluCount = 2;
+  uint32_t branchCount = 1;
   uint32_t aguCount = 1;
   uint32_t dataPorts = 1;
   uint32_t mulLatency = 3;

@@ -101,5 +101,80 @@ extern const char *const kRegName[32];
 
 void dumpRegisters(const uint32_t regs[32], uint32_t pc);
 Instr decode(uint32_t word);
-ExecResult execute(const Instr &instr, uint32_t pc, uint32_t src1, uint32_t src2);
 std::string disasm(const Instr &instr);
+
+inline ExecResult execute(const Instr &instr, uint32_t pc, uint32_t src1, uint32_t src2) {
+  ExecResult result;
+  const int32_t signedSrc1 = (int32_t)src1;
+  const int32_t signedSrc2 = (int32_t)src2;
+  const uint32_t imm = (uint32_t)instr.imm;
+
+  switch (instr.op) {
+  case Op::LUI:    result.value = imm; break;
+  case Op::AUIPC:  result.value = pc + imm; break;
+  case Op::JAL:    result = {pc + 4, true, pc + imm}; break;
+  case Op::JALR:   result = {pc + 4, true, (src1 + imm) & ~1u}; break;
+
+  case Op::BEQ:    if (src1 == src2) { result.redirect = true; result.target = pc + imm; } break;
+  case Op::BNE:    if (src1 != src2) { result.redirect = true; result.target = pc + imm; } break;
+  case Op::BLT:    if (signedSrc1 < signedSrc2) { result.redirect = true; result.target = pc + imm; } break;
+  case Op::BGE:    if (signedSrc1 >= signedSrc2) { result.redirect = true; result.target = pc + imm; } break;
+  case Op::BLTU:   if (src1 < src2) { result.redirect = true; result.target = pc + imm; } break;
+  case Op::BGEU:   if (src1 >= src2) { result.redirect = true; result.target = pc + imm; } break;
+
+  // Loads and stores compute their effective address using rs1 + imm.
+  case Op::LB: case Op::LH: case Op::LW: case Op::LBU: case Op::LHU:
+  case Op::SB: case Op::SH: case Op::SW: case Op::ADDI:
+    result.value = src1 + imm;
+    break;
+
+  case Op::SLTI:   result.value = signedSrc1 < (int32_t)imm; break;
+  case Op::SLTIU:  result.value = src1 < imm; break;
+  case Op::XORI:   result.value = src1 ^ imm; break;
+  case Op::ORI:    result.value = src1 | imm; break;
+  case Op::ANDI:   result.value = src1 & imm; break;
+  case Op::SLLI:   result.value = src1 << (imm & 31); break;
+  case Op::SRLI:   result.value = src1 >> (imm & 31); break;
+  case Op::SRAI:   result.value = (uint32_t)(signedSrc1 >> (imm & 31)); break;
+
+  case Op::ADD:    result.value = src1 + src2; break;
+  case Op::SUB:    result.value = src1 - src2; break;
+  case Op::SLL:    result.value = src1 << (src2 & 31); break;
+  case Op::SLT:    result.value = signedSrc1 < signedSrc2; break;
+  case Op::SLTU:   result.value = src1 < src2; break;
+  case Op::XOR:    result.value = src1 ^ src2; break;
+  case Op::SRL:    result.value = src1 >> (src2 & 31); break;
+  case Op::SRA:    result.value = (uint32_t)(signedSrc1 >> (src2 & 31)); break;
+  case Op::OR:     result.value = src1 | src2; break;
+  case Op::AND:    result.value = src1 & src2; break;
+
+  case Op::MUL:    result.value = src1 * src2; break;
+  case Op::MULH:   result.value = (uint32_t)(((int64_t)signedSrc1 * (int64_t)signedSrc2) >> 32); break;
+  case Op::MULHSU: result.value = (uint32_t)(((int64_t)signedSrc1 * (int64_t)(uint64_t)src2) >> 32); break;
+  case Op::MULHU:  result.value = (uint32_t)(((uint64_t)src1 * (uint64_t)src2) >> 32); break;
+
+  // RISC-V M-extension defines explicit results for divide-by-zero and
+  // INT32_MIN / -1 instead of trapping.
+  case Op::DIV:
+    if (src2 == 0) result.value = 0xFFFFFFFFu;
+    else if (src1 == 0x80000000u && signedSrc2 == -1) result.value = src1;
+    else result.value = (uint32_t)(signedSrc1 / signedSrc2);
+    break;
+  case Op::DIVU:
+    result.value = (src2 == 0) ? 0xFFFFFFFFu : src1 / src2;
+    break;
+  case Op::REM:
+    if (src2 == 0) result.value = src1;
+    else if (src1 == 0x80000000u && signedSrc2 == -1) result.value = 0;
+    else result.value = (uint32_t)(signedSrc1 % signedSrc2);
+    break;
+  case Op::REMU:
+    result.value = (src2 == 0) ? src1 : src1 % src2;
+    break;
+
+  case Op::FENCE: case Op::ECALL: case Op::EBREAK: case Op::ILLEGAL:
+    break;
+  }
+
+  return result;
+}

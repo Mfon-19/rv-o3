@@ -3,22 +3,23 @@
 
 #include "core/predictor.h"
 
+#include <bit>
 #include <cmath>
 
 // Updates a cyclic XOR-folded history register when shifting `bitIn` in and
-// evicting `bitOut` after `length` bits.
+// evicting `bitOut` using a precomputed `length % width` shift amount.
 static inline uint16_t foldHistory(uint16_t compressed, uint32_t bitIn,
-                                   uint32_t bitOut, uint32_t length,
-                                   uint32_t width) {
+                                   uint32_t bitOut, uint32_t evictShift,
+                                   uint32_t width, uint32_t mask) {
   uint32_t value = ((uint32_t)compressed << 1) ^ bitIn;
-  value ^= bitOut << (length % width);
+  value ^= bitOut << evictShift;
   value ^= value >> width;
-  return (uint16_t)(value & ((1u << width) - 1));
+  return (uint16_t)(value & mask);
 }
 
 template <class T>
-static void updateSaturatingCounter(T &counter, bool increment, int minVal,
-                                    int maxVal) {
+static inline void updateSaturatingCounter(T &counter, bool increment, int minVal,
+                                           int maxVal) {
   if (increment && counter < maxVal)
     counter++;
   else if (!increment && counter > minVal)
@@ -28,26 +29,41 @@ static void updateSaturatingCounter(T &counter, bool increment, int minVal,
 Predictor::Predictor(const SimConfig &config)
     : rasRepair(config.rasRepair),
       pht(1u << config.phtBits, 1),
+      phtMask((1u << config.phtBits) - 1),
       ghrMask(config.ghrBits ? (1u << config.ghrBits) - 1 : 0),
       btb(config.btbEntries),
       btbWays(config.btbWays),
       btbSets(config.btbEntries / config.btbWays),
+      btbSetMask(btbSets - 1),
+      btbPow2(std::has_single_bit(btbSets)),
       ras(config.rasEntries),
+      rasMask(config.rasEntries - 1),
+      rasPow2(std::has_single_bit(config.rasEntries)),
       numTables(config.tageTables),
       tableBits(config.tageTableBits),
-      tagBits(config.tageTagBits) {
+      tagBits(config.tageTagBits),
+      tableMask((1u << config.tageTableBits) - 1),
+      tagMask((1u << config.tageTagBits) - 1),
+      tagMaskAlt((1u << (config.tageTagBits - 1)) - 1) {
   if (!numTables)
     return;
 
-  // Build geometric history lengths from tageMinHist up to tageMaxHist.
+  // Build geometric history lengths from tageMinHist up to tageMaxHist and
+  // precompute modulo shift amounts to avoid divisions on hot paths.
   for (uint32_t i = 0; i < numTables; i++) {
     const double fraction = numTables > 1 ? double(i) / (numTables - 1) : 1.0;
     const double ratio = double(config.tageMaxHist) / config.tageMinHist;
-    historyLengths.push_back(
-        (uint32_t)std::lround(config.tageMinHist * std::pow(ratio, fraction)));
+    const uint32_t histLen =
+        (uint32_t)std::lround(config.tageMinHist * std::pow(ratio, fraction));
+
+    historyLengths.push_back(histLen);
+    histModTable.push_back((uint8_t)(histLen % tableBits));
+    histModTag1.push_back((uint8_t)(histLen % tagBits));
+    histModTag2.push_back((uint8_t)(histLen % (tagBits - 1)));
+    pcShift.push_back((uint8_t)(tableBits - (i % tableBits)));
   }
 
-  tables.assign(numTables, std::vector<TageEntry>(1u << tableBits));
+  tageTables.assign((size_t)numTables << tableBits, TageEntry{});
 
   // Size the history ring so in-flight checkpoints never overwrite live entries.
   uint32_t ringSize = 64;
@@ -74,11 +90,18 @@ Predictor::Kind Predictor::kindOf(const Instr &instr) {
 }
 
 uint32_t Predictor::phtIndexFor(uint32_t pc) const {
-  return ((pc >> 2) ^ (numTables ? 0 : ghr)) & (uint32_t)(pht.size() - 1);
+  return ((pc >> 2) ^ (numTables ? 0 : ghr)) & phtMask;
 }
 
 Predictor::BtbEntry *Predictor::btbFind(uint32_t pc) {
-  BtbEntry *set = &btb[(size_t)((pc >> 2) % btbSets) * btbWays];
+  const uint32_t setIdx = btbSetIndex(pc);
+
+  if (btbWays == 1) {
+    BtbEntry &entry = btb[setIdx];
+    return (entry.valid && entry.pc == pc) ? &entry : nullptr;
+  }
+
+  BtbEntry *set = &btb[(size_t)setIdx * btbWays];
 
   for (uint32_t way = 0; way < btbWays; way++) {
     if (set[way].valid && set[way].pc == pc) {
@@ -92,7 +115,7 @@ Predictor::BtbEntry *Predictor::btbFind(uint32_t pc) {
 
 void Predictor::pushHistory(bool taken) {
   if (!numTables) {
-    ghr = ((ghr << 1) | (taken ? 1 : 0)) & ghrMask;
+    ghr = ((ghr << 1) | (taken ? 1u : 0u)) & ghrMask;
     return;
   }
 
@@ -107,34 +130,29 @@ void Predictor::pushHistory(bool taken) {
     const uint32_t bitOut = historyBits[(historyPos - historyLengths[i]) & ringMask];
 
     nextFolds[3 * i] = foldHistory(prevFolds[3 * i], taken, bitOut,
-                                   historyLengths[i], tableBits);
+                                   histModTable[i], tableBits, tableMask);
     nextFolds[3 * i + 1] = foldHistory(prevFolds[3 * i + 1], taken, bitOut,
-                                       historyLengths[i], tagBits);
+                                       histModTag1[i], tagBits, tagMask);
     nextFolds[3 * i + 2] = foldHistory(prevFolds[3 * i + 2], taken, bitOut,
-                                       historyLengths[i], tagBits - 1);
+                                       histModTag2[i], tagBits - 1, tagMaskAlt);
   }
 }
 
 Predictor::TageLookup Predictor::tageLookup(uint32_t pc, uint32_t pos) {
   const uint16_t *folds = foldsAt(pos);
   const uint32_t wordPc = pc >> 2;
-  const uint32_t idxMask = (1u << tableBits) - 1;
-  const uint32_t tagMask = (1u << tagBits) - 1;
 
   for (uint32_t i = 0; i < numTables; i++) {
-    tableIndices[i] =
-        (wordPc ^ (wordPc >> (tableBits - i % tableBits)) ^ folds[3 * i]) &
-        idxMask;
+    tableIndices[i] = (wordPc ^ (wordPc >> pcShift[i]) ^ folds[3 * i]) & tableMask;
     tableTags[i] =
-        (wordPc ^ folds[3 * i + 1] ^ ((uint32_t)folds[3 * i + 2] << 1)) &
-        tagMask;
+        (wordPc ^ folds[3 * i + 1] ^ ((uint32_t)folds[3 * i + 2] << 1)) & tagMask;
   }
 
   TageLookup lookup;
 
   // Select the longest-history matching table as provider and the next longest as alt.
   for (int i = (int)numTables - 1; i >= 0; i--) {
-    if (tables[i][tableIndices[i]].tag == tableTags[i]) {
+    if (tageEntry((uint32_t)i, tableIndices[i]).tag == tableTags[i]) {
       if (lookup.provider < 0) {
         lookup.provider = i;
       } else {
@@ -144,10 +162,11 @@ Predictor::TageLookup Predictor::tageLookup(uint32_t pc, uint32_t pos) {
     }
   }
 
-  const bool basePred = pht[wordPc & (pht.size() - 1)] >= 2;
-  lookup.altPred = lookup.alt >= 0
-                       ? tables[lookup.alt][tableIndices[lookup.alt]].counter >= 0
-                       : basePred;
+  const bool basePred = pht[wordPc & phtMask] >= 2;
+  lookup.altPred =
+      lookup.alt >= 0
+          ? tageEntry((uint32_t)lookup.alt, tableIndices[lookup.alt]).counter >= 0
+          : basePred;
 
   if (lookup.provider < 0) {
     lookup.pred = basePred;
@@ -156,7 +175,7 @@ Predictor::TageLookup Predictor::tageLookup(uint32_t pc, uint32_t pos) {
   }
 
   const int8_t counter =
-      tables[lookup.provider][tableIndices[lookup.provider]].counter;
+      tageEntry((uint32_t)lookup.provider, tableIndices[lookup.provider]).counter;
   lookup.providerPred = counter >= 0;
   lookup.weak = counter == 0 || counter == -1;
   lookup.pred = lookup.weak && useAltOnWeak >= 0 ? lookup.altPred
@@ -167,10 +186,10 @@ Predictor::TageLookup Predictor::tageLookup(uint32_t pc, uint32_t pos) {
 
 void Predictor::tageUpdate(uint32_t pc, bool taken, uint32_t pos) {
   const TageLookup lookup = tageLookup(pc, pos);
-  uint8_t &baseCounter = pht[(pc >> 2) & (pht.size() - 1)];
+  uint8_t &baseCounter = pht[(pc >> 2) & phtMask];
 
   if (lookup.provider >= 0) {
-    TageEntry &entry = tables[lookup.provider][tableIndices[lookup.provider]];
+    TageEntry &entry = tageEntry((uint32_t)lookup.provider, tableIndices[lookup.provider]);
 
     if (lookup.weak && lookup.providerPred != lookup.altPred)
       updateSaturatingCounter(useAltOnWeak, lookup.altPred == taken, -8, 7);
@@ -195,7 +214,7 @@ void Predictor::tageUpdate(uint32_t pc, bool taken, uint32_t pos) {
     int secondFree = -1;
 
     for (uint32_t t = (uint32_t)(lookup.provider + 1); t < numTables; t++) {
-      if (tables[t][tableIndices[t]].useful == 0) {
+      if (tageEntry(t, tableIndices[t]).useful == 0) {
         if (firstFree < 0) {
           firstFree = (int)t;
         } else {
@@ -207,13 +226,14 @@ void Predictor::tageUpdate(uint32_t pc, bool taken, uint32_t pos) {
 
     if (firstFree < 0) {
       for (uint32_t t = (uint32_t)(lookup.provider + 1); t < numTables; t++) {
-        if (tables[t][tableIndices[t]].useful > 0)
-          tables[t][tableIndices[t]].useful--;
+        TageEntry &entry = tageEntry(t, tableIndices[t]);
+        if (entry.useful > 0)
+          entry.useful--;
       }
     } else {
-      const int allocTable =
-          secondFree >= 0 && (lfsr & 3) == 0 ? secondFree : firstFree;
-      TageEntry &entry = tables[allocTable][tableIndices[allocTable]];
+      const uint32_t allocTable =
+          (uint32_t)(secondFree >= 0 && (lfsr & 3) == 0 ? secondFree : firstFree);
+      TageEntry &entry = tageEntry(allocTable, tableIndices[allocTable]);
       entry.tag = (uint16_t)tableTags[allocTable];
       entry.counter = taken ? 0 : -1;
       entry.useful = 0;
@@ -222,18 +242,14 @@ void Predictor::tageUpdate(uint32_t pc, bool taken, uint32_t pos) {
 
   // Periodically halve useful counters so stale entries can be reclaimed.
   if ((++updateCount & ((1u << 18) - 1)) == 0) {
-    for (auto &table : tables) {
-      for (TageEntry &entry : table)
-        entry.useful >>= 1;
-    }
+    for (TageEntry &entry : tageTables)
+      entry.useful >>= 1;
   }
 }
 
 Predictor::Prediction Predictor::predict(uint32_t pc) {
   Prediction prediction;
-  prediction.before.history = numTables ? historyPos : ghr;
-  prediction.before.rasCount = rasCount;
-  prediction.before.rasTop = rasCount ? ras[(rasCount - 1) % ras.size()] : 0;
+  prediction.before = checkpoint();
   prediction.phtIndex = phtIndexFor(pc);
 
   const BtbEntry *entry = btbFind(pc);
@@ -249,8 +265,9 @@ Predictor::Prediction Predictor::predict(uint32_t pc) {
     break;
 
   case CALL:
-    ras[rasCount % ras.size()] = pc + 4;
+    ras[rasSlot(rasCount)] = pc + 4;
     rasCount++;
+    rasTopValue = pc + 4;
     prediction.taken = true;
     prediction.target = entry->target;
     break;
@@ -259,7 +276,8 @@ Predictor::Prediction Predictor::predict(uint32_t pc) {
     prediction.taken = true;
     if (rasCount > 0) {
       rasCount--;
-      prediction.target = ras[rasCount % ras.size()];
+      prediction.target = ras[rasSlot(rasCount)];
+      rasTopValue = rasCount ? ras[rasSlot(rasCount - 1)] : 0;
     } else {
       prediction.target = entry->target;
     }
@@ -274,16 +292,20 @@ Predictor::Prediction Predictor::predict(uint32_t pc) {
   return prediction;
 }
 
-void Predictor::restore(const Checkpoint &checkpoint) {
+void Predictor::restore(const Checkpoint &saved) {
   if (numTables)
-    historyPos = checkpoint.history;
+    historyPos = saved.history;
   else
-    ghr = checkpoint.history;
+    ghr = saved.history;
 
   if (rasRepair) {
-    rasCount = checkpoint.rasCount;
-    if (rasCount)
-      ras[(rasCount - 1) % ras.size()] = checkpoint.rasTop;
+    rasCount = saved.rasCount;
+    if (rasCount) {
+      ras[rasSlot(rasCount - 1)] = saved.rasTop;
+      rasTopValue = saved.rasTop;
+    } else {
+      rasTopValue = 0;
+    }
   }
 }
 
@@ -294,10 +316,12 @@ void Predictor::replay(uint32_t pc, const Instr &instr, bool taken) {
   if (kind == COND) {
     pushHistory(taken);
   } else if (rasRepair && kind == CALL) {
-    ras[rasCount % ras.size()] = pc + 4;
+    ras[rasSlot(rasCount)] = pc + 4;
     rasCount++;
+    rasTopValue = pc + 4;
   } else if (rasRepair && kind == RET && rasCount > 0) {
     rasCount--;
+    rasTopValue = rasCount ? ras[rasSlot(rasCount - 1)] : 0;
   }
 }
 
@@ -322,16 +346,20 @@ void Predictor::update(uint32_t pc, const Instr &instr, bool taken,
     BtbEntry *entry = btbFind(pc);
 
     if (!entry) {
-      BtbEntry *set = &btb[(size_t)((pc >> 2) % btbSets) * btbWays];
-      entry = &set[0];
+      if (btbWays == 1) {
+        entry = &btb[btbSetIndex(pc)];
+      } else {
+        BtbEntry *set = &btb[(size_t)btbSetIndex(pc) * btbWays];
+        entry = &set[0];
 
-      for (uint32_t way = 0; way < btbWays; way++) {
-        if (!set[way].valid) {
-          entry = &set[way];
-          break;
+        for (uint32_t way = 0; way < btbWays; way++) {
+          if (!set[way].valid) {
+            entry = &set[way];
+            break;
+          }
+          if (set[way].lastUse < entry->lastUse)
+            entry = &set[way];
         }
-        if (set[way].lastUse < entry->lastUse)
-          entry = &set[way];
       }
     }
 
@@ -339,6 +367,7 @@ void Predictor::update(uint32_t pc, const Instr &instr, bool taken,
     entry->pc = pc;
     entry->target = target;
     entry->kind = kind;
-    entry->lastUse = ++btbClock;
+    if (btbWays > 1)
+      entry->lastUse = ++btbClock;
   }
 }
