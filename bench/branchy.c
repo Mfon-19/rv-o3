@@ -1,36 +1,36 @@
-/*
- * Branch stress: 20000 iterations of LCG-driven branches with mixed
- * bias: a loop backedge taken all but once, a 50/50 coin, a mildly
- * biased test, and a rare event. High MPKI and constant recovery
- * traffic.
- */
+// Branch-prediction stress benchmark using unpredictable pseudo-random branches
+// with inline asm barriers preventing the compiler from converting them to cmovs.
+
 #include "bench.h"
 
-#define ITERS 20000u
+#define ITERATIONS 20000u
 
 int main(void) {
-    u32 a = 0, b = 0;
-    for (u32 i = 0; i < ITERS; i++) {
-        u32 x = lcg();
-        /* The empty asm in each arm is an opaque side effect: the
-         * compiler cannot convert these into branchless selects, so
-         * the machine sees real, unpredictable branches */
-        if (x & 1u) {
-            a += x >> 3;
-            __asm__ volatile("" : "+r"(a));
+    u32 acc_a = 0;
+    u32 acc_b = 0;
+
+    for (u32 i = 0; i < ITERATIONS; i++) {
+        u32 sample = next_random();
+
+        if (sample & 1u) {
+            acc_a += sample >> 3;
+            __asm__ volatile("" : "+r"(acc_a));
         } else {
-            b ^= x;
-            __asm__ volatile("" : "+r"(b));
+            acc_b ^= sample;
+            __asm__ volatile("" : "+r"(acc_b));
         }
-        if (x & 0x100u) {
-            a ^= b >> 1;
-            __asm__ volatile("" : "+r"(a));
+
+        if (sample & 0x100u) {
+            acc_a ^= acc_b >> 1;
+            __asm__ volatile("" : "+r"(acc_a));
         }
-        if ((x & 0x7000u) == 0) {
-            b += i;
-            __asm__ volatile("" : "+r"(b));
+
+        if ((sample & 0x7000u) == 0) {
+            acc_b += i;
+            __asm__ volatile("" : "+r"(acc_b));
         }
     }
-    print_int((int)(a ^ b));
+
+    print_int((int)(acc_a ^ acc_b));
     return 0;
 }

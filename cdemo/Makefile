@@ -16,7 +16,6 @@ start.o: start.S
 demo.elf: start.o demo.o runtime.o linker.ld
 	$(LD) $(LDFLAGS) start.o demo.o runtime.o -o $@
 
-# rvsim does not parse ELF metadata, so objcopy extracts the loadable bytes.
 demo.bin: demo.elf
 	$(OBJCOPY) -O binary $< $@
 
@@ -26,7 +25,6 @@ sim:
 run: demo.bin sim
 	../rvsim demo.bin
 
-# This target is useful for checking exactly which instructions Clang emitted.
 disassemble: demo.elf
 	$(OBJDUMP) -d -M no-aliases,numeric $<
 

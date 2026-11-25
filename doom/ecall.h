@@ -1,4 +1,7 @@
+// Inline RV32IM ECALL wrapper used by guest Doom runtime and platform code.
+
 #pragma once
+
 #include <stdint.h>
 
 static inline uint32_t rv_call(uint32_t number, uint32_t argument) {

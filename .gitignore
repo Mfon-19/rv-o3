@@ -1,17 +1,13 @@
-# Project executable
 /rvsim
 
-# Local development tools and editor settings
 /tools/
 /compile_flags.txt
 
-# Freestanding C demo outputs (object files are covered by *.o below)
 /cdemo/demo.elf
 /cdemo/demo.bin
 
 .vscode
 
-# Compiler and linker outputs
 *.o
 *.obj
 *.a
@@ -21,27 +17,22 @@
 *.exe
 *.d
 
-# Build directories
 /build/
 /out/
 /cmake-build-*/
 
-# Coverage and profiling data
 *.gcda
 *.gcno
 *.gcov
 *.profraw
 *.profdata
 
-# clangd's project-local cache
 /.cache/
 
-# Editor swap and backup files
 *.swp
 *.swo
 *~
 
-# OS metadata
 .DS_Store
 Thumbs.db
 bench/*.o

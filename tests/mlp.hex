@@ -1,17 +1,11 @@
-# Directed memory-level parallelism test: two independent loads from
-# cold lines far apart; both miss L1D and L2 and go to DRAM. Separate
-# MSHRs keep both misses outstanding, so they overlap (L1D "overlap
-# cycles" > 0 in the stats) instead of serializing. Memory starts at
-# zero, so the loaded values are zero; correctness rides on -d.
-# Expected output: 7, exit 0.
-000100B7   # lui  x1, 0x10        0x10000
-00020137   # lui  x2, 0x20        0x20000
-0000A183   # lw   x3, 0(x1)       miss all the way to DRAM
-00012203   # lw   x4, 0(x2)       independent miss: overlaps the first
-004182B3   # add  x5, x3, x4      0
-00728513   # addi x10, x5, 7
-00100893   # addi x17, x0, 1      syscall 1: print integer
-00000073   # ecall                prints 7
-00000513   # addi x10, x0, 0
-05D00893   # addi x17, x0, 93     syscall 93: exit
-00000073   # ecall
+000100B7
+00020137
+0000A183
+00012203
+004182B3
+00728513
+00100893
+00000073
+00000513
+05D00893
+00000073

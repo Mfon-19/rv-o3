@@ -1,53 +1,32 @@
-// The assembled memory system: backing store, topology, and the two
-// top-level ports the core talks to.
-//
-// Cache mode (default):
-//
-//   core IF port  -> L1I --+
-//                          +--> unified L2 --> DRAM --> backing Memory
-//   core MEM port -> L1D --+
-//
-// Flat mode (SimConfig::flatMemory): two independent fixed-latency
-// ports straight to the backing store; at latency 1 that is a
-// dual-ported flat memory with no structural hazards at all.
-//
-// Every level is nonblocking and tagged; MemorySystem::tick routes each
-// level's completions to its requester: DRAM completions go to the L2,
-// and the L2's completions, which carry the src id of the L1 that
-// asked, go back to the right L1. Backpressure is MSHR and
-// writeback-queue occupancy (canAccept) plus each lower port's one
-// request per cycle.
+// Top-level memory hierarchy wiring split L1I/L1D caches, a unified L2 cache,
+// and DRAM (or flat fixed-latency memory when flatMemory is enabled).
 
 #pragma once
 
 #include <optional>
 
 #include "memory/cache.h"
-#include "memory/dram.h"
 #include "memory/memory.h"
-#include "memory/request.h"
 #include "sim/config.h"
 
-// Requester ids carried in MemRequest::src for response routing
+// Identifies which upper cache originated a request to the shared L2.
 enum : uint8_t { SRC_L1I = 0, SRC_L1D = 1, SRC_L2 = 2 };
 
 struct MemorySystem {
-  explicit MemorySystem(const SimConfig &cfg);
+  explicit MemorySystem(const SimConfig &config);
 
-  void tick(); // advance the whole hierarchy one cycle, bottom-up
+  void tick();
 
-  // Functional byte read for the simulator's own use (syscall 3 string
-  // reads, the differential checker's final memory compare): newest
-  // copy wins, L1D, then L2, then the backing store
+  // Coherent side-channel byte read checking L1D -> L2 -> backing DRAM.
   uint8_t peek8(uint32_t addr) const;
 
   void printStats(uint64_t retired) const;
 
   Memory backing;
   bool flat;
-  DRAM dram;                 // cache mode: below L2; flat mode: data port
-  std::optional<DRAM> flatI; // flat mode only: independent fetch port
+  DRAM dram;
+  std::optional<DRAM> flatInstrMem;
   std::optional<Cache> l2, l1i, l1d;
-  MemPort *imem; // what the core's fetch talks to
-  MemPort *dmem; // what the core's LSQ talks to
+  MemPort *imem = nullptr;
+  MemPort *dmem = nullptr;
 };

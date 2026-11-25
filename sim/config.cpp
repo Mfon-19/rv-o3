@@ -1,322 +1,306 @@
-// The configuration interface: every SimConfig knob, addressable by
-// name from a config file (-C) or a command-line override (-O).
-//
-// One table drives everything (parsing, overriding, dumping), so a
-// knob added to the X-macro list below is immediately scriptable.
-// Errors are FATAL, never warnings: a silently ignored typo in a
-// sweep configuration produces wrong results that look right.
+// Table-driven configuration parser, CLI `-O` override handler, dumper, and
+// geometry/range validator. Invalid options or values abort immediately.
 
 #include "sim/config.h"
 
 #include <bit>
-
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
-#include "memory/request.h" // kMaxLineBytes
+#include "memory/memory.h"
 
 namespace {
 
-enum Kind { U32, U64, BOOL, MEMORD };
+enum class OptionKind { U32, U64, BOOL, MEM_ORDER };
 
-struct Knob {
+struct ConfigOption {
   const char *name;
-  Kind kind;
-  size_t off;
+  OptionKind kind;
+  size_t offset;
 };
 
-// clang-format off
-#define KNOB_LIST(_)                                                        \
-  _("memBytes",      U64,    memBytes)                                      \
-  _("maxCycles",     U64,    maxCycles)                                     \
-  _("flatMemory",    BOOL,   flatMemory)                                    \
-  _("flatLatency",   U32,    flatLatency)                                   \
-  _("dramLatency",   U32,    dramLatency)                                   \
-  _("l1i.size",      U32,    l1i.sizeBytes)                                 \
-  _("l1i.ways",      U32,    l1i.ways)                                      \
-  _("l1i.line",      U32,    l1i.lineBytes)                                 \
-  _("l1i.latency",   U32,    l1i.hitLatency)                                \
-  _("l1i.mshrs",     U32,    l1i.mshrs)                                     \
-  _("l1i.wbq",       U32,    l1i.wbq)                                       \
-  _("l1d.size",      U32,    l1d.sizeBytes)                                 \
-  _("l1d.ways",      U32,    l1d.ways)                                      \
-  _("l1d.line",      U32,    l1d.lineBytes)                                 \
-  _("l1d.latency",   U32,    l1d.hitLatency)                                \
-  _("l1d.mshrs",     U32,    l1d.mshrs)                                     \
-  _("l1d.wbq",       U32,    l1d.wbq)                                       \
-  _("l2.size",       U32,    l2.sizeBytes)                                  \
-  _("l2.ways",       U32,    l2.ways)                                       \
-  _("l2.line",       U32,    l2.lineBytes)                                  \
-  _("l2.latency",    U32,    l2.hitLatency)                                 \
-  _("l2.mshrs",      U32,    l2.mshrs)                                      \
-  _("l2.wbq",        U32,    l2.wbq)                                        \
-  _("aluCount",      U32,    aluCount)                                      \
-  _("aguCount",      U32,    aguCount)                                      \
-  _("dataPorts",     U32,    dataPorts)                                     \
-  _("mulLatency",    U32,    mulLatency)                                    \
-  _("mulPipelined",  BOOL,   mulPipelined)                                  \
-  _("divLatency",    U32,    divLatency)                                    \
-  _("wbPorts",       U32,    wbPorts)                                       \
-  _("width",         U32,    width)                                         \
-  _("robSize",       U32,    robSize)                                       \
-  _("iqSize",        U32,    iqSize)                                        \
-  _("lsqSize",       U32,    lsqSize)                                       \
-  _("sbSize",        U32,    sbSize)                                        \
-  _("physRegs",      U32,    physRegs)                                      \
-  _("fetchQSize",    U32,    fetchQSize)                                    \
-  _("fetchBytes",    U32,    fetchBytes)                                    \
-  _("usePredictor",  BOOL,   usePredictor)                                  \
-  _("memOrder",      MEMORD, memOrder)                                      \
-  _("depPredictor",  BOOL,   depPredictor)                                  \
-  _("depTableSize",  U32,    depTableSize)                                  \
-  _("phtBits",       U32,    phtBits)                                       \
-  _("ghrBits",       U32,    ghrBits)                                       \
-  _("btbEntries",    U32,    btbEntries)                                    \
-  _("btbWays",       U32,    btbWays)                                       \
-  _("rasEntries",    U32,    rasEntries)                                    \
-  _("rasRepair",     BOOL,   rasRepair)                                     \
-  _("tageTables",    U32,    tageTables)                                    \
-  _("tageTableBits", U32,    tageTableBits)                                 \
-  _("tageTagBits",   U32,    tageTagBits)                                   \
-  _("tageMinHist",   U32,    tageMinHist)                                   \
-  _("tageMaxHist",   U32,    tageMaxHist)
-// clang-format on
+#define CONFIG_OPTION_LIST(_)                                               \
+  _("memBytes",      OptionKind::U64,       memBytes)                       \
+  _("maxCycles",     OptionKind::U64,       maxCycles)                      \
+  _("flatMemory",    OptionKind::BOOL,      flatMemory)                     \
+  _("flatLatency",   OptionKind::U32,       flatLatency)                    \
+  _("dramLatency",   OptionKind::U32,       dramLatency)                    \
+  _("l1i.size",      OptionKind::U32,       l1i.sizeBytes)                  \
+  _("l1i.ways",      OptionKind::U32,       l1i.ways)                       \
+  _("l1i.line",      OptionKind::U32,       l1i.lineBytes)                  \
+  _("l1i.latency",   OptionKind::U32,       l1i.hitLatency)                 \
+  _("l1i.mshrs",     OptionKind::U32,       l1i.mshrs)                      \
+  _("l1i.wbq",       OptionKind::U32,       l1i.wbq)                        \
+  _("l1d.size",      OptionKind::U32,       l1d.sizeBytes)                  \
+  _("l1d.ways",      OptionKind::U32,       l1d.ways)                       \
+  _("l1d.line",      OptionKind::U32,       l1d.lineBytes)                  \
+  _("l1d.latency",   OptionKind::U32,       l1d.hitLatency)                 \
+  _("l1d.mshrs",     OptionKind::U32,       l1d.mshrs)                      \
+  _("l1d.wbq",       OptionKind::U32,       l1d.wbq)                        \
+  _("l2.size",       OptionKind::U32,       l2.sizeBytes)                   \
+  _("l2.ways",       OptionKind::U32,       l2.ways)                        \
+  _("l2.line",       OptionKind::U32,       l2.lineBytes)                   \
+  _("l2.latency",    OptionKind::U32,       l2.hitLatency)                  \
+  _("l2.mshrs",      OptionKind::U32,       l2.mshrs)                       \
+  _("l2.wbq",        OptionKind::U32,       l2.wbq)                         \
+  _("aluCount",      OptionKind::U32,       aluCount)                       \
+  _("aguCount",      OptionKind::U32,       aguCount)                       \
+  _("dataPorts",     OptionKind::U32,       dataPorts)                      \
+  _("mulLatency",    OptionKind::U32,       mulLatency)                     \
+  _("mulPipelined",  OptionKind::BOOL,      mulPipelined)                   \
+  _("divLatency",    OptionKind::U32,       divLatency)                     \
+  _("wbPorts",       OptionKind::U32,       wbPorts)                        \
+  _("width",         OptionKind::U32,       width)                          \
+  _("robSize",       OptionKind::U32,       robSize)                        \
+  _("iqSize",        OptionKind::U32,       iqSize)                         \
+  _("lsqSize",       OptionKind::U32,       lsqSize)                        \
+  _("sbSize",        OptionKind::U32,       sbSize)                         \
+  _("physRegs",      OptionKind::U32,       physRegs)                       \
+  _("fetchQSize",    OptionKind::U32,       fetchQSize)                     \
+  _("fetchBytes",    OptionKind::U32,       fetchBytes)                     \
+  _("usePredictor",  OptionKind::BOOL,      usePredictor)                   \
+  _("memOrder",      OptionKind::MEM_ORDER, memOrder)                       \
+  _("phtBits",       OptionKind::U32,       phtBits)                        \
+  _("ghrBits",       OptionKind::U32,       ghrBits)                        \
+  _("btbEntries",    OptionKind::U32,       btbEntries)                     \
+  _("btbWays",       OptionKind::U32,       btbWays)                        \
+  _("rasEntries",    OptionKind::U32,       rasEntries)                     \
+  _("rasRepair",     OptionKind::BOOL,      rasRepair)                      \
+  _("tageTables",    OptionKind::U32,       tageTables)                     \
+  _("tageTableBits", OptionKind::U32,       tageTableBits)                  \
+  _("tageTagBits",   OptionKind::U32,       tageTagBits)                    \
+  _("tageMinHist",   OptionKind::U32,       tageMinHist)                    \
+  _("tageMaxHist",   OptionKind::U32,       tageMaxHist)
 
-const Knob kKnobs[] = {
-#define X(n, k, f) {n, k, offsetof(SimConfig, f)},
-    KNOB_LIST(X)
+const ConfigOption kConfigOptions[] = {
+#define X(optName, optKind, field) {optName, optKind, offsetof(SimConfig, field)},
+    CONFIG_OPTION_LIST(X)
 #undef X
 };
 
-static_assert(sizeof(size_t) == sizeof(uint64_t),
-              "memBytes is dumped/parsed as a 64-bit knob");
+static_assert(sizeof(size_t) == sizeof(uint64_t), "memBytes is 64-bit");
 
 const struct {
   const char *name;
   MemOrder value;
-} kMemOrders[] = {
+} kMemOrderNames[] = {
     {"conservative", MemOrder::Conservative},
     {"bypass", MemOrder::Bypass},
     {"speculative", MemOrder::Speculative},
 };
 
-void *fieldPtr(SimConfig &c, const Knob &k) {
-  return (char *)&c + k.off;
-}
-const void *fieldPtr(const SimConfig &c, const Knob &k) {
-  return (const char *)&c + k.off;
+void *fieldPtr(SimConfig &config, const ConfigOption &option) {
+  return (char *)&config + option.offset;
 }
 
-// Numbers accept k/K (x1024) and m/M (x1048576) suffixes: l1d.size=64k
-bool parseNum(const char *s, uint64_t &out) {
-  char *end;
-  uint64_t v = strtoull(s, &end, 0);
-  if (end == s)
+const void *fieldPtr(const SimConfig &config, const ConfigOption &option) {
+  return (const char *)&config + option.offset;
+}
+
+// Parses decimal/hex integers with optional KiB ('k') or MiB ('m') suffix.
+bool parseNumber(const char *text, uint64_t &outValue) {
+  char *end = nullptr;
+  uint64_t value = strtoull(text, &end, 0);
+  if (end == text)
     return false;
-  if (*end == 'k' || *end == 'K') {
-    v <<= 10;
-    end++;
-  } else if (*end == 'm' || *end == 'M') {
-    v <<= 20;
-    end++;
-  }
-  out = v;
+
+  if (*end == 'k' || *end == 'K') { value <<= 10; end++; }
+  else if (*end == 'm' || *end == 'M') { value <<= 20; end++; }
+
+  outValue = value;
   return *end == '\0';
 }
 
-[[noreturn]] void knobFail(const char *where, const char *what,
-                           const char *detail) {
-  fprintf(stderr, "fatal: %s: %s '%s'\n", where, what, detail);
-  fprintf(stderr, "valid knobs:");
-  for (const Knob &k : kKnobs)
-    fprintf(stderr, " %s", k.name);
-  fputc('\n', stderr);
+[[noreturn]] void failOption(const char *location, const char *reason,
+                             const char *detail) {
+  fprintf(stderr, "fatal: %s: %s '%s'\n", location, reason, detail);
   exit(1);
 }
 
-void setKnob(SimConfig &c, const char *key, const char *val,
-             const char *where) {
-  for (const Knob &k : kKnobs) {
-    if (strcmp(k.name, key) != 0)
+void setConfigOption(SimConfig &config, const char *key, const char *valueStr,
+                     const char *location) {
+  for (const ConfigOption &option : kConfigOptions) {
+    if (strcmp(option.name, key) != 0)
       continue;
-    uint64_t n;
-    switch (k.kind) {
-    case U32:
-      if (!parseNum(val, n) || n > UINT32_MAX)
-        knobFail(where, "bad value for", key);
-      *(uint32_t *)fieldPtr(c, k) = (uint32_t)n;
+
+    uint64_t parsed = 0;
+
+    switch (option.kind) {
+    case OptionKind::U32:
+      if (!parseNumber(valueStr, parsed) || parsed > UINT32_MAX)
+        failOption(location, "bad value for", key);
+      *(uint32_t *)fieldPtr(config, option) = (uint32_t)parsed;
       return;
-    case U64:
-      if (!parseNum(val, n))
-        knobFail(where, "bad value for", key);
-      *(uint64_t *)fieldPtr(c, k) = n;
+
+    case OptionKind::U64:
+      if (!parseNumber(valueStr, parsed))
+        failOption(location, "bad value for", key);
+      *(uint64_t *)fieldPtr(config, option) = parsed;
       return;
-    case BOOL:
-      if (!strcmp(val, "1") || !strcmp(val, "true"))
-        *(bool *)fieldPtr(c, k) = true;
-      else if (!strcmp(val, "0") || !strcmp(val, "false"))
-        *(bool *)fieldPtr(c, k) = false;
+
+    case OptionKind::BOOL:
+      if (!strcmp(valueStr, "1") || !strcmp(valueStr, "true"))
+        *(bool *)fieldPtr(config, option) = true;
+      else if (!strcmp(valueStr, "0") || !strcmp(valueStr, "false"))
+        *(bool *)fieldPtr(config, option) = false;
       else
-        knobFail(where, "bad value for", key);
+        failOption(location, "bad value for", key);
       return;
-    case MEMORD:
-      for (const auto &m : kMemOrders)
-        if (!strcmp(val, m.name)) {
-          *(MemOrder *)fieldPtr(c, k) = m.value;
+
+    case OptionKind::MEM_ORDER:
+      for (const auto &entry : kMemOrderNames) {
+        if (!strcmp(valueStr, entry.name)) {
+          *(MemOrder *)fieldPtr(config, option) = entry.value;
           return;
         }
-      knobFail(where, "bad value for", key);
+      }
+      failOption(location, "bad value for", key);
     }
   }
-  knobFail(where, "unknown knob", key);
+
+  failOption(location, "unknown option", key);
 }
 
-char *trim(char *s) {
-  while (*s == ' ' || *s == '\t')
-    s++;
-  char *e = s + strlen(s);
-  while (e > s && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\n' ||
-                   e[-1] == '\r'))
-    *--e = '\0';
-  return s;
+char *trimWhitespace(char *text) {
+  while (*text == ' ' || *text == '\t')
+    text++;
+
+  char *end = text + strlen(text);
+  while (end > text && (end[-1] == ' ' || end[-1] == '\t' ||
+                        end[-1] == '\n' || end[-1] == '\r')) {
+    *--end = '\0';
+  }
+  return text;
 }
 
-void require(bool ok, const char *what) {
+void requireValid(bool ok, const char *message) {
   if (!ok) {
-    fprintf(stderr, "fatal: config: %s\n", what);
+    fprintf(stderr, "fatal: config: %s\n", message);
     exit(1);
   }
 }
 
-} // namespace
+}
 
-void applyConfigOverride(SimConfig &c, const char *kv) {
-  const char *eq = strchr(kv, '=');
-  if (!eq || eq == kv) {
-    fprintf(stderr, "fatal: -O expects key=value, got '%s'\n", kv);
-    exit(1);
-  }
+void applyConfigOverride(SimConfig &config, const char *overrideStr) {
+  const char *equals = strchr(overrideStr, '=');
+  if (!equals || equals == overrideStr)
+    failOption("-O", "expected key=value, got", overrideStr);
+
   char key[128];
-  const size_t n = (size_t)(eq - kv);
-  if (n >= sizeof key) {
-    fprintf(stderr, "fatal: -O key too long: '%s'\n", kv);
-    exit(1);
-  }
-  memcpy(key, kv, n);
-  key[n] = '\0';
-  setKnob(c, trim(key), eq + 1, "-O");
+  const size_t keyLen = (size_t)(equals - overrideStr);
+  if (keyLen >= sizeof key)
+    failOption("-O", "key too long", overrideStr);
+
+  memcpy(key, overrideStr, keyLen);
+  key[keyLen] = '\0';
+  setConfigOption(config, trimWhitespace(key), equals + 1, "-O");
 }
 
-void loadConfigFile(SimConfig &c, const char *path) {
-  FILE *f = fopen(path, "r");
-  if (!f) {
-    fprintf(stderr, "fatal: cannot open config file '%s'\n", path);
-    exit(1);
-  }
-  char line[256], where[300];
-  int lineno = 0;
-  while (fgets(line, sizeof line, f)) {
-    lineno++;
+void loadConfigFile(SimConfig &config, const char *path) {
+  FILE *file = fopen(path, "r");
+  if (!file)
+    failOption("config", "cannot open", path);
+
+  char line[256], location[300];
+  int lineNumber = 0;
+
+  while (fgets(line, sizeof line, file)) {
+    lineNumber++;
     if (char *hash = strchr(line, '#'))
       *hash = '\0';
-    char *s = trim(line);
-    if (!*s)
+
+    char *trimmed = trimWhitespace(line);
+    if (!*trimmed)
       continue;
-    char *eq = strchr(s, '=');
-    snprintf(where, sizeof where, "%s:%d", path, lineno);
-    if (!eq) {
-      fprintf(stderr, "fatal: %s: expected 'key = value', got '%s'\n",
-              where, s);
-      exit(1);
-    }
-    *eq = '\0';
-    setKnob(c, trim(s), trim(eq + 1), where);
+
+    char *equals = strchr(trimmed, '=');
+    snprintf(location, sizeof location, "%s:%d", path, lineNumber);
+    if (!equals)
+      failOption(location, "expected 'key = value', got", trimmed);
+
+    *equals = '\0';
+    setConfigOption(config, trimWhitespace(trimmed), trimWhitespace(equals + 1), location);
   }
-  fclose(f);
+
+  fclose(file);
 }
 
-void dumpConfig(const SimConfig &c, FILE *out) {
-  for (const Knob &k : kKnobs) {
-    switch (k.kind) {
-    case U32:
-      fprintf(out, "%s = %u\n", k.name, *(const uint32_t *)fieldPtr(c, k));
+void dumpConfig(const SimConfig &config, FILE *out) {
+  for (const ConfigOption &option : kConfigOptions) {
+    switch (option.kind) {
+    case OptionKind::U32:
+      fprintf(out, "%s = %u\n", option.name, *(const uint32_t *)fieldPtr(config, option));
       break;
-    case U64:
-      fprintf(out, "%s = %llu\n", k.name,
-              (unsigned long long)*(const uint64_t *)fieldPtr(c, k));
+    case OptionKind::U64:
+      fprintf(out, "%s = %llu\n", option.name,
+              (unsigned long long)*(const uint64_t *)fieldPtr(config, option));
       break;
-    case BOOL:
-      fprintf(out, "%s = %d\n", k.name, *(const bool *)fieldPtr(c, k));
+    case OptionKind::BOOL:
+      fprintf(out, "%s = %d\n", option.name, *(const bool *)fieldPtr(config, option));
       break;
-    case MEMORD:
-      for (const auto &m : kMemOrders)
-        if (m.value == *(const MemOrder *)fieldPtr(c, k))
-          fprintf(out, "%s = %s\n", k.name, m.name);
+    case OptionKind::MEM_ORDER:
+      for (const auto &entry : kMemOrderNames)
+        if (entry.value == *(const MemOrder *)fieldPtr(config, option))
+          fprintf(out, "%s = %s\n", option.name, entry.name);
       break;
     }
   }
 }
 
-void validateConfig(SimConfig &c) {
-  // Default: one physical register per architectural register plus one
-  // per ROB entry, so the free list can never bind before the ROB does.
-  // An explicit smaller value makes register pressure a real constraint
-  if (c.physRegs == 0)
-    c.physRegs = 32 + c.robSize;
-  require(c.physRegs >= 33, "physRegs must be at least 33 (32 arch + 1)");
-  require(c.physRegs <= 255, "physRegs must fit 8-bit ids (max 255)");
+void validateConfig(SimConfig &config) {
+  if (config.physRegs == 0)
+    config.physRegs = 32 + config.robSize;
 
-  require(c.width >= 1 && c.width <= 8, "width must be in 1..8");
-  const uint32_t fetchBytes = c.fetchBlockBytes();
-  require(fetchBytes >= 8 && fetchBytes <= 64 &&
-              (fetchBytes & (fetchBytes - 1)) == 0,
-          "fetchBytes must be 0 (automatic), 8, 16, 32, or 64");
-  require(c.fetchQSize >= fetchBytes / 4,
-          "fetchQSize must hold at least one fetch block");
-  require(c.robSize >= 1 && c.iqSize >= 1 && c.lsqSize >= 1 && c.sbSize >= 1,
-          "robSize/iqSize/lsqSize/sbSize must be at least 1");
-  require(c.aluCount >= 1 && c.aluCount <= 8, "aluCount must be in 1..8");
-  require(c.wbPorts >= 1, "need at least 1 writeback port");
-  require(c.aguCount >= 1 && c.aguCount <= 8, "aguCount must be in 1..8");
-  require(c.dataPorts >= 1 && c.dataPorts <= 8, "dataPorts must be in 1..8");
-  require(c.mulLatency >= 1 && c.divLatency >= 1, "unit latencies are >= 1");
+  // Physical register IDs are stored in uint8_t with 0xFF reserved as kNoReg.
+  requireValid(config.physRegs >= 33 && config.physRegs <= 255,
+               "physRegs must be in 33..255");
+  requireValid(config.width >= 1 && config.width <= 8, "width must be in 1..8");
 
-  if (!c.flatMemory) {
-    for (const CacheConfig *cache : {&c.l1i, &c.l1d, &c.l2}) {
-      const uint32_t lines = cache->ways ? cache->sizeBytes / cache->lineBytes : 0;
-      require(std::has_single_bit(cache->lineBytes) &&
-                  cache->lineBytes <= kMaxLineBytes,
-              "cache lines must be a power of two up to 128 bytes");
-      require(cache->ways >= 1 && lines % cache->ways == 0 &&
-                  std::has_single_bit(lines / cache->ways),
-              "cache size / (line size x ways) must be a power-of-two set count");
-      require(cache->mshrs >= 1 && cache->wbq >= 1,
-              "caches need at least 1 MSHR and 1 writeback-queue entry");
+  const uint32_t fetchBytes = config.fetchBlockBytes();
+  requireValid(fetchBytes >= 8 && fetchBytes <= 64 && std::has_single_bit(fetchBytes),
+               "fetchBytes must be 0, 8, 16, 32, or 64");
+  requireValid(config.fetchQSize >= fetchBytes / 4, "fetchQSize too small for fetchBytes");
+  requireValid(config.robSize >= 1 && config.iqSize >= 1 &&
+                   config.lsqSize >= 1 && config.sbSize >= 1,
+               "queue sizes must be >= 1");
+  requireValid(config.aluCount >= 1 && config.aluCount <= 8 &&
+                   config.aguCount >= 1 && config.aguCount <= 8 &&
+                   config.dataPorts >= 1 && config.dataPorts <= 8 &&
+                   config.wbPorts >= 1 && config.mulLatency >= 1 && config.divLatency >= 1,
+               "invalid execution unit or port counts");
+
+  if (!config.flatMemory) {
+    for (const CacheConfig *cache : {&config.l1i, &config.l1d, &config.l2}) {
+      const uint32_t lineCount = cache->ways ? cache->sizeBytes / cache->lineBytes : 0;
+      requireValid(std::has_single_bit(cache->lineBytes) && cache->lineBytes <= kMaxLineBytes &&
+                       cache->ways >= 1 && lineCount % cache->ways == 0 &&
+                       std::has_single_bit(lineCount / cache->ways) &&
+                       cache->mshrs >= 1 && cache->wbq >= 1,
+                   "invalid cache geometry");
     }
-    require(c.l1i.lineBytes == c.l1d.lineBytes &&
-                c.l1d.lineBytes == c.l2.lineBytes,
-            "all cache levels must share one line size");
-    require(c.l1i.lineBytes % fetchBytes == 0,
-            "the fetch block must divide the line size");
+
+    requireValid(config.l1i.lineBytes == config.l1d.lineBytes &&
+                     config.l1d.lineBytes == config.l2.lineBytes &&
+                     config.l1i.lineBytes % fetchBytes == 0,
+                 "mismatched cache line sizes or fetchBytes");
   }
 
-  require(c.phtBits >= 1 && c.phtBits <= 24, "phtBits must be 1..24");
-  require(c.ghrBits <= 30, "ghrBits must be 0..30");
-  require(c.btbEntries >= 1 && c.rasEntries >= 1 && c.depTableSize >= 1,
-          "predictor structures need at least 1 entry");
-  require(c.btbWays >= 1 && c.btbEntries % c.btbWays == 0,
-          "btbEntries must be a multiple of btbWays");
-  require(c.tageTables <= 12, "tageTables must be 0..12");
-  if (c.tageTables) {
-    require(c.tageTableBits >= 4 && c.tageTableBits <= 16,
-            "tageTableBits must be 4..16");
-    require(c.tageTagBits >= 4 && c.tageTagBits <= 16,
-            "tageTagBits must be 4..16");
-    require(c.tageMinHist >= 1 && c.tageMinHist <= c.tageMaxHist &&
-                c.tageMaxHist <= 1024,
-            "TAGE history lengths must satisfy 1 <= min <= max <= 1024");
+  requireValid(config.phtBits >= 1 && config.phtBits <= 24 && config.ghrBits <= 30 &&
+                   config.btbEntries >= 1 && config.rasEntries >= 1 &&
+                   config.btbWays >= 1 && config.btbEntries % config.btbWays == 0 &&
+                   config.tageTables <= 12,
+               "invalid branch predictor configuration");
+
+  if (config.tageTables) {
+    requireValid(config.tageTableBits >= 4 && config.tageTableBits <= 16 &&
+                     config.tageTagBits >= 4 && config.tageTagBits <= 16 &&
+                     config.tageMinHist >= 1 && config.tageMinHist <= config.tageMaxHist &&
+                     config.tageMaxHist <= 1024,
+                 "invalid TAGE configuration");
   }
-  require(c.memBytes >= 64 * 1024, "memBytes must be at least 64 KiB");
+
+  requireValid(config.memBytes >= 64 * 1024, "memBytes must be >= 64 KiB");
 }

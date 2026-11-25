@@ -1,25 +1,15 @@
-/*
- * RV32IM Doom: 64 MiB RAM, embedded read-only WAD, Picolibc TLS,
- * bounded heap, and a 1 MiB stack. rvsim zeroes RAM before loading.
- */
+/* 64 MiB flat RV32IM linker script for Doom: embedded WAD, Picolibc TLS, heap, and 1 MiB stack. */
 
 OUTPUT_ARCH(riscv)
 ENTRY(_start)
 
-/* Keep this synchronized with run.py's -m argument. */
 MEMORY
 {
     RAM (rwx) : ORIGIN = 0x00000000, LENGTH = 64M
 }
 
-/* The stack begins one byte beyond RAM and grows downward into valid memory. */
 __stack_top = ORIGIN(RAM) + LENGTH(RAM);
 
-/*
- * ELF program headers keep code read/execute and data read/write. rvsim does
- * not enforce permissions, but expressing them correctly avoids an RWX ELF
- * segment and makes the intermediate file useful to normal inspection tools.
- */
 PHDRS
 {
     text PT_LOAD FLAGS(5); /* PF_R | PF_X */
@@ -32,7 +22,6 @@ SECTIONS
 
     .text :
     {
-        /* KEEP preserves the entry point if section garbage collection is enabled. */
         KEEP(*(.text.start))
         *(.text .text.*)
     } > RAM :text
@@ -61,7 +50,7 @@ SECTIONS
         *(.tbss .tbss.*)
     } > RAM :data
 
-    /* TLS NOBITS does not advance the regular section cursor automatically. */
+    /* Advance .bss explicitly past .tbss because TLS NOBITS does not move `.`. */
     .bss (ADDR(.tbss) + SIZEOF(.tbss)) (NOLOAD) :
     {
         . = ALIGN(16);
@@ -80,7 +69,6 @@ SECTIONS
     ASSERT(__heap_end - __heap_start >= 0x800000,
            "Doom image leaves less than 8 MiB for the heap")
 
-    /* Metadata is useful in ELF files but has no meaning in the raw image. */
     /DISCARD/ :
     {
         *(.comment)

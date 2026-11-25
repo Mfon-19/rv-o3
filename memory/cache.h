@@ -1,35 +1,5 @@
-// A nonblocking, write-back, write-allocate set-associative cache.
-//
-// One class serves as L1I, L1D, and L2; an L1's `below` port is the
-// L2, the L2's is DRAM. Instead of one blocking state machine, the
-// cache is organized around three tables:
-//
-//   - MSHRs (miss-status holding registers): one per outstanding
-//     missed LINE. A second access to a line already being fetched
-//     MERGES into the existing entry's waiting list instead of
-//     issuing a duplicate refill. When every MSHR is occupied the
-//     cache refuses new work (canAccept returns false), which is how
-//     miss pressure slows the requesters above it.
-//   - a writeback queue: dirty victims park here and drain to the
-//     level below opportunistically, off the refill critical path.
-//     Lines here have left the arrays, so peek8 scans this queue too.
-//   - a response queue: completed accesses (hits after hitLatency,
-//     and every waiting request when its refill lands) ready for the
-//     requester to pop, tagged, in completion order.
-//
-// Hits keep being served while misses are pending, simply because
-// hits never consult the MSHRs. Reads capture their data and writes
-// take effect at access() (a hit) or at line install (a miss); an
-// MSHR's waiting list is replayed in arrival order at install, so
-// requests to one line take effect in the order they arrived.
-//
-// Deliberate simplifications: canAccept() conservatively requires a
-// free MSHR and writeback-queue room even for what turns out to be a
-// hit; a full-line write that misses installs immediately without a
-// refill (every byte is overwritten); accepted accesses per cycle are
-// not limited (the port above already rations itself); a writeback
-// leaves the queue as soon as the level below accepts it, and its ack
-// is dropped.
+// Nonblocking set-associative write-back cache with MSHRs (hit-under-miss and
+// miss merging), LRU replacement, and a writeback queue for dirty victims.
 
 #pragma once
 
@@ -37,129 +7,117 @@
 #include <deque>
 #include <vector>
 
-#include "memory/request.h"
-#include "sim/config.h" // CacheConfig
+#include "memory/memory.h"
+#include "sim/config.h"
 
 struct CacheStats {
   uint64_t accesses = 0;
   uint64_t hits = 0;
   uint64_t misses = 0;
-  uint64_t mergedMisses = 0;   // misses absorbed by an existing MSHR
-  uint64_t wbqRestores = 0;    // lines pulled back from the wb queue
-  uint64_t hitUnderMiss = 0;   // hits served while a miss was pending
-  uint64_t overlapCycles = 0;  // cycles with 2+ misses outstanding
+  uint64_t mergedMisses = 0;
+  uint64_t hitUnderMiss = 0;
   uint64_t dirtyEvictions = 0;
-  uint64_t bytesRead = 0;    // refill traffic from the level below
-  uint64_t bytesWritten = 0; // writeback traffic to the level below
-  uint64_t latencySum = 0;   // total access-to-response cycles
-  uint64_t mshrOccSum = 0;   // live MSHRs, summed once each tick...
-  uint64_t ticks = 0;        // ...over this many ticks; the ratio is
-                             // the average outstanding misses
+  uint64_t latencySum = 0;
 };
 
 class Cache : public MemPort {
 public:
-  Cache(const char *name, const CacheConfig &cfg, MemPort *below,
+  Cache(const char *name, const CacheConfig &config, MemPort *lowerLevel,
         uint8_t srcId);
 
+  // Backpressure when all MSHRs are occupied or the writeback queue is full.
   bool canAccept() const override {
-    return pendingMisses < mshrs.size() && wbq.size() < cfg.wbq;
+    return pendingMisses < mshrs.size() && writebackQueue.size() < config.wbq;
   }
+
   void access(const MemRequest &req) override;
-  bool hasResponse() const override { return !respQ.empty(); }
-  const MemResponse &frontResponse() const override { return respQ.front(); }
-  void popResponse() override { respQ.pop_front(); }
+  bool hasResponse() const override { return !responseQueue.empty(); }
+  const MemResponse &frontResponse() const override { return responseQueue.front(); }
+  void popResponse() override { responseQueue.pop_front(); }
   void tick() override;
 
-  // A completion from the level below (refill line or writeback ack),
-  // routed here by the MemorySystem
-  void deliverBelowResponse(const MemResponse &r);
+  // Delivers a line refill returned by the lower memory level.
+  void deliverBelowResponse(const MemResponse &response);
 
-  // Functional read for the simulator's own use (syscall 3 strings,
-  // the differential checker's final memory compare): the newest copy
-  // of the byte this cache owns, whether in the arrays, the writeback
-  // queue, or a write waiting in an MSHR. False if it owns none
-  bool peek8(uint32_t addr, uint8_t &out) const;
+  // Side-channel read for syscalls and differential checking without timing effects.
+  bool peek8(uint32_t addr, uint8_t &outByte) const;
 
   const char *name;
   CacheStats stats;
 
 private:
-  struct Waiting {
+  struct WaitingRequest {
     MemRequest req;
-    uint64_t issueTick;
+    uint64_t issueTick = 0;
   };
+
   struct Mshr {
     bool valid = false;
     uint32_t lineAddr = 0;
     bool refillSent = false;
-    std::vector<Waiting> waiting;
+    std::vector<WaitingRequest> waiting;
   };
-  struct WbEntry {
+
+  struct WritebackEntry {
     uint32_t addr = 0;
     Line line;
   };
-  struct HitTxn {
-    MemResponse resp;
-    uint64_t readyAt;
+
+  struct PendingHit {
+    MemResponse response;
+    uint64_t readyAt = 0;
   };
-  struct PendingInstall { // refill returned while the wb queue was full
-    uint32_t mshrIdx;
+
+  // Refill that arrived while the writeback queue was full and could not evict.
+  struct PendingInstall {
+    uint32_t mshrIndex = 0;
     Line line;
   };
 
-  // Line size and set count are powers of two (validateConfig)
-  uint32_t setOf(uint32_t addr) const { return (addr >> lineShift) & (sets - 1); }
+  uint32_t setOf(uint32_t addr) const { return (addr >> lineShift) & (setCount - 1); }
   uint32_t tagOf(uint32_t addr) const { return addr >> tagShift; }
-  uint32_t offsetOf(uint32_t addr) const { return addr & (cfg.lineBytes - 1); }
+  uint32_t offsetOf(uint32_t addr) const { return addr & (config.lineBytes - 1); }
+
   uint32_t lineAddrOf(uint32_t set, uint32_t way) const {
-    return (tags[set * cfg.ways + way] << tagShift) | (set << lineShift);
+    return (tags[set * config.ways + way] << tagShift) | (set << lineShift);
   }
+
   uint8_t *lineData(uint32_t set, uint32_t way) {
-    return data.data() + (size_t)(set * cfg.ways + way) * cfg.lineBytes;
+    return data.data() + (size_t)(set * config.ways + way) * config.lineBytes;
   }
+
   const uint8_t *lineData(uint32_t set, uint32_t way) const {
-    return data.data() + (size_t)(set * cfg.ways + way) * cfg.lineBytes;
+    return data.data() + (size_t)(set * config.ways + way) * config.lineBytes;
   }
 
   int findWay(uint32_t set, uint32_t tag) const;
   uint32_t victimWay(uint32_t set) const;
-  void touchLRU(uint32_t set, uint32_t way) {
-    lru[set * cfg.ways + way] = ++lruTick;
-  }
-  int freeMshr() const;
   int mshrFor(uint32_t lineAddr) const;
-
-  // Perform one request directly into its reserved response slot
-  void performOnLine(const MemRequest &req, uint32_t set, uint32_t way,
-                     MemResponse &resp);
-  // Put a line into the way picked for lineAddr, evicting a dirty
-  // occupant to the wb queue. False, changing nothing, if that queue
-  // has no room for the victim
-  bool installLine(uint32_t lineAddr, const uint8_t *src, bool isDirty,
-                   uint32_t &set, uint32_t &way);
-  bool tryInstall(uint32_t mshrIdx, const Line &line);
+  bool mergeIntoMshr(uint32_t lineAddr, const MemRequest &req);
+  void performOnLine(const MemRequest &req, uint32_t set, uint32_t way, MemResponse &response);
+  bool installLine(uint32_t lineAddr, const uint8_t *srcData, bool isDirty, uint32_t &outSet, uint32_t &outWay);
+  bool tryInstall(uint32_t mshrIndex, const Line &line);
   MemResponse &reserveHit();
 
-  CacheConfig cfg;
-  uint32_t sets;
-  unsigned lineShift, tagShift;
-  MemPort *below;
-  uint8_t srcId;
+  static constexpr uint32_t kInvalidTag = UINT32_MAX;
+
+  CacheConfig config;
+  uint32_t setCount = 0;
+  unsigned lineShift = 0, tagShift = 0;
+  MemPort *lowerLevel = nullptr;
+  uint8_t srcId = 0;
 
   std::vector<uint8_t> data;
   std::vector<uint32_t> tags;
-  // lineBytes >= 4, so no valid address can produce UINT32_MAX as its tag.
-  static constexpr uint32_t invalidTag = UINT32_MAX;
   std::vector<uint8_t> dirty;
   std::vector<uint64_t> lru;
   uint64_t lruTick = 0;
 
   std::vector<Mshr> mshrs;
-  uint32_t pendingMisses = 0; // occupied MSHRs, including pending installs
-  std::deque<WbEntry> wbq;
+  uint32_t pendingMisses = 0;
+  std::deque<WritebackEntry> writebackQueue;
   std::deque<PendingInstall> pendingInstalls;
-  std::deque<HitTxn> hitPipe; // hits waiting out hitLatency, in order
-  std::deque<MemResponse> respQ;
+  std::deque<PendingHit> hitPipeline;
+  std::deque<MemResponse> responseQueue;
   uint64_t tickCount = 0;
 };

@@ -1,59 +1,61 @@
-// A fixed-capacity ring of entries, oldest at the head.
-//
-// The reorder buffer, the load/store queue, the store buffer, and the
-// free list are all this shape: allocate at the tail, retire from the
-// head, squash from the tail. An entry's ring index stays stable while
-// it is live even as the head advances, which is what lets in-flight
-// ops name their ROB and LSQ entries by index.
+// Fixed-capacity circular buffer supporting head/tail pops and stable slot
+// indices, used by the ROB, LSQ, store buffer, fetch queue, and free list.
 
 #pragma once
 
 #include <cstdint>
 #include <vector>
 
-template <class T> class Ring {
+template <class T>
+class Ring {
 public:
-  explicit Ring(uint32_t capacity) : e(capacity), capacity(capacity) {}
+  explicit Ring(uint32_t capacity) : entries(capacity), capacity(capacity) {}
 
-  bool empty() const { return n == 0; }
-  bool full() const { return n == capacity; }
-  uint32_t count() const { return n; }
+  bool empty() const { return size == 0; }
+  bool full() const { return size == capacity; }
+  uint32_t count() const { return size; }
 
-  // Take the slot after the tail, reset it, and return its ring index
   uint32_t alloc() {
-    const uint32_t idx = indexOf(n);
-    e[idx] = T{};
-    n++;
+    const uint32_t idx = indexOf(size);
+    entries[idx] = T{};
+    size++;
     return idx;
   }
-  void push(const T &v) { e[alloc()] = v; }
 
-  T &at(uint32_t idx) { return e[idx]; }
-  T &head() { return e[headIdx]; }
-  T &tail() { return e[indexOf(n - 1)]; }
-  T &nth(uint32_t k) { return e[indexOf(k)]; } // k-th oldest, 0 = head
-  uint32_t indexOf(uint32_t k) const {
-    // All callers use offsets <= capacity: at most one wrap, even for
-    // non-power-of-two capacities. Subtract first to avoid overflow.
-    const uint32_t toEnd = capacity - headIdx;
-    return k < toEnd ? headIdx + k : k - toEnd;
+  void push(const T &value) { entries[alloc()] = value; }
+
+  T &at(uint32_t idx) { return entries[idx]; }
+  T &head() { return entries[headIndex]; }
+  T &tail() { return entries[indexOf(size - 1)]; }
+  T &nth(uint32_t offset) { return entries[indexOf(offset)]; }
+
+  uint32_t indexOf(uint32_t offset) const {
+    const uint32_t toEnd = capacity - headIndex;
+    return offset < toEnd ? headIndex + offset : offset - toEnd;
   }
-  // Is this ring index currently occupied by a live entry?
+
+  // Returns true if `idx` currently belongs to the live [head, tail] range.
   bool live(uint32_t idx) const {
-    const uint32_t distance = idx >= headIdx ? idx - headIdx
-                                            : capacity - (headIdx - idx);
-    return idx < capacity && distance < n;
+    const uint32_t distance =
+        idx >= headIndex ? idx - headIndex : capacity - (headIndex - idx);
+    return idx < capacity && distance < size;
   }
 
   void popHead() {
-    headIdx = indexOf(1);
-    n--;
+    headIndex = indexOf(1);
+    size--;
   }
-  void popTail() { n--; }
-  void clear() { headIdx = n = 0; }
+
+  void popTail() { size--; }
+
+  void clear() {
+    headIndex = 0;
+    size = 0;
+  }
 
 private:
-  std::vector<T> e;
+  std::vector<T> entries;
   const uint32_t capacity;
-  uint32_t headIdx = 0, n = 0;
+  uint32_t headIndex = 0;
+  uint32_t size = 0;
 };

@@ -1,55 +1,74 @@
-// The differential-checking reference model: the executable form of the ISA spec.
-// Used only to verify instructions retired by the out-of-order core.
-//
-// A plain fetch-decode-execute-commit interpreter. One instruction at a
-// time, in program order, each fully completed before the next begins.
-// No pipeline, no forwarding, no speculation, no stalls; nothing here
-// can be wrong about *when*, because there is no when. It answers only
-// what each instruction does to architectural state.
-//
-// It shares decode() and execute() with the timing core, so it is not
-// an independent oracle for those; the two can only diverge in what
-// the core adds on top: operand routing, hazard handling, memory
-// ordering, speculation, recovery, retirement. That is exactly what
-// comparing their commit streams (core/commit.h) checks. The bench/
-// host builds cover the ISA semantics from outside.
-//
-// The non-ISA policies are shared outright rather than mirrored: the
-// syscall interface (sim/syscall.h) and the fatal-access checks
-// (memory/memory.h) are the same code in both models.
+// Architectural commit record shared by OoOCore and RefModel, plus the
+// timing-free functional RV32IM reference interpreter used by `-d`.
 
 #pragma once
 
 #include <cstdint>
+#include <optional>
 
-#include "core/commit.h"
 #include "isa/isa.h"
 #include "memory/memory.h"
 #include "sim/config.h"
 
+struct RegisterWrite {
+  uint8_t rd = 0;
+  uint32_t value = 0;
+  bool operator==(const RegisterWrite &) const = default;
+};
+
+struct MemoryWrite {
+  uint32_t addr = 0;
+  uint32_t value = 0;
+  uint8_t size = 0;
+
+  MemoryWrite() = default;
+  MemoryWrite(uint32_t addr, uint32_t value, uint8_t size)
+      : addr(addr),
+        value(size == 4 ? value : value & ((1u << (8 * size)) - 1)),
+        size(size) {}
+
+  bool operator==(const MemoryWrite &) const = default;
+};
+
+enum class ExceptionKind : uint8_t { IllegalInstruction };
+
+struct Exception {
+  ExceptionKind kind = ExceptionKind::IllegalInstruction;
+  bool operator==(const Exception &) const = default;
+};
+
+// Exact architectural side effects of one retired instruction.
+struct CommitRecord {
+  uint64_t sequence = 0;
+  uint32_t pc = 0;
+  uint32_t instruction = 0;
+  std::optional<RegisterWrite> registerWrite;
+  std::optional<MemoryWrite> memoryWrite;
+  std::optional<Exception> exception;
+
+  bool operator==(const CommitRecord &) const = default;
+};
+
+// Timing-free RV32IM interpreter stepped in lockstep with OoOCore under `-d`.
 class RefModel {
 public:
-  explicit RefModel(const SimConfig &cfg);
+  explicit RefModel(const SimConfig &config);
 
   Memory mem;
 
-  // A differential shadow consumes the primary core's recorded byte/key event.
+  // Input value captured by OoOCore for non-deterministic syscalls (5 and 7).
   uint32_t replayInput = UINT32_MAX;
 
-  // Execute one instruction and optionally describe it in *rec.
-  // Returns false if the model had already halted
-  bool step(CommitRecord *rec = nullptr);
+  bool step(CommitRecord *outRecord = nullptr);
 
   bool halted() const { return halted_; }
   int exitCode() const { return exitCode_; }
   uint64_t retired() const { return retired_; }
-  uint32_t reg(int i) const { return regs[i]; }
+  uint32_t reg(int idx) const { return regs[idx]; }
 
 private:
-  // The architectural state, apart from mem above
   uint32_t regs[32];
   uint32_t pc = 0;
-
   bool halted_ = false;
   int exitCode_ = 0;
   uint64_t retired_ = 0;

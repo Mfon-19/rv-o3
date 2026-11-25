@@ -11,8 +11,6 @@ CFLAGS += -isystem $(PICOLIBC)/include -I$(ENGINE) -I$(BUILD) \
           -D_DEFAULT_SOURCE -DDOOMGENERIC_RESX=320 -DDOOMGENERIC_RESY=200 \
           -ffunction-sections -fdata-sections -Wno-unused-variable \
           -Wno-unused-but-set-variable -Wno-implicit-int -Wno-format
-# CMAP256=1 keeps Doom's 8-bit palette indices and lets the host expand them;
-# CMAP256=0 converts every pixel to XRGB on the guest (the original path).
 CMAP256 ?= 1
 ifeq ($(CMAP256),1)
 CFLAGS += -DCMAP256
@@ -31,7 +29,6 @@ run:
 demo:
 	python3 run.py
 
-# The native viewer is separate: the simulator and guest never link SDL.
 HOST_CXX ?= c++
 PKG_CONFIG ?= pkg-config
 viewer: $(BUILD)/doom-viewer
@@ -58,7 +55,6 @@ $(BUILD)/wad_io.o: wad_io.c | $(BUILD)
 $(BUILD)/start.o: start.S | $(BUILD)
 	$(CC) $(ASFLAGS) -c $< -o $@
 
-# A stable input name gives the embedded image stable linker symbols.
 $(BUILD)/game.wad: $(WAD) | $(BUILD)
 	cp $< $@
 $(BUILD)/gamewad.o: $(BUILD)/game.wad

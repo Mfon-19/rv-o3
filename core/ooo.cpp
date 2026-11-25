@@ -1,3 +1,7 @@
+// Out-of-order pipeline stages executed in reverse order each cycle
+// (commit -> writeback -> AGU/LSQ -> issue -> dispatch -> fetch) so freed
+// resources become available cleanly without same-cycle structural races.
+
 #include "core/ooo.h"
 
 #include <algorithm>
@@ -5,35 +9,61 @@
 #include <cstdio>
 #include <cstdlib>
 
-#include "isa/execute.h"
 #include "sim/syscall.h"
 
-OoOCore::OoOCore(const SimConfig &cfg, MemorySystem &msys)
-    : cfg(cfg), msys(msys), imem(msys.imem), dmem(msys.dmem),
-      showMemStats(!cfg.flatMemory || cfg.flatLatency > 1),
-      freeList(cfg.physRegs), prf(cfg.physRegs), rob(cfg.robSize),
-      iq(cfg.iqSize, cfg.robSize, cfg.physRegs), lsq(cfg.lsqSize), sb(cfg.sbSize),
-      pred(cfg),
-      alus(cfg.aluCount, FuUnit("alu", 1, true)), brUnit("br", 1, true),
-      mulUnit("mul", cfg.mulLatency, cfg.mulPipelined),
-      divUnit("div", cfg.divLatency, false),
-      agus(cfg.aguCount, FuUnit("agu", 1, true)),
-      fBytes(cfg.fetchBlockBytes()), fetchQ(cfg.fetchQSize),
-      loadOuts(cfg.width > 2 ? cfg.width : 2), depTable(cfg.depTableSize, 0),
-      trace(cfg.trace) {
-  for (FuUnit &u : alus)
-    units.push_back(&u);
-  for (FuUnit *u : {&brUnit, &mulUnit, &divUnit})
-    units.push_back(u);
-  wbReady.reserve(units.size() + loadOuts.size());
-  rmap.reset(); // architectural register i starts in physical register i...
-  for (uint32_t p = 32; p < cfg.physRegs; p++)
-    freeList.push((uint8_t)p); // ...and the rest are free
+namespace {
+
+// High bit distinguishes committed store-buffer writes from speculative LSQ
+// loads when responses arrive back from L1D.
+constexpr uint64_t kStoreBufferTagBit = 1ull << 63;
+
+uint64_t makeStoreTag(uint32_t slot, uint32_t txnId) {
+  return kStoreBufferTagBit | (uint64_t(slot) << 32) | txnId;
+}
+
+uint64_t makeLoadTag(uint32_t slot, uint16_t generation) {
+  return (uint64_t(slot) << 16) | generation;
+}
+
+}
+
+OoOCore::OoOCore(const SimConfig &config, MemorySystem &memSystem)
+    : config(config),
+      memSystem(memSystem),
+      imem(memSystem.imem),
+      dmem(memSystem.dmem),
+      freeList(config.physRegs),
+      physRegs(config.physRegs),
+      rob(config.robSize),
+      iq(config.iqSize),
+      lsq(config.lsqSize),
+      storeBuffer(config.sbSize),
+      predictor(config),
+      alus(config.aluCount, FuUnit("alu", 1, true)),
+      branchUnit("br", 1, true),
+      mulUnit("mul", config.mulLatency, config.mulPipelined),
+      divUnit("div", config.divLatency, false),
+      agus(config.aguCount, FuUnit("agu", 1, true)),
+      loadOutputs(config.width > 2 ? config.width : 2),
+      fetchBlockBytes(config.fetchBlockBytes()),
+      fetchQueue(config.fetchQSize) {
+  for (FuUnit &alu : alus)
+    execUnits.push_back(&alu);
+
+  for (FuUnit *unit : {&branchUnit, &mulUnit, &divUnit})
+    execUnits.push_back(unit);
+
+  wbReady.reserve(execUnits.size() + loadOutputs.size());
+  renameMap.reset();
+
+  // Physical registers 0..31 start mapped to architectural x0..x31.
+  for (uint32_t physReg = 32; physReg < config.physRegs; physReg++)
+    freeList.push((uint8_t)physReg);
 }
 
 int OoOCore::run() {
   while (!halted) {
-    if (stats.cycles >= cfg.maxCycles) {
+    if (stats.cycles >= config.maxCycles) {
       fprintf(stderr,
               "stopping after %" PRIu64
               " cycles without an exit syscall (raise with -c)\n",
@@ -41,846 +71,730 @@ int OoOCore::run() {
       exitCode = 2;
       break;
     }
+
     stepCycle();
   }
 
-  const Stats &s = stats;
-  auto ratio = [](uint64_t a, uint64_t b, double scale = 1.0) {
-    return b ? scale * (double)a / (double)b : 0.0;
-  };
-  fprintf(stderr, "--- rvsim: %" PRIu64 " cycles, %" PRIu64
-          " instructions retired, IPC = %.3f (CPI = %.3f)\n",
-          s.cycles, s.retired, ratio(s.retired, s.cycles),
-          ratio(s.cycles, s.retired));
-  fprintf(stderr, "--- rvsim: dispatch stalls: rob-full %" PRIu64
-          ", iq-full %" PRIu64 ", lsq-full %" PRIu64 ", no-preg %" PRIu64
-          ", serialize %" PRIu64 ", fetch-empty %" PRIu64 "\n",
-          s.dsRobFull, s.dsIqFull, s.dsLsqFull, s.dsNoPreg, s.dsSerialize,
-          s.dsFetchEmpty);
-  fprintf(stderr, "--- rvsim: %" PRIu64 " branches, %" PRIu64
-          " mispredicted (%.1f%%, %.2f MPKI), %" PRIu64
-          " flushes; avg issue %.2f; wb-port holds %" PRIu64 "\n",
-          s.branches, s.mispredicts, ratio(s.mispredicts, s.branches, 100.0),
-          ratio(s.mispredicts, s.retired, 1000.0), s.flushes,
-          ratio(s.issuedOps, s.cycles), s.wbConflicts);
-  fprintf(stderr, "--- rvsim: %" PRIu64 " dispatched, %" PRIu64
-          " wrong-path (%.1f%%); recovery loss %" PRIu64
-          " cycles; retire blocked on loads %" PRIu64 " cycles\n",
-          seqCtr, seqCtr - s.retired, ratio(seqCtr - s.retired, seqCtr, 100.0),
-          s.recoveryLossCycles, s.memRetireStallCycles);
-  fprintf(stderr, "--- rvsim: occupancy: rob %.1f/%u, iq %.1f/%u, "
-          "lsq %.1f/%u, sb %.1f/%u, pregs %.1f/%u\n",
-          ratio(s.robOccSum, s.cycles), cfg.robSize,
-          ratio(s.iqOccSum, s.cycles), cfg.iqSize,
-          ratio(s.lsqOccSum, s.cycles), cfg.lsqSize,
-          ratio(s.sbOccSum, s.cycles), cfg.sbSize,
-          ratio(s.pregsUsedSum, s.cycles), cfg.physRegs - 32);
-  fprintf(stderr, "--- rvsim: fu busy:");
-  auto fuLine = [&](const char *name, uint64_t busy, uint64_t ops) {
-    fprintf(stderr, " %s %.1f%% (%" PRIu64 " ops)", name,
-            ratio(busy, s.cycles, 100.0), ops);
-  };
-  uint64_t aluBusy = 0, aluOps = 0;
-  for (const FuUnit &u : alus) {
-    aluBusy += u.busyCycles;
-    aluOps += u.ops;
-  }
-  fuLine("alu", aluBusy, aluOps);
-  for (const FuUnit *u : {&brUnit, &mulUnit, &divUnit})
-    fuLine(u->name, u->busyCycles, u->ops);
-  uint64_t aguBusy = 0, aguOps = 0;
-  for (const FuUnit &u : agus) {
-    aguBusy += u.busyCycles;
-    aguOps += u.ops;
-  }
-  fuLine("agu", aguBusy, aguOps);
-  fputc('\n', stderr);
-  fprintf(stderr, "--- rvsim: %" PRIu64 " loads forwarded from stores, %"
-          PRIu64 " speculative loads, %" PRIu64 " replays, %" PRIu64
-          " store-buffer commit stalls\n",
-          s.loadsForwarded, s.specLoads, s.loadReplays, s.sbCommitStalls);
-  if (showMemStats) {
-    fprintf(stderr, "--- rvsim: %" PRIu64 " ifetch stall cycles, %" PRIu64
-            " data stall cycles\n",
-            s.dsFetchEmpty, s.dataStallCycles);
-    msys.printStats(s.retired);
-  }
-  if (s.badFetchWaitCycles)
-    fprintf(stderr, "--- rvsim: speculative target wait %" PRIu64 " cycles\n",
-            s.badFetchWaitCycles);
-  fprintf(stderr, "--- rvsim: exit code %d\n", exitCode);
+  printStats();
   return exitCode;
 }
 
-void OoOCore::dumpRegs() const {
-  uint32_t regs[32];
-  for (int i = 0; i < 32; i++)
-    regs[i] = reg(i);
-  dumpRegisters(regs, pc);
+void OoOCore::printStats() const {
+  auto ratio = [](uint64_t num, uint64_t denom, double scale = 1.0) {
+    return denom ? scale * (double)num / (double)denom : 0.0;
+  };
+
+  fprintf(stderr,
+          "--- rvsim: %" PRIu64 " cycles, %" PRIu64
+          " instructions retired, IPC = %.3f (CPI = %.3f)\n",
+          stats.cycles, stats.retired, ratio(stats.retired, stats.cycles),
+          ratio(stats.cycles, stats.retired));
+
+  fprintf(stderr,
+          "--- rvsim: %" PRIu64 " branches, %" PRIu64
+          " mispredicted (%.1f%%, %.2f MPKI), %" PRIu64 " flushes, %" PRIu64
+          " forwarded, %" PRIu64 " replays\n",
+          stats.branches, stats.mispredicts,
+          ratio(stats.mispredicts, stats.branches, 100.0),
+          ratio(stats.mispredicts, stats.retired, 1000.0), stats.flushes,
+          stats.loadsForwarded, stats.loadReplays);
+
+  if (!config.flatMemory || config.flatLatency > 1)
+    memSystem.printStats(stats.retired);
+
+  fprintf(stderr, "--- rvsim: exit code %d\n", exitCode);
 }
 
-// Commit: up to width instructions per cycle from the ROB head, in
-// program order. This is where state becomes architectural: mappings
-// are freed, stores move to the store buffer (the cache write lands
-// later, but the buffer forwards to younger loads meanwhile), syscalls
-// run, the predictor trains
-void OoOCore::commitStage() {
-  uint32_t done = 0;
-  while (done < cfg.width && !rob.empty() && rob.head().done && !halted) {
-    RobEntry &e = rob.head();
-    const Instr &I = e.ins;
+void OoOCore::dumpRegs() const {
+  uint32_t archRegs[32];
+  for (int i = 0; i < 32; i++)
+    archRegs[i] = reg(i);
+  dumpRegisters(archRegs, pc);
+}
 
-    // A fault carried down the pipe becomes real only here, where the
-    // instruction is known to be on the committed path
-    if (e.isBranch && e.actualTaken && (e.actualTarget & 3)) {
-      fprintf(stderr,
-              "fatal: misaligned branch target 0x%08x at pc=0x%08x\n",
-              e.actualTarget, e.pc);
+// Retires completed instructions strictly in program order; this is the only
+// stage that exposes faults, runs syscalls, or pushes stores to the store buffer.
+void OoOCore::commitStage() {
+  uint32_t committed = 0;
+
+  while (committed < config.width && !rob.empty() && rob.head().done && !halted) {
+    RobEntry &robEntry = rob.head();
+    const Instr &instr = robEntry.instr;
+
+    if (robEntry.isBranch && robEntry.actualTaken && (robEntry.actualTarget & 3)) {
+      fprintf(stderr, "fatal: misaligned branch target 0x%08x at pc=0x%08x\n",
+              robEntry.actualTarget, robEntry.pc);
       exit(1);
     }
-    if (e.fault) {
-      const char *what = isStore(I.op) ? "store" : "load";
-      if (e.fault == 1)
-        Memory::failMisaligned(lsq.head().addr, what, e.pc);
-      msys.backing.failOutOfRange(lsq.head().addr, what);
+
+    if (robEntry.fault) {
+      const char *operation = isStore(instr.op) ? "store" : "load";
+      if (robEntry.fault == 1)
+        Memory::failMisaligned(lsq.head().addr, operation, robEntry.pc);
+      memSystem.backing.failOutOfRange(lsq.head().addr, operation);
     }
 
-    CommitRecord rec;
-    rec.sequence = stats.retired;
-    rec.pc = e.pc;
-    rec.instruction = I.raw;
+    CommitRecord record;
+    record.sequence = stats.retired;
+    record.pc = robEntry.pc;
+    record.instruction = instr.raw;
 
-    if (e.isSystem) {
-      switch (I.op) {
+    if (robEntry.isSystem) {
+      switch (instr.op) {
       case Op::ECALL: {
         stats.retired++;
-        // The argument registers were captured at dispatch into a
-        // drained machine, so their values are final
+        uint32_t &syscallNum = physRegs.values[robEntry.syscallNumPhysReg];
+        uint32_t &syscallArg = physRegs.values[robEntry.syscallArgPhysReg];
+
         if (runSyscall(
-                prf.val[e.sysA7], prf.val[e.sysA0], e.pc, false,
-                [&](uint32_t a) { return msys.peek8(a); }, exitCode,
-                msys.backing.bytes.size()))
+                syscallNum, syscallArg, robEntry.pc, false,
+                [&](uint32_t addr) { return memSystem.peek8(addr); }, exitCode,
+                memSystem.backing.bytes.size())) {
           halted = true;
-        // ECALL executes alone in a drained machine, so updating the current
-        // architectural mapping cannot clobber an older or younger operand.
-        if (syscallReturnsInput(prf.val[e.sysA7]))
-          rec.registerWrite = RegisterWrite{10, prf.val[e.sysA0]};
+        }
+
+        if (syscallReturnsInput(syscallNum))
+          record.registerWrite = RegisterWrite{10, syscallArg};
         break;
       }
+
       case Op::EBREAK:
         stats.retired++;
-        fprintf(stderr, "ebreak at pc=0x%08x; halting\n", e.pc);
+        fprintf(stderr, "ebreak at pc=0x%08x; halting\n", robEntry.pc);
         halted = true;
         break;
+
       case Op::ILLEGAL:
-        fprintf(stderr, "illegal instruction 0x%08x at pc=0x%08x\n", I.raw,
-                e.pc);
+        fprintf(stderr, "illegal instruction 0x%08x at pc=0x%08x\n", instr.raw,
+                robEntry.pc);
         halted = true;
         exitCode = 1;
-        rec.exception = Exception{ExceptionKind::IllegalInstruction};
+        record.exception = Exception{ExceptionKind::IllegalInstruction};
         break;
-      default: // FENCE
+
+      default:
         stats.retired++;
         break;
       }
     } else {
-      if (e.isMem) {
-        LsqEntry &le = lsq.head();
-        if (le.isStore) {
-          if (sb.full()) { // must drain before this store can retire
-            stats.sbCommitStalls++;
-            if (trace)
-              events.push_back("sb full");
+      if (robEntry.isMem) {
+        LsqEntry &lsqEntry = lsq.head();
+        if (lsqEntry.isStore) {
+          if (storeBuffer.full())
             break;
-          }
-          sb.push(StoreBufEntry{le.addr, le.size, le.data});
-          rec.memoryWrite = MemoryWrite{le.addr, le.data, le.size};
+
+          storeBuffer.push(
+              StoreBufferEntry{lsqEntry.addr, lsqEntry.size, lsqEntry.data});
+          record.memoryWrite =
+              MemoryWrite{lsqEntry.addr, lsqEntry.data, lsqEntry.size};
         }
         lsq.popHead();
       }
-      if (e.pdst != kNoReg) {
-        rec.registerWrite = RegisterWrite{I.rd, prf.val[e.pdst]};
-        freeList.push(e.prevPhys); // in-order commit: no older reader is left
+
+      if (robEntry.destPhysReg != kNoReg) {
+        record.registerWrite =
+            RegisterWrite{instr.rd, physRegs.values[robEntry.destPhysReg]};
+        freeList.push(robEntry.prevPhysReg);
       }
-      if (e.isBranch) {
+
+      if (robEntry.isBranch) {
         stats.branches++;
-        if (e.mispredicted())
+        if (robEntry.mispredicted())
           stats.mispredicts++;
-        if (cfg.usePredictor)
-          pred.update(e.pc, I, e.actualTaken, e.actualTarget, e.predIdx,
-                      e.predBefore);
+
+        if (config.usePredictor) {
+          predictor.update(robEntry.pc, instr, robEntry.actualTaken,
+                           robEntry.actualTarget, robEntry.phtIndex,
+                           robEntry.predCheckpoint);
+        }
       }
-      // A load that commits cleanly slowly re-earns the right to speculate
-      if (cfg.depPredictor && e.isMem && isLoad(I.op) && depEntry(e.pc) > 0)
-        depEntry(e.pc)--;
+
       stats.retired++;
     }
 
-    if (trace)
-      note(vCT, I);
     if (onCommit)
-      onCommit(rec);
+      onCommit(record);
+
     rob.popHead();
-    done++;
+    committed++;
   }
-  // Attribution: nothing committed and the machine's oldest work is a
-  // load still waiting for its data (on the cache, an older store, or
-  // the data port: this counter lumps them together)
-  if (done == 0 && !halted && !rob.empty() && !rob.head().done &&
-      rob.head().isMem && isLoad(rob.head().ins.op) && !lsq.empty() &&
-      !lsq.head().done)
-    stats.memRetireStallCycles++;
 }
 
-// Writeback: up to wbPorts results per cycle, oldest first from the
-// units' output slots and the load completion slots. Each winner
-// writes the physical register file, wakes the issue queue, and marks
-// its ROB entry done. A branch is checked against its prediction here,
-// the moment its real outcome exists; a wrong prediction triggers
-// recovery, which also flushes the rest of this cycle's (younger)
-// winners
+// Grants up to `wbPorts` writeback slots oldest-first, waking IQ waiters and
+// triggering recovery immediately on branch misprediction.
 void OoOCore::writebackStage() {
-  auto &cands = wbReady;
-  const size_t winners = std::min((size_t)cfg.wbPorts, cands.size());
-  for (size_t i = 0; i < winners; i++) {
-    // Only winners need ordering. Leave the losing results in their slots.
-    const auto oldest = std::min_element(cands.begin(), cands.end(),
-        [](const FuOp *a, const FuOp *b) { return a->seq < b->seq; });
-    FuOp &op = **oldest;
-    *oldest = cands.back();
-    cands.pop_back();
-    RobEntry &e = rob.at(op.robIdx);
-    if (op.pdst != kNoReg) {
-      prf.val[op.pdst] = op.value;
-      prf.ready[op.pdst] = true;
-      iq.wakeup(op.pdst);
+  const size_t grantCount = std::min((size_t)config.wbPorts, wbReady.size());
+
+  for (size_t i = 0; i < grantCount; i++) {
+    const auto oldestIt = std::min_element(
+        wbReady.begin(), wbReady.end(),
+        [](const FuOp *lhs, const FuOp *rhs) { return lhs->seq < rhs->seq; });
+
+    FuOp &op = **oldestIt;
+    *oldestIt = wbReady.back();
+    wbReady.pop_back();
+
+    RobEntry &robEntry = rob.at(op.robIdx);
+
+    if (op.destPhysReg != kNoReg) {
+      physRegs.values[op.destPhysReg] = op.value;
+      physRegs.ready[op.destPhysReg] = true;
+      iq.wakeup(op.destPhysReg);
     }
-    e.done = true;
-    if (trace)
-      note(vWB, e.ins);
-    if (e.isBranch) {
-      e.actualTaken = op.redirect;
-      e.actualTarget = op.redirect ? op.target : e.pc + 4;
-      if (e.mispredicted()) {
-        const uint64_t seq = op.seq;
-        const uint32_t tgt = e.actualTarget;
-        if (cfg.usePredictor) {
-          pred.restore(e.predBefore);
-          pred.replay(e.pc, e.ins, e.actualTaken);
+
+    robEntry.done = true;
+
+    if (robEntry.isBranch) {
+      robEntry.actualTaken = op.redirect;
+      robEntry.actualTarget = op.redirect ? op.target : robEntry.pc + 4;
+
+      if (robEntry.mispredicted()) {
+        const uint64_t branchSeq = op.seq;
+        const uint32_t targetPc = robEntry.actualTarget;
+
+        if (config.usePredictor) {
+          predictor.restore(robEntry.predCheckpoint);
+          predictor.replay(robEntry.pc, robEntry.instr, robEntry.actualTaken);
         }
-        op.valid = false; // not younger than seq, so recover() would leave it
-        recover(seq);
-        pendRedirect = true;
-        pendTarget = tgt;
-        if (trace) {
-          char b[64];
-          snprintf(b, sizeof b, "mispredict -> 0x%08x", tgt);
-          events.push_back(b);
-        }
-        break; // younger winners were flushed by recover()
+
+        op.valid = false;
+        recover(branchSeq);
+        pendingRedirect = true;
+        pendingTarget = targetPc;
+        break;
       }
     }
+
     op.valid = false;
   }
-  if (!pendRedirect)
-    stats.wbConflicts += cands.size();
 }
 
-// Squash everything younger than seq: issue queue, functional units,
-// load completion slots, LSQ tail, ROB tail. The ROB walk goes from
-// youngest to oldest so each entry restores the mapping it displaced
-// and returns its physical register. The fetch queue empties too; the
-// pc itself is steered at the clock edge like every redirect
-void OoOCore::recover(uint64_t seq) {
+// Flushes every speculative instruction younger than `keepSeq` and rolls back
+// the rename map by walking the ROB from tail to `keepSeq`.
+void OoOCore::recover(uint64_t keepSeq) {
   stats.flushes++;
-  iq.flushYounger(seq);
-  for (FuUnit *u : units)
-    u->flushYounger(seq);
-  for (FuUnit &u : agus)
-    u.flushYounger(seq);
-  for (FuOp &l : loadOuts)
-    if (l.valid && l.seq > seq)
-      l.valid = false;
-  wbReady.erase(std::remove_if(wbReady.begin(), wbReady.end(),
-      [](const FuOp *op) { return !op->valid; }), wbReady.end());
-  // A cache access already in flight for a squashed load cannot be
-  // cancelled, and needs no bookkeeping either: its response fails the
-  // {slot, generation} tag match and is dropped
-  while (lsq.count() && lsq.tail().seq > seq)
+  iq.flushYounger(keepSeq);
+
+  for (FuUnit *unit : execUnits)
+    unit->flushYounger(keepSeq);
+  for (FuUnit &agu : agus)
+    agu.flushYounger(keepSeq);
+  for (FuOp &loadOut : loadOutputs) {
+    if (loadOut.valid && loadOut.seq > keepSeq)
+      loadOut.valid = false;
+  }
+
+  wbReady.erase(
+      std::remove_if(wbReady.begin(), wbReady.end(),
+                     [](const FuOp *op) { return !op->valid; }),
+      wbReady.end());
+
+  while (lsq.count() && lsq.tail().seq > keepSeq)
     lsq.popTail();
-  while (rob.count() && rob.tail().seq > seq) {
-    RobEntry &t = rob.tail();
-    if (t.pdst != kNoReg) {
-      rmap.map[t.ins.rd] = t.prevPhys;
-      freeList.push(t.pdst);
+
+  while (rob.count() && rob.tail().seq > keepSeq) {
+    RobEntry &tailEntry = rob.tail();
+    if (tailEntry.destPhysReg != kNoReg) {
+      renameMap.archToPhys[tailEntry.instr.rd] = tailEntry.prevPhysReg;
+      freeList.push(tailEntry.destPhysReg);
     }
     rob.popTail();
   }
-  fetchQ.clear();
-  // A wrong-path fetch still in flight must be marked stale NOW: it can
-  // complete later this same cycle (fetchStage runs after us) and would
-  // refill the queue just cleared
-  if (fOutstanding)
-    fStale = true;
-  // Attribution: everything from here until dispatch resumes is the
-  // price of this flush (a newer flush restarts the clock)
-  recTimerArmed = true;
-  recTimerStart = stats.cycles;
+
+  fetchQueue.clear();
+  if (fetchOutstanding)
+    fetchStale = true;
 }
 
-// The AGU's output feeds the LSQ, not a writeback port: fill in the
-// address, record any fault for commit to act on, and mark a store
-// done once both its address and data exist. In Speculative mode a
-// store address resolving is also the moment ordering violations
-// surface
+// Consumes completed AGU effective addresses oldest-first, recording faults
+// for commit-time delivery and scanning for speculative load violations.
 void OoOCore::aguDrain() {
-  // Drain oldest first, reselecting after each completion: a store can
-  // replay a younger load and invalidate another AGU's pending output.
   for (;;) {
-    FuUnit *ready = nullptr;
-    for (FuUnit &u : agus)
-      if (u.out.valid && (!ready || u.out.seq < ready->out.seq))
-        ready = &u;
-    if (!ready)
-      return;
-    const FuOp op = ready->out;
-    ready->out.valid = false;
-    LsqEntry &le = lsq.at(op.lsqIdx);
-    le.addr = op.value;
-    le.size = (uint8_t)accessSize(le.op);
-    lsq.resolveAddress(le);
+    FuUnit *oldestReady = nullptr;
+    for (FuUnit &agu : agus) {
+      if (agu.output.valid &&
+          (!oldestReady || agu.output.seq < oldestReady->output.seq)) {
+        oldestReady = &agu;
+      }
+    }
 
-    RobEntry &e = rob.at(op.robIdx);
-    if (le.addr % le.size != 0)
-      e.fault = 1;
-    else if ((uint64_t)le.addr + le.size > msys.backing.bytes.size())
-      e.fault = 2;
-    if (le.isStore) {
-      if (le.dataReady)
-        e.done = true; // else done when the data operand arrives
-      if (cfg.memOrder == MemOrder::Speculative && !e.fault)
-        violationScan(le);
+    if (!oldestReady)
+      return;
+
+    const FuOp op = oldestReady->output;
+    oldestReady->output.valid = false;
+
+    LsqEntry &lsqEntry = lsq.at(op.lsqIdx);
+    lsqEntry.addr = op.value;
+    lsqEntry.size = (uint8_t)accessSize(lsqEntry.op);
+    lsqEntry.addrValid = true;
+
+    RobEntry &robEntry = rob.at(op.robIdx);
+    if (lsqEntry.addr % lsqEntry.size != 0)
+      robEntry.fault = 1;
+    else if ((uint64_t)lsqEntry.addr + lsqEntry.size > memSystem.backing.bytes.size())
+      robEntry.fault = 2;
+
+    if (lsqEntry.isStore) {
+      if (lsqEntry.dataReady)
+        robEntry.done = true;
+
+      if (config.memOrder == MemOrder::Speculative && !robEntry.fault)
+        violationScan(lsqEntry);
     }
   }
 }
 
-// A store's address just resolved. Any YOUNGER load that already read
-// an overlapping address (from the cache or by forwarding) may have
-// consumed a stale value; the oldest such load replays, even if it
-// happened to forward the right data. Replay reuses the mispredict
-// path wholesale: flush from the load down and refetch it
+// Detects if any younger load already read memory overlapping this newly
+// resolved store; if so, replays starting at the oldest offending load.
 void OoOCore::violationScan(const LsqEntry &store) {
   const LsqEntry *victim = nullptr;
-  lsq.visitAccessedLoads([&](uint32_t slot) {
-    const LsqEntry &le = lsq.at(slot);
-    if (le.seq > store.seq &&
-        overlaps(store.addr, store.size, le.addr, le.size)) {
-      victim = &le;
-      return false; // oldest overlapping younger load; no need to scan on
+
+  for (uint32_t i = 0; i < lsq.count(); i++) {
+    const LsqEntry &entry = lsq.nth(i);
+    if (!entry.isStore && (entry.issued || entry.done) &&
+        entry.seq > store.seq &&
+        overlaps(store.addr, store.size, entry.addr, entry.size)) {
+      victim = &entry;
+      break;
     }
-    return true;
-  });
+  }
+
   if (!victim)
     return;
+
   stats.loadReplays++;
-  if (cfg.depPredictor)
-    depEntry(victim->pc) = 3;
-  const uint64_t vseq = victim->seq;
-  const uint32_t vpc = victim->pc;
-  if (trace) {
-    char b[64];
-    snprintf(b, sizeof b, "load replay @0x%08x", vpc);
-    events.push_back(b);
-  }
-  // Squashed conditionals shifted the speculative history at fetch;
-  // rewind to the replaying load's snapshot, just like a mispredict
-  if (cfg.usePredictor)
-    pred.restore(rob.at(victim->robIdx).predBefore);
-  recover(vseq - 1); // the load itself flushes too
-  pendRedirect = true;
-  pendTarget = vpc;
+
+  const uint64_t victimSeq = victim->seq;
+  const uint32_t victimPc = victim->pc;
+
+  if (config.usePredictor)
+    predictor.restore(rob.at(victim->robIdx).predCheckpoint);
+
+  recover(victimSeq - 1);
+  pendingRedirect = true;
+  pendingTarget = victimPc;
 }
 
-// L1D completions. Store acks carry a stable buffer slot and transaction id.
-// Loads match through their {slot, generation} tag; a mismatch means
-// the slot was squashed and reused, and the response is dropped
 void OoOCore::drainDataResponses() {
   while (dmem->hasResponse()) {
-    // Data-port requests are scalar: read only the fields we consume.
     const MemResponse &response = dmem->frontResponse();
     const uint64_t tag = response.tag;
-    const uint32_t data = response.rdata;
+    const uint32_t data = response.readData;
     dmem->popResponse();
-    if (tag & (1ull << 63)) { // a committed store's ack
-      const uint32_t txn = (uint32_t)tag;
-      const uint32_t slot = uint32_t((tag & ~(1ull << 63)) >> 32);
-      if (sb.live(slot)) {
-        StoreBufEntry &st = sb.at(slot);
-        if (st.inflight && !st.acked && st.txn == txn)
-          st.acked = true;
+
+    if (tag & kStoreBufferTagBit) {
+      const uint32_t txnId = (uint32_t)tag;
+      const uint32_t slot = uint32_t((tag & ~kStoreBufferTagBit) >> 32);
+
+      if (storeBuffer.live(slot)) {
+        StoreBufferEntry &storeEntry = storeBuffer.at(slot);
+        if (storeEntry.inFlight && !storeEntry.acked && storeEntry.txnId == txnId)
+          storeEntry.acked = true;
       }
       continue;
     }
-    const uint32_t idx = (uint32_t)(tag >> 16);
-    const uint16_t gen = (uint16_t)tag;
-    if (!lsq.live(idx))
+
+    const uint32_t lsqSlot = (uint32_t)(tag >> 16);
+    const uint16_t generation = (uint16_t)tag;
+
+    // Ignore responses belonging to loads that were already squashed/reused.
+    if (!lsq.live(lsqSlot))
       continue;
-    LsqEntry &le = lsq.at(idx);
-    if (le.isStore || !le.issued || le.done || le.gen != gen)
-      continue; // stale response from a squashed generation
-    lsq.completeLoad(le, extendLoad(le.op, data));
+
+    LsqEntry &lsqEntry = lsq.at(lsqSlot);
+    if (lsqEntry.isStore || !lsqEntry.issued || lsqEntry.done ||
+        lsqEntry.generation != generation) {
+      continue;
+    }
+
+    lsqEntry.value = extendLoad(lsqEntry.op, data);
+    lsqEntry.done = true;
   }
 }
 
-// The memory engine. Several loads and committed stores can be in
-// flight at the L1D at once (its MSHRs absorb the misses); up to
-// dataPorts new accesses start per cycle. Which loads may go depends on the
-// memory-ordering mode; committed stores stream from the store buffer,
-// which wins the port only when full, because a full store buffer
-// stalls commit and must always be able to drain
+// Captures ready store data, reports completed loads to writeback, checks
+// store-to-load forwarding, and issues up to `dataPorts` accesses to L1D.
 void OoOCore::lsqOperate() {
   drainDataResponses();
-  while (!sb.empty() && sb.head().acked)
-    sb.popHead(); // acks can arrive out of order; entries pop in order
 
-  // Visit only pending updates, oldest first: surface loads and capture store
-  // data whose physical register is ready. Each store's register is
-  // written exactly once while the store is live, so captured data stays valid.
-  if (lsq.needsUpdate()) {
-    size_t nextOutput = 0;
-    lsq.visitUpdates([&](LsqEntry &le) {
-      if (le.isStore && !le.dataReady && prf.ready[le.dataPreg]) {
-        lsq.captureStoreData(le, prf.val[le.dataPreg]);
-        if (le.addrValid)
-          rob.at(le.robIdx).done = true;
-      }
-      if (!le.isStore && le.done && !le.reported) {
-        while (nextOutput < loadOuts.size() && loadOuts[nextOutput].valid)
-          nextOutput++;
-        if (nextOutput == loadOuts.size())
-          return true;
-        FuOp &slot = loadOuts[nextOutput++];
+  while (!storeBuffer.empty() && storeBuffer.head().acked)
+    storeBuffer.popHead();
+
+  size_t nextOutput = 0;
+  for (uint32_t i = 0; i < lsq.count(); i++) {
+    LsqEntry &entry = lsq.nth(i);
+
+    if (entry.isStore && !entry.dataReady && physRegs.ready[entry.dataPhysReg]) {
+      entry.data = physRegs.values[entry.dataPhysReg];
+      entry.dataReady = true;
+      if (entry.addrValid)
+        rob.at(entry.robIdx).done = true;
+    }
+
+    if (!entry.isStore && entry.done && !entry.reported) {
+      while (nextOutput < loadOutputs.size() && loadOutputs[nextOutput].valid)
+        nextOutput++;
+
+      if (nextOutput < loadOutputs.size()) {
+        FuOp &slot = loadOutputs[nextOutput++];
         slot.valid = true;
-        slot.seq = le.seq;
-        slot.robIdx = le.robIdx;
-        slot.pdst = le.pdst;
-        slot.value = le.value;
+        slot.seq = entry.seq;
+        slot.robIdx = entry.robIdx;
+        slot.destPhysReg = entry.destPhysReg;
+        slot.value = entry.value;
         wbReady.push_back(&slot);
-        lsq.reportLoad(le);
+        entry.reported = true;
       }
-      return true;
-    });
+    }
   }
 
-  // A shared load/store bandwidth budget. Responses and completed-load
-  // reporting stay outside this loop, so more ports do not shorten latency.
-  for (uint32_t access = 0; access < cfg.dataPorts; ++access) {
-    bool sent = false;
-    // Visit only address-ready, unissued loads, in age order. An older
-    // store with an unknown address is a wall in
-    // Conservative and Bypass modes (and, in Speculative mode, for loads
-    // the dependence predictor has flagged); other Speculative loads walk
-    // straight past it and pay with a replay when wrong
-    LsqEntry *cand = nullptr;
-    uint32_t candRing = 0;
-    bool candSpeculative = false;
-    const uint64_t unknownSeq = lsq.oldestUnknownStore();
-    const uint64_t pendingSeq = cfg.memOrder == MemOrder::Conservative
-                                    ? lsq.oldestPendingLoad() : UINT64_MAX;
-    lsq.visitCandidates([&](uint32_t slot) {
-      LsqEntry &le = lsq.at(slot);
-      if (le.seq > pendingSeq)
-        return false; // conservative mode: no passing an in-flight load
-      const bool wall = unknownSeq < le.seq;
-      if (rob.at(le.robIdx).fault) {
-        // Faulted (possibly wrong-path garbage): never touch memory.
-        // Produce a zero so the entry can reach commit, which decides
-        // whether the fault is real
-        lsq.completeLoad(le, 0);
-        return true;
+  for (uint32_t port = 0; port < config.dataPorts; ++port) {
+    LsqEntry *selectedLoad = nullptr;
+    uint32_t selectedSlot = 0;
+
+    const uint64_t oldestUnknownSeq = lsq.oldestUnknownStore();
+    const uint64_t oldestPendingSeq =
+        config.memOrder == MemOrder::Conservative ? lsq.oldestPendingLoad()
+                                                  : UINT64_MAX;
+
+    for (uint32_t i = 0; i < lsq.count(); i++) {
+      LsqEntry &loadEntry = lsq.nth(i);
+      if (loadEntry.isStore || !loadEntry.addrValid || loadEntry.issued || loadEntry.done)
+        continue;
+
+      if (loadEntry.seq > oldestPendingSeq)
+        break;
+
+      // Faulting loads skip memory and complete immediately so commit raises the fault.
+      if (rob.at(loadEntry.robIdx).fault) {
+        loadEntry.value = 0;
+        loadEntry.done = true;
+        continue;
       }
-      const bool cautious = cfg.memOrder != MemOrder::Speculative ||
-                            (cfg.depPredictor && depEntry(le.pc) >= 2);
-      if (wall && cautious)
-        return true;
-      // Visit known older stores from the newest, then the
-      // store buffer (all committed, hence older). The nearest older store
-      // to a matching address decides: an exact match forwards, a partial
-      // overlap waits (no byte merging across stores)
-      bool blocked = false, forwarded = false;
-      auto olderStore = [&](uint32_t addr, uint32_t size, bool dataReady,
-                            uint32_t data) {
-        if (addr == le.addr && size == le.size) {
-          if (!dataReady) {
-            blocked = true; // aliases, but the data doesn't exist yet
+
+      if (oldestUnknownSeq < loadEntry.seq && config.memOrder != MemOrder::Speculative)
+        continue;
+
+      bool blocked = false;
+      bool forwarded = false;
+
+      auto checkOlderStore = [&](uint32_t storeAddr, uint32_t storeSize,
+                                 bool storeDataReady, uint32_t storeData) {
+        if (storeAddr == loadEntry.addr && storeSize == loadEntry.size) {
+          if (!storeDataReady) {
+            blocked = true;
           } else {
-            lsq.completeLoad(le, extendLoad(le.op, data));
+            loadEntry.value = extendLoad(loadEntry.op, storeData);
+            loadEntry.done = true;
             forwarded = true;
           }
-        } else if (overlaps(addr, size, le.addr, le.size)) {
-          blocked = true; // partial overlap: wait for the store to drain
+        } else if (overlaps(storeAddr, storeSize, loadEntry.addr, loadEntry.size)) {
+          blocked = true;
         }
       };
-      if (lsq.mayStoreToWord(le.addr))
-        lsq.visitOlderStores(slot, [&](const LsqEntry &st) {
-          olderStore(st.addr, st.size, st.dataReady, st.data);
-          return !blocked && !forwarded;
-        });
-      for (int j = (int)sb.count() - 1; j >= 0 && !blocked && !forwarded; j--) {
-        const StoreBufEntry &st = sb.nth((uint32_t)j);
-        olderStore(st.addr, st.size, true, st.data);
+
+      // Search youngest-to-oldest older stores in the LSQ, then the store buffer.
+      for (int j = (int)i - 1; j >= 0 && !blocked && !forwarded; j--) {
+        const LsqEntry &storeEntry = lsq.nth((uint32_t)j);
+        if (storeEntry.isStore && storeEntry.addrValid)
+          checkOlderStore(storeEntry.addr, storeEntry.size, storeEntry.dataReady, storeEntry.data);
       }
+
+      for (int j = (int)storeBuffer.count() - 1; j >= 0 && !blocked && !forwarded; j--) {
+        const StoreBufferEntry &storeEntry = storeBuffer.nth((uint32_t)j);
+        checkOlderStore(storeEntry.addr, storeEntry.size, true, storeEntry.data);
+      }
+
       if (forwarded) {
         stats.loadsForwarded++;
-        if (wall)
-          stats.specLoads++; // forwarded past an unknown address
-        if (trace)
-          events.push_back("store->load forward");
-        if (cfg.memOrder == MemOrder::Conservative)
-          return false;
-        return true; // forwarding is free; keep looking for a port customer
+        if (config.memOrder == MemOrder::Conservative)
+          break;
+        continue;
       }
-      if (!blocked) {
-        cand = &le;
-        candRing = slot;
-        candSpeculative = wall;
-        return false;
-      }
-      // blocked: Conservative stays in order; the other modes may issue a
-      // younger, independent load instead
-      if (cfg.memOrder == MemOrder::Conservative)
-        return false;
-      return true;
-    });
 
-    if (cand || !sb.empty()) {
-      // For each available access, the store buffer goes first only
-      // when full or when no load is ready
-      StoreBufEntry *st = sb.nextToIssue();
-      if (st && (sb.full() || !cand)) {
-        if (dmem->canAccept()) {
-          MemRequest req;
-          req.addr = st->addr;
-          req.size = st->size;
-          req.isWrite = true;
-          req.wdata = st->data;
-          req.tag = (1ull << 63) | (uint64_t(sb.nextIssueSlot()) << 32) | sbTxnCtr;
-          st->txn = sbTxnCtr++;
-          sb.issue();
-          dmem->access(req);
-          sent = true;
-        }
-      } else if (cand && dmem->canAccept()) {
-        MemRequest req;
-        req.addr = cand->addr;
-        req.size = cand->size;
-        req.tag = ((uint64_t)candRing << 16) | cand->gen;
-        lsq.issueLoad(*cand);
-        if (candSpeculative)
-          stats.specLoads++;
-        dmem->access(req);
-        sent = true;
+      if (!blocked) {
+        selectedLoad = &loadEntry;
+        selectedSlot = lsq.indexOf(i);
+        break;
       }
+
+      if (config.memOrder == MemOrder::Conservative)
+        break;
     }
-    if (!sent)
+
+    bool sentAccess = false;
+    StoreBufferEntry *storeEntry = storeBuffer.nextToIssue();
+
+    // Prioritize draining the store buffer when full or when no load is ready.
+    if (storeEntry && (storeBuffer.full() || !selectedLoad)) {
+      if (dmem->canAccept()) {
+        MemRequest req;
+        req.addr = storeEntry->addr;
+        req.size = storeEntry->size;
+        req.isWrite = true;
+        req.writeData = storeEntry->data;
+        req.tag = makeStoreTag(storeBuffer.nextIssueSlot(), storeBufferTxnCounter);
+
+        storeEntry->txnId = storeBufferTxnCounter++;
+        storeBuffer.issue();
+        dmem->access(req);
+        sentAccess = true;
+      }
+    } else if (selectedLoad && dmem->canAccept()) {
+      MemRequest req;
+      req.addr = selectedLoad->addr;
+      req.size = selectedLoad->size;
+      req.tag = makeLoadTag(selectedSlot, selectedLoad->generation);
+
+      selectedLoad->issued = true;
+      dmem->access(req);
+      sentAccess = true;
+    }
+
+    if (!sentAccess)
       break;
   }
 
-  drainDataResponses(); // a combinational hit completes this cycle
-
-  if (lsq.hasPendingLoads()) {
-    stats.dataStallCycles++;
-    if (trace)
-      events.push_back("dmem wait");
-  }
+  drainDataResponses();
 }
 
-// Issue: up to width instructions per cycle leave the issue queue,
-// oldest first among those whose operands are ready and whose
-// functional unit can accept. Operand values come from the physical
-// register file; writeback ran earlier this cycle, so a ready bit set
-// today is readable today
+FuUnit *OoOCore::acquireUnit(FuKind kind, size_t &nextAlu, size_t &nextAgu) {
+  switch (kind) {
+  case FuKind::ALU:
+    while (nextAlu < alus.size() && !alus[nextAlu].canAccept())
+      nextAlu++;
+    return nextAlu < alus.size() ? &alus[nextAlu++] : nullptr;
+
+  case FuKind::BRANCH: return &branchUnit;
+  case FuKind::MUL:    return &mulUnit;
+  case FuKind::DIV:    return &divUnit;
+
+  case FuKind::LSU:
+    while (nextAgu < agus.size() && !agus[nextAgu].canAccept())
+      nextAgu++;
+    return nextAgu < agus.size() ? &agus[nextAgu++] : nullptr;
+
+  case FuKind::NONE:
+    return nullptr;
+  }
+
+  return nullptr;
+}
+
+// Issues up to `width` ready instructions oldest-first to available functional units.
 void OoOCore::issueStage() {
   uint32_t issued = 0;
-  size_t nextAlu = 0, nextAgu = 0;
-  iq.visitReady(rob.indexOf(0), [&](IqEntry &candidate) {
-    IqEntry *q = &candidate;
-    const RobEntry &entry = rob.at(q->robIdx);
-    const Instr &I = entry.ins;
-    FuUnit *unit = nullptr;
-    switch (q->unit) {
-    case FuKind::ALU:
-      // Units only get busier during issue, so each search resumes
-      // where the previous one stopped
-      while (nextAlu < alus.size() && !alus[nextAlu].canAccept())
-        nextAlu++;
-      if (nextAlu < alus.size())
-        unit = &alus[nextAlu++];
-      break;
-    case FuKind::BRANCH:
-      unit = &brUnit;
-      break;
-    case FuKind::MUL:
-      unit = &mulUnit;
-      break;
-    case FuKind::DIV:
-      unit = &divUnit;
-      break;
-    case FuKind::LSU:
-      while (nextAgu < agus.size() && !agus[nextAgu].canAccept())
-        nextAgu++;
-      if (nextAgu < agus.size())
-        unit = &agus[nextAgu++];
-      break;
-    case FuKind::NONE:
-      break; // system ops never enter the issue queue
+  size_t nextAlu = 0;
+  size_t nextAgu = 0;
+  size_t kept = 0;
+
+  for (size_t i = 0; i < iq.entries.size(); i++) {
+    IqEntry &entry = iq.entries[i];
+
+    if (issued < config.width && entry.ready1 && entry.ready2) {
+      FuUnit *targetUnit = acquireUnit(entry.unit, nextAlu, nextAgu);
+      if (targetUnit && targetUnit->canAccept()) {
+        const RobEntry &robEntry = rob.at(entry.robIdx);
+        const ExecResult execResult = execute(
+            robEntry.instr, robEntry.pc, physRegs.values[entry.src1PhysReg],
+            physRegs.values[entry.src2PhysReg]);
+
+        FuOp op;
+        op.valid = true;
+        op.seq = entry.seq;
+        op.robIdx = entry.robIdx;
+        op.lsqIdx = entry.lsqIdx;
+        op.destPhysReg = robEntry.destPhysReg;
+        op.value = execResult.value;
+        op.redirect = execResult.redirect;
+        op.target = execResult.target;
+
+        targetUnit->accept(op);
+        issued++;
+        continue;
+      }
     }
-    if (!unit || !unit->canAccept())
-      return true; // the unit is busy; try a younger ready op instead
 
-    // execute() ignores operands the instruction doesn't use
-    const ExecResult r = execute(I, entry.pc, prf.val[q->ps1], prf.val[q->ps2]);
+    if (kept != i)
+      iq.entries[kept] = entry;
+    kept++;
+  }
 
-    FuOp op;
-    op.valid = true;
-    op.seq = q->seq;
-    op.robIdx = q->robIdx;
-    op.lsqIdx = q->lsqIdx;
-    op.pdst = entry.pdst;
-    op.value = r.value;
-    op.redirect = r.redirect;
-    op.target = r.target;
-    unit->accept(op);
-    if (trace)
-      note(vIS, I);
-    iq.release(q);
-    issued++;
-    stats.issuedOps++;
-    return issued < cfg.width;
-  });
+  iq.entries.resize(kept);
 }
 
-// Dispatch: up to width per cycle, in program order: decode, rename,
-// allocate ROB (and LSQ) entries, drop into the issue queue. Any
-// missing resource stalls this instruction and everything younger
+// Decodes, renames, and allocates ROB, IQ, and LSQ entries up to `width` per cycle.
 void OoOCore::dispatchStage() {
-  for (uint32_t w = 0; w < cfg.width; w++) {
-    if (fetchQ.empty()) {
-      if (w == 0)
-        stats.dsFetchEmpty++;
+  for (uint32_t lane = 0; lane < config.width; lane++) {
+    if (fetchQueue.empty())
       return;
-    }
-    const Fetched f = fetchQ.head();
-    const Instr I = decode(f.raw);
-    const FuKind unit = fuKindOf(I.op);
-    const bool sys = unit == FuKind::NONE;
-    const bool mem = isLoad(I.op) || isStore(I.op);
-    const bool hasDest = writesRd(I.op) && I.rd != 0;
 
-    // System ops wait for the machine to empty completely (all older
-    // work committed AND the store buffer drained), then run alone
-    // and take effect at commit
-    if (sys && (w != 0 || !rob.empty() || !sb.empty())) {
-      if (w == 0) {
-        stats.dsSerialize++;
-        if (trace)
-          events.push_back("serialize wait");
-      }
-      return;
-    }
-    if (rob.full()) {
-      if (w == 0)
-        stats.dsRobFull++;
-      return;
-    }
-    if (mem && lsq.full()) {
-      if (w == 0)
-        stats.dsLsqFull++;
-      return;
-    }
-    if (iq.full()) {
-      if (w == 0)
-        stats.dsIqFull++;
-      return;
-    }
-    if (hasDest && freeList.empty()) {
-      if (w == 0)
-        stats.dsNoPreg++; // only reachable with an explicit, smaller physRegs
-      return;
-    }
+    const FetchedInstr fetched = fetchQueue.head();
+    const Instr instr = decode(fetched.raw);
+    const FuKind unitKind = fuKindOf(instr.op);
+    const bool isSystemOp = unitKind == FuKind::NONE;
+    const bool isMemOp = isLoad(instr.op) || isStore(instr.op);
+    const bool hasDest = writesRd(instr.op) && instr.rd != 0;
 
-    if (recTimerArmed) { // dispatch resumed: close the flush window
-      stats.recoveryLossCycles += stats.cycles - recTimerStart;
-      recTimerArmed = false;
-    }
-    fetchQ.popHead();
-    const uint64_t seq = seqCtr++;
+    // System ops (ECALL, EBREAK, FENCE, ILLEGAL) serialize on an empty machine.
+    if (isSystemOp && (lane != 0 || !rob.empty() || !storeBuffer.empty()))
+      return;
+    if (rob.full() || (isMemOp && lsq.full()) || iq.full() || (hasDest && freeList.empty()))
+      return;
+
+    fetchQueue.popHead();
+
+    const uint64_t seq = nextSeq++;
     const uint32_t robIdx = rob.alloc();
-    RobEntry &e = rob.at(robIdx);
-    e.seq = seq;
-    e.pc = f.pc;
-    e.ins = I;
-    // Every entry keeps its fetch-time history snapshot: a flush from
-    // ANY point (branch mispredict or load replay) must be able to
-    // rewind the speculative history and RAS to before the squashed ones
-    e.predBefore = f.predBefore;
+    RobEntry &robEntry = rob.at(robIdx);
+    robEntry.seq = seq;
+    robEntry.pc = fetched.pc;
+    robEntry.instr = instr;
+    robEntry.predCheckpoint = fetched.predCheckpoint;
 
-    if (sys) {
-      e.done = true;
-      e.isSystem = true;
-      e.sysA0 = rmap.map[10]; // the map is architectural right now
-      e.sysA7 = rmap.map[17];
-      if (trace)
-        note(vDS, I);
+    if (isSystemOp) {
+      robEntry.done = true;
+      robEntry.isSystem = true;
+      robEntry.syscallArgPhysReg = renameMap.archToPhys[10];
+      robEntry.syscallNumPhysReg = renameMap.archToPhys[17];
       return;
     }
 
-    // Sources rename through the CURRENT map, including updates made
-    // by the older instruction dispatched this same cycle, and before
-    // the destination displaces anything (rs may equal rd)
-    const uint8_t ps1 = rmap.map[I.rs1];
-    const uint8_t ps2 = rmap.map[I.rs2];
+    const uint8_t src1PhysReg = renameMap.archToPhys[instr.rs1];
+    const uint8_t src2PhysReg = renameMap.archToPhys[instr.rs2];
+
     if (hasDest) {
-      e.pdst = freeList.head();
+      robEntry.destPhysReg = freeList.head();
       freeList.popHead();
-      e.prevPhys = rmap.map[I.rd];
-      rmap.map[I.rd] = e.pdst;
-      prf.ready[e.pdst] = false;
+      robEntry.prevPhysReg = renameMap.archToPhys[instr.rd];
+      renameMap.archToPhys[instr.rd] = robEntry.destPhysReg;
+      physRegs.ready[robEntry.destPhysReg] = false;
     }
 
-    e.isMem = mem;
+    robEntry.isMem = isMemOp;
     uint32_t lsqIdx = 0;
-    if (mem) {
+
+    if (isMemOp) {
       lsqIdx = lsq.alloc();
-      LsqEntry &le = lsq.at(lsqIdx);
-      le.seq = seq;
-      le.robIdx = robIdx;
-      le.pc = f.pc;
-      le.op = I.op;
-      le.isStore = isStore(I.op);
-      le.pdst = e.pdst;
-      if (le.isStore) {
-        // Address and data resolve independently: capture the data
-        // now if its producer already wrote back, else watch its preg
-        lsq.setStoreSource(le, ps2, prf.ready[ps2], prf.val[ps2]);
+      LsqEntry &lsqEntry = lsq.at(lsqIdx);
+      lsqEntry.seq = seq;
+      lsqEntry.robIdx = robIdx;
+      lsqEntry.pc = fetched.pc;
+      lsqEntry.op = instr.op;
+      lsqEntry.isStore = isStore(instr.op);
+      lsqEntry.destPhysReg = robEntry.destPhysReg;
+
+      if (lsqEntry.isStore) {
+        lsqEntry.dataPhysReg = src2PhysReg;
+        lsqEntry.dataReady = physRegs.ready[src2PhysReg];
+        if (lsqEntry.dataReady)
+          lsqEntry.data = physRegs.values[src2PhysReg];
       }
     }
-    if (unit == FuKind::BRANCH) {
-      e.isBranch = true;
-      e.predictedTaken = f.predTaken;
-      e.predictedTarget = f.predTarget;
-      e.predIdx = f.predIdx;
+
+    if (unitKind == FuKind::BRANCH) {
+      robEntry.isBranch = true;
+      robEntry.predictedTaken = fetched.predTaken;
+      robEntry.predictedTarget = fetched.predTarget;
+      robEntry.phtIndex = fetched.phtIndex;
     }
 
-    IqEntry *q = iq.allocate(robIdx);
-    q->seq = seq;
-    q->lsqIdx = lsqIdx;
-    q->unit = unit;
-    q->ps1 = ps1;
-    q->ps2 = ps2;
-    // Stores don't wait for their data to issue; only the address
-    // operand gates them, and the LSQ captures the data when it
-    // appears
-    iq.track(q, !usesRs1(I.op) || prf.ready[ps1],
-             !usesRs2(I.op) || isStore(I.op) || prf.ready[ps2]);
-    if (trace)
-      note(vDS, I);
+    // Store data (rs2) is captured directly in the LSQ, so the AGU only waits on rs1.
+    IqEntry iqEntry;
+    iqEntry.seq = seq;
+    iqEntry.robIdx = robIdx;
+    iqEntry.lsqIdx = lsqIdx;
+    iqEntry.src1PhysReg = src1PhysReg;
+    iqEntry.src2PhysReg = src2PhysReg;
+    iqEntry.ready1 = !usesRs1(instr.op) || physRegs.ready[src1PhysReg];
+    iqEntry.ready2 = !usesRs2(instr.op) || isStore(instr.op) || physRegs.ready[src2PhysReg];
+    iqEntry.unit = unitKind;
+    iq.push(iqEntry);
   }
 }
 
-// Fetch: one aligned block per cycle, steered by the predictor. pc
-// advances when the block arrives (the predictor may redirect it
-// mid-block); a squash marks the in-flight fetch stale
 void OoOCore::fetchStage() {
-  auto consume = [&] {
-    const MemResponse &r = imem->frontResponse();
-    fOutstanding = false;
-    if (fStale)
-      fStale = false;
+  auto consumeResponse = [&] {
+    const MemResponse &response = imem->frontResponse();
+    fetchOutstanding = false;
+
+    if (fetchStale)
+      fetchStale = false;
     else
-      processFetch(r);
+      processFetch(response);
+
     imem->popResponse();
   };
-  if (fOutstanding && imem->hasResponse())
-    consume();
-  if (fOutstanding || pendRedirect ||
-      fetchQ.count() + fBytes / 4 > cfg.fetchQSize)
-    return;
-  if (pc % 4 != 0) {
-    // A younger branch may redirect here before an older branch squashes
-    // it. Wait for recovery; an unsquashed bad target faults at commit.
-    stats.badFetchWaitCycles++;
+
+  if (fetchOutstanding && imem->hasResponse())
+    consumeResponse();
+
+  if (fetchOutstanding || pendingRedirect ||
+      fetchQueue.count() + fetchBlockBytes / 4 > config.fetchQSize) {
     return;
   }
-  if (pc >= msys.backing.bytes.size()) {
-    // The same wait for a target outside memory. Once nothing older is
-    // in flight, pc is architectural and the fetch fault is real
-    if (rob.empty() && fetchQ.count() == 0)
-      msys.backing.failOutOfRange(pc, "instruction fetch");
-    stats.badFetchWaitCycles++;
+
+  // Wrong-path speculative PCs may be misaligned or out of range; stall fetch
+  // until the older branch redirects or the machine drains and faults precisely.
+  if (pc % 4 != 0)
+    return;
+
+  if (pc >= memSystem.backing.bytes.size()) {
+    if (rob.empty() && fetchQueue.count() == 0)
+      memSystem.backing.failOutOfRange(pc, "instruction fetch");
     return;
   }
+
   if (!imem->canAccept())
     return;
+
   MemRequest req;
-  req.addr = pc & ~(fBytes - 1);
-  req.size = fBytes;
+  req.addr = pc & ~(fetchBlockBytes - 1);
+  req.size = fetchBlockBytes;
+
   imem->access(req);
-  fOutstanding = true;
-  fBlock = req.addr;
-  fFetchPc = pc;
-  if (imem->hasResponse()) // 1-cycle port: complete this cycle
-    consume();
-  else if (trace)
-    events.push_back("ifetch wait");
+  fetchOutstanding = true;
+  fetchBlockAddr = req.addr;
+  fetchStartPc = pc;
+
+  if (imem->hasResponse())
+    consumeResponse();
 }
 
-void OoOCore::processFetch(const MemResponse &r) {
-  for (uint32_t idx = (fFetchPc - fBlock) / 4; idx < fBytes / 4; idx++) {
-    const uint32_t raw = (uint32_t)r.rline[idx * 4] |
-                         (uint32_t)r.rline[idx * 4 + 1] << 8 |
-                         (uint32_t)r.rline[idx * 4 + 2] << 16 |
-                         (uint32_t)r.rline[idx * 4 + 3] << 24;
-    const uint32_t wpc = fBlock + idx * 4;
-    Predictor::Pred p;
-    if (cfg.usePredictor)
-      p = pred.predict(wpc);
-    fetchQ.push(
-        Fetched{wpc, raw, p.taken, p.target, p.phtIdx, p.before});
-    if (p.taken) {
-      pc = p.target;
+void OoOCore::processFetch(const MemResponse &response) {
+  const uint32_t startWord = (fetchStartPc - fetchBlockAddr) / 4;
+  const uint32_t blockWords = fetchBlockBytes / 4;
+
+  for (uint32_t wordIdx = startWord; wordIdx < blockWords; wordIdx++) {
+    const uint32_t rawWord = readLittleEndian(response.readLine.data() + wordIdx * 4, 4);
+    const uint32_t instrPc = fetchBlockAddr + wordIdx * 4;
+
+    Predictor::Prediction prediction;
+    if (config.usePredictor)
+      prediction = predictor.predict(instrPc);
+
+    fetchQueue.push(FetchedInstr{instrPc, rawWord, prediction.taken,
+                                 prediction.target, prediction.phtIndex,
+                                 prediction.before});
+
+    // Stop consuming the fetch block on the first predicted-taken control transfer.
+    if (prediction.taken) {
+      pc = prediction.target;
       return;
     }
   }
-  pc = fBlock + fBytes;
+
+  pc = fetchBlockAddr + fetchBlockBytes;
 }
 
-// One clock cycle: stages in reverse pipeline order (each consumes
-// what the stage behind it produced in an earlier cycle), redirect at
-// the clock edge, units and memory ticking last
 void OoOCore::stepCycle() {
   stats.cycles++;
-  // start-of-cycle occupancy samples, averaged in the final report
-  stats.robOccSum += rob.count();
-  stats.iqOccSum += iq.count();
-  stats.lsqOccSum += lsq.count();
-  stats.sbOccSum += sb.count();
-  stats.pregsUsedSum += (cfg.physRegs - 32) - freeList.count();
-  if (trace) {
-    events.clear();
-    vDS.clear();
-    vIS.clear();
-    vWB.clear();
-    vCT.clear();
-    captureView();
-  }
 
   commitStage();
-  if (halted) {
-    if (trace)
-      printTrace();
+  if (halted)
     return;
-  }
+
   writebackStage();
   aguDrain();
   lsqOperate();
@@ -888,48 +802,26 @@ void OoOCore::stepCycle() {
   dispatchStage();
   fetchStage();
 
-  if (pendRedirect) {
-    if (fOutstanding)
-      fStale = true;
-    pc = pendTarget;
-    pendRedirect = false;
+  if (pendingRedirect) {
+    if (fetchOutstanding)
+      fetchStale = true;
+    pc = pendingTarget;
+    pendingRedirect = false;
   }
 
-  for (FuUnit *u : units)
-    if (u->tick())
-      wbReady.push_back(&u->out);
-  for (FuUnit &u : agus)
-    u.tick(); // address completions never consume a writeback port
-  msys.tick();
-  if (trace)
-    printTrace();
-}
+  for (FuUnit *unit : execUnits) {
+    if (unit->tick())
+      wbReady.push_back(&unit->output);
+  }
 
-// Trace: start-of-cycle occupancy, then per-stage activity as it
-// happens, then events
+  for (FuUnit &agu : agus)
+    agu.tick();
 
-void OoOCore::note(std::string &v, const Instr &ins) {
-  if (!trace)
-    return;
-  if (!v.empty())
-    v += "; ";
-  v += disasm(ins);
-}
+  memSystem.tick();
 
-void OoOCore::captureView() {
-  char b[64];
-  snprintf(b, sizeof b, "fq%u rob%2u iq%2u lsq%2u sb%u", fetchQ.count(),
-           rob.count(), iq.count(), lsq.count(), sb.count());
-  vOcc = b;
-}
-
-void OoOCore::printTrace() const {
-  fprintf(stderr,
-          "cyc %6" PRIu64 " | %s | DS %-28s | IS %-28s | WB %-28s | CT %-28s",
-          stats.cycles, vOcc.c_str(), vDS.empty() ? "-" : vDS.c_str(),
-          vIS.empty() ? "-" : vIS.c_str(), vWB.empty() ? "-" : vWB.c_str(),
-          vCT.empty() ? "-" : vCT.c_str());
-  for (const auto &event : events)
-    fprintf(stderr, "  ! %s", event.c_str());
-  fputc('\n', stderr);
+  if (config.trace) {
+    fprintf(stderr, "cyc %6" PRIu64 " | pc=0x%08x fq=%u rob=%u iq=%u lsq=%u sb=%u\n",
+            stats.cycles, pc, fetchQueue.count(), rob.count(), iq.count(),
+            lsq.count(), storeBuffer.count());
+  }
 }

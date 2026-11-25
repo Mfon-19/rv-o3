@@ -1,5 +1,3 @@
-# RV32IM benchmarks, built on the cdemo runtime.
-
 include ../cdemo/toolchain.mk
 
 BENCHES := $(patsubst %.c,%,$(wildcard *.c))

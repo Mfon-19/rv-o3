@@ -1,27 +1,31 @@
-/* FixedDiv without libgcc's signed 64-bit divide. Linked with
- * --wrap=FixedDiv, so the vendored engine keeps its own version unused.
- * The result is bit-identical to ((int64_t)a << 16) / b truncated to 32
- * bits. When |b| fits in 16 bits the 48-bit dividend splits exactly into
- * two 32-bit hardware divides:
- *   (|a| << 16) / |b| = (|a| / |b|) << 16  +  ((|a| % |b|) << 16) / |b|
- * because |a| % |b| < |b| <= 0xffff keeps the second dividend in 32 bits. 
- */
+// Bit-identical FixedDiv override (linked with --wrap=FixedDiv) using two
+// hardware RV32IM 32-bit divides when the divisor fits in 16 bits instead of
+// calling a slow 64-bit software divide helper.
+
 #include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
+
 #include "m_fixed.h"
 
-fixed_t __wrap_FixedDiv(fixed_t a, fixed_t b) {
-    if ((abs(a) >> 14) >= abs(b))
-        return (a ^ b) < 0 ? INT_MIN : INT_MAX;
-    const uint32_t ua = a < 0 ? 0u - (uint32_t)a : (uint32_t)a;
-    const uint32_t ub = b < 0 ? 0u - (uint32_t)b : (uint32_t)b;
-    uint32_t q;
-    if (ub <= 0xffff) {
-        const uint32_t whole = ua / ub, rest = ua - whole * ub;
-        q = (whole << 16) + (rest << 16) / ub;
+fixed_t __wrap_FixedDiv(fixed_t dividend, fixed_t divisor) {
+    if ((abs(dividend) >> 14) >= abs(divisor))
+        return (dividend ^ divisor) < 0 ? INT_MIN : INT_MAX;
+
+    const uint32_t abs_dividend =
+        dividend < 0 ? 0u - (uint32_t)dividend : (uint32_t)dividend;
+    const uint32_t abs_divisor =
+        divisor < 0 ? 0u - (uint32_t)divisor : (uint32_t)divisor;
+
+    uint32_t quotient = 0;
+
+    if (abs_divisor <= 0xffff) {
+        const uint32_t whole = abs_dividend / abs_divisor;
+        const uint32_t remainder = abs_dividend - whole * abs_divisor;
+        quotient = (whole << 16) + (remainder << 16) / abs_divisor;
     } else {
-        q = (uint32_t)(((uint64_t)ua << 16) / ub);
+        quotient = (uint32_t)(((uint64_t)abs_dividend << 16) / abs_divisor);
     }
-    return (fixed_t)((a ^ b) < 0 ? 0u - q : q);
+
+    return (fixed_t)((dividend ^ divisor) < 0 ? 0u - quotient : quotient);
 }

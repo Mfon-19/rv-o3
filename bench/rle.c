@@ -1,49 +1,56 @@
-/*
- * Run-length encode/decode round trip over a 4 KiB buffer of random
- * runs: byte loads and stores, short data-dependent inner loops, and a
- * verified decompression.
- */
+// Run-length encode/decode benchmark exercising byte loads/stores in short loops.
+
 #include "bench.h"
 
-#define N 4096u
+#define INPUT_LEN 4096u
 
-static unsigned char src[N];
-static unsigned char enc[2u * N + 8u];
-static unsigned char dec[N];
+static unsigned char input[INPUT_LEN];
+static unsigned char encoded[2u * INPUT_LEN + 8u];
+static unsigned char decoded[INPUT_LEN];
 
 int main(void) {
-    u32 i = 0;
-    while (i < N) {
-        u32 len = 1u + (lcg() & 15u);
-        unsigned char val = (unsigned char)(lcg() & 0xFFu);
-        for (u32 k = 0; k < len && i < N; k++)
-            src[i++] = val;
+    u32 pos = 0;
+    while (pos < INPUT_LEN) {
+        u32 run_len = 1u + (next_random() & 15u);
+        unsigned char byte_val = (unsigned char)(next_random() & 0xFFu);
+
+        for (u32 k = 0; k < run_len && pos < INPUT_LEN; k++)
+            input[pos++] = byte_val;
     }
-    /* encode as (count, value) pairs, count 1..255 */
-    u32 e = 0;
-    i = 0;
-    while (i < N) {
-        u32 run = 1;
-        while (i + run < N && src[i + run] == src[i] && run < 255u)
-            run++;
-        enc[e++] = (unsigned char)run;
-        enc[e++] = src[i];
-        i += run;
+
+    u32 encoded_len = 0;
+    pos = 0;
+
+    while (pos < INPUT_LEN) {
+        u32 run_len = 1;
+        while (pos + run_len < INPUT_LEN && input[pos + run_len] == input[pos] &&
+               run_len < 255u) {
+            run_len++;
+        }
+
+        encoded[encoded_len++] = (unsigned char)run_len;
+        encoded[encoded_len++] = input[pos];
+        pos += run_len;
     }
-    /* decode and verify */
-    u32 d = 0;
-    for (u32 k = 0; k < e; k += 2)
-        for (u32 r = 0; r < enc[k]; r++)
-            dec[d++] = enc[k + 1];
-    u32 ok = (d == N);
-    for (i = 0; i < N; i++)
-        if (dec[i] != src[i])
-            ok = 0;
-    u32 sum = 0;
-    for (i = 0; i < N; i++)
-        sum = sum * 33u + dec[i];
-    print_int((int)ok);
-    print_int((int)e);
-    print_int((int)sum);
+
+    u32 decoded_len = 0;
+    for (u32 idx = 0; idx < encoded_len; idx += 2) {
+        for (u32 rep = 0; rep < encoded[idx]; rep++)
+            decoded[decoded_len++] = encoded[idx + 1];
+    }
+
+    u32 matches = (decoded_len == INPUT_LEN);
+    for (pos = 0; pos < INPUT_LEN; pos++) {
+        if (decoded[pos] != input[pos])
+            matches = 0;
+    }
+
+    u32 hash = 0;
+    for (pos = 0; pos < INPUT_LEN; pos++)
+        hash = hash * 33u + decoded[pos];
+
+    print_int((int)matches);
+    print_int((int)encoded_len);
+    print_int((int)hash);
     return 0;
 }

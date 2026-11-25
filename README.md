@@ -1,235 +1,171 @@
 # rv-o3
 
-A cycle-level simulator of a superscalar, out-of-order RISC-V (RV32IM)
-processor, written in C++. It models register
-renaming, a reorder buffer, oldest-first issue, branch prediction with
-full misprediction recovery, speculative load reordering with replay,
-and a nonblocking cache hierarchy. Every run can be checked instruction by
-instruction against a reference interpreter.
+A cycle-level C++20 simulator of a superscalar, out-of-order **RISC-V (RV32IM)** processor (`rvsim`). It models register renaming, a reorder buffer, oldest-first issue, branch prediction (bimodal/gshare/TAGE + BTB + RAS) with full squash recovery, speculative load reordering with replay, and a nonblocking L1I/L1D/L2/DRAM cache hierarchy. Every execution can be verified instruction-by-instruction against a golden functional interpreter (`-d`).
 
-It is fast and complete enough to run **Doom**: the engine, game logic,
-and renderer execute as RV32IM instructions on the simulated core, at
-**about 5.6 frames per second**.
+It is fast and complete enough to run **Doom** as an RV32IM guest binary inside the simulated core, streaming rendered frames to a native SDL3 window.
 
-> Measured on an Apple M4 with the profile-guided build (`make pgo`),
-> playing the built-in demo without a window: 177 ms per frame, or
-> 5.65 FPS. A normal `make` build gets 5.2 FPS. The simulated CPU is not
-> the limit; the frame rate depends on how fast your computer can run the
-> simulator. See [doom/README.md](doom/README.md).
-
-## Build and run
+## Build and Run
 
 ```sh
 make
-./rvsim tests/sum.hex        # prints 55, then a statistics report
-./rvsim -d tests/sum.hex     # the same, differentially checked
-make test                    # the regression suite
+./rvsim tests/sum.hex         # runs program, prints output + stats
+./rvsim -d tests/sum.hex      # runs with lockstep differential verification
+make test                     # unit tests + directed .hex programs under -d
 ```
 
-Program output goes to stdout; statistics and traces go to stderr. The
-simulator needs only a C++20 compiler. The C demo and benchmarks also need
-Clang and GNU RISC-V binutils; Doom additionally needs SDL3.
+The simulator requires only a C++20 compiler. Building `bench/` and `cdemo/` requires Clang and GNU RISC-V binutils; running `doom/` additionally requires SDL3 and Python 3.11+.
 
-## The machine
+## Processor & Memory Architecture
 
 ```text
-     pc, steered by the predictor (bimodal/TAGE + BTB + RAS)
-       |
-   +-------+   +--------+   +----------------+   +-------------+
-   | fetch |-->| decode |-->|    dispatch    |-->| issue queue |
-   |       |   | rename |   | ROB, LSQ alloc |   |             |
-   +-------+   +--------+   +----------------+   +------+------+
-       ^                                            ^    |
-       |                                    wakeup: |    | oldest ready
-       | redirect: refetch after            results |    | first
-       | a mispredict (caught at            ready   |    |
-       | writeback) or a load           +-----------+----+----------------+
-       | replay (caught in the          | ALU  ALU  branch  mul  div  AGU |
-       | LSQ)                           +----+-----------------------+----+
-       |                                     | results               | memory ops
-       |                                     v                       v
-       |                        +---------------------+    +----------------+
-       +------------------------| writeback           |<---|      LSQ       |
-                                | oldest result first |load|                |
-                                +----------+----------+data+--+---------+---+
-                                           |                  |         |
-                                           v           loads  |         | stores, only
-                              commit: in order, the ONLY      |         | after commit
-                              architectural update            |         v
-                                                              |   +--------------+
-                                                              |   | store buffer |
-                                                              |   +------+-------+
-                                                              v          |
-    fetch ---> L1I ---------+----------------- L1D <----------+----------+
-                            |                   |
-                            +--- unified L2 ----+
-                                       |             every cache level:
-                                 pipelined DRAM      MSHRs, hit under miss,
-                                                     writeback queues
+                       pc (steered by BTB + RAS + Bimodal / GShare / TAGE)
+                                          |
+                                          v
+    +-----------+    +---------------+    +-------------------+    +-------------+
+    |   Fetch   |--->| Fetch Queue   |--->|  Decode & Rename  |--->| Issue Queue |
+    | (block)   |    | (Ring buffer) |    |  ROB / LSQ alloc  |    | (oldest-1st)|
+    +-----------+    +---------------+    +-------------------+    +------+------+
+          ^                                                               ^    |
+          |                                                       wakeup: |    | issue ready
+          | redirect + flush younger (branch mispredict                   |    | oldest first
+          | at writeback, or speculative load replay)                     |    v
+          |                                                 +-------------+---------------+
+          |                                                 | ALUs | BR | MUL | DIV | AGUs |
+          |                                                 +------+----+-----+-----+--+--+
+          |                                                        |                   |
+          |                                                        v                   v
+          |                                             +--------------------+   +------------+
+          +---------------------------------------------|     Writeback      |<--|    LSQ     |
+                                                        | oldest-first grant |   | fwd/replay |
+                                                        +---------+----------+   +---+-----+--+
+                                                                  |                  |     |
+                                                                  v            loads |     | stores
+                                                    +--------------------------+     |     | (commit
+                                                    |     Commit (in-order)    |     |     |  only)
+                                                    | architectural state,     |     |     v
+                                                    | faults, syscalls, retire |     |  +--------------+
+                                                    +--------------------------+     |  | Store Buffer |
+                                                                                     |  +------+-------+
+                                                                                     v         |
+    Fetch ---------> [ L1I Cache ] ----+                     +---- [ L1D Cache ] <---+---------+
+                                       |                     |
+                                       +---> [ Unified L2 ] <+     (all cache levels: MSHRs,
+                                                   |                hit-under-miss, miss merging,
+                                                   v                LRU, writeback queues)
+                                          [ Pipelined DRAM ]
 ```
 
-Every width, size, and latency is a setting. By default the machine is
-two-wide with a 32-entry ROB, 32 KiB L1s, and a 256 KiB L2 (see
-`sim/config.h`, or `./rvsim -p`). `configs/doom.cfg` is an eight-wide core with a
-128-entry ROB, two address-generation units, a TAGE branch predictor, and a
-1 MiB L2.
+### Pipeline Highlights
 
-- **Fetch** reads one aligned block per cycle, steered by a direction
-  predictor (bimodal, gshare, or TAGE), a branch target buffer, and a
-  return-address stack.
-- **Rename** gives every writer a fresh physical register, so
-  write-after-write and write-after-read hazards cannot occur; the issue
-  queue only waits on true dependences.
-- **Execution units**: 1-cycle ALUs, a branch unit, a pipelined
-  multiplier, a non-pipelined divider, and address-generation units that
-  feed the memory system.
-- **Branches** are checked the moment the branch unit resolves them. A
-  mispredict flushes everything younger, restores the rename map by walking
-  the reorder buffer backwards, and returns the squashed registers. Load
-  replays reuse the same recovery.
-- **Memory ordering** is a setting (`memOrder`). `conservative` loads
-  wait until every older store address is known; `bypass` loads pass
-  stores proven not to overlap; `speculative` (the default) loads also pass
-  unknown addresses, and if an older store later turns out to overlap,
-  the load and everything younger re-execute. Store-to-load forwarding and
-  a post-commit store buffer work in every mode.
-- **Commit** is the only place architectural state changes. Stores reach
-  memory only after commit, syscalls run against a drained machine, and a
-  fault on a wrong path is fatal only if its instruction commits, so the
-  machine is precise at every instruction boundary.
-- **Caches** track outstanding misses in MSHRs, so independent misses
-  overlap, requests for a line already on its way merge, and hits keep
-  flowing under a miss. Dirty victims wait in writeback queues.
+- **Fetch & Branch Prediction**: Fetches one aligned block per cycle, steered by a set-associative BTB, a Return Address Stack (with optional squash repair), and either a bimodal/gshare PHT or a geometric-history TAGE predictor.
+- **Rename & Dispatch**: Allocates fresh physical registers from a free list to eliminate WAW/WAR hazards, and allocates ROB, IQ, and LSQ slots up to `width` instructions per cycle. System operations (`ecall`, `ebreak`, `fence`, `illegal`) serialize on an empty pipeline.
+- **Execution**: Configurable 1-cycle ALUs, branch unit, pipelined/non-pipelined multiplier, non-pipelined divider, and 1-cycle AGUs.
+- **Memory Ordering (`memOrder`)**:
+  - `conservative`: loads wait for all older store addresses and issue in order.
+  - `bypass`: loads bypass proven non-overlapping older stores.
+  - `speculative` (default): loads bypass unknown store addresses and trigger a pipeline replay if an older store later resolves to an overlapping address.
+  - Store-to-load forwarding (from both the LSQ and the post-commit store buffer) works in all modes.
+- **Commit & Verification**: Architectural state only updates at commit. Under `-d`, `RefModel` steps once per retired instruction, checking PC, instruction encoding, register writes, memory writes, and final register/RAM state at exit.
 
-## Three demonstrations
-
-**Out-of-order execution.** Two interleaved, independent dependency
-chains sustain more than one instruction per cycle, which no single-issue
-in-order machine can do:
+## How rv-o3 Works with Doom
 
 ```text
-$ ./rvsim tests/ilp.hex
---- rvsim: 216 cycles, 249 instructions retired, IPC = 1.153 (CPI = 0.867)
+                             +---------------------------+
+                             |        doom/run.py        |
+                             | builds rvsim, doom.bin,   |
+                             | doom-viewer & wires pipes |
+                             +-------------+-------------+
+                                           |
+                    spawns both processes with two OS pipes
+                      |                                   |
+                      v                                   v
+  +-----------------------------------------+   +-------------------------------+
+  |            rvsim (OoOCore)              |   |    doom-viewer (Native SDL3)  |
+  |                                         |   |                               |
+  |  Guest RV32IM binary: doom/build/       |   |  Reads RVF1 frame packets     |
+  |    doom.bin (64 MiB flat guest RAM)     |   |  from stdin (nonblocking):    |
+  |   - Doomgeneric + Picolibc + libgcc     |   |    [magic "RVF1" | w | h |    |
+  |   - Embedded read-only game.wad         |   |     w*h XRGB8888 pixels]      |
+  |   - Custom memcpy/memset & FixedDiv     |   |                               |
+  |                                         |   |  Uploads texture & presents   |
+  |  1) Guest renders 320x200 frame into    |   |  4:3 nearest-neighbor window  |
+  |     DG_ScreenBuffer (8-bit indexed)     |   |                               |
+  |                                         |   |  Captures SDL key down/up     |
+  |  2) Guest executes ECALL 6 (present) ---+---+-> --frame-fd pipe ----------> |
+  |     rvsim drains pipeline, peeks pixels |   |     (RVF1 XRGB8888 packets)   |
+  |     + 256-color palette coherently      |   |                               |
+  |     through L1D -> L2 -> DRAM, expands  |   |                               |
+  |     to XRGB8888, writes packet          |   |                               |
+  |                                         |   |                               |
+  |  3) Guest executes ECALL 7 (poll key) <-+---+-- --key-fd pipe <------------ |
+  |     rvsim reads nonblocking 32-bit      |   |     (key | (pressed << 8))    |
+  |     key event into a0 (or 0xffffffff)   |   |                               |
+  +-----------------------------------------+   +-------------------------------+
 ```
 
-**Memory-level parallelism.** Two independent loads miss all the way to
-DRAM. With the default four MSHRs the misses overlap; with one they
-serialize, and the run gets exactly one miss latency slower:
-
-```text
-$ ./rvsim tests/mlp.hex                                   ...77 cycles
-$ ./rvsim -O l1d.mshrs=1 -O l2.mshrs=1 tests/mlp.hex      ...107 cycles
-```
-
-**A speculative load caught out.** In `tests/replay.hex` a store's
-address hides behind a divide while a younger load to the same address
-runs early and reads stale data. The `-t` trace shows the cycle the divide
-resolves and the machine notices (DS/IS/WB/CT: dispatch, issue, writeback,
-commit):
-
-```text
-cyc 48 | fq5 rob 6 iq 1 lsq 2 sb1 | IS sw s0,0(sp)  | WB divu sp,t2,t0 ...
-cyc 49 | fq5 rob 6 iq 0 lsq 2 sb1 | CT divu sp,t2,t0; addi s0,zero,99   ! load replay @0x00000020
-```
-
-The load and everything younger flush, refetch, and this time forward the
-correct value; the program prints 100 either way.
-
-## Verification
-
-`core/refmodel.cpp` is a plain fetch-decode-execute interpreter with no
-timing. It shares decode and execute semantics with the core, so the two
-can only disagree about what the timing model adds: operand routing,
-speculation, recovery, and memory ordering. Under `-d` both run in lockstep,
-and every retired instruction's effects (pc, register written, memory
-written) are compared. At exit the whole register file and memory are
-compared too, because out-of-order completion can produce a correct commit
-stream while still leaving a stale value behind.
-
-`make test` runs unit tests (including randomized checks of the issue
-queue's and LSQ's bookkeeping against brute-force answers), interface and
-timing tests, and every directed program in `tests/` under `-d`.
-
-## Benchmarks
-
-Six small C programs in `bench/`, each stressing one behavior. At the
-default configuration:
-
-| Benchmark | IPC | What it shows |
-| --- | --- | --- |
-| `ptrchase` | 0.440 | Serial pointer chasing over 512 KiB; no window size can help a dependent chain |
-| `mlpbench` | 1.001 | Independent gathers over 512 KiB; scales with ROB size and MSHR count |
-| `mm64` | 1.710 | A 48 KiB working set, just past the 32 KiB L1 |
-| `qsortb` | 1.205 | Recursive quicksort: 49 branch mispredicts per 1000 instructions |
-| `rle` | 1.581 | Run-length encode/decode: byte traffic in short loops |
-| `branchy` | 0.845 | Unpredictable branches: 77 mispredicts per 1000 instructions |
-
-## Configuration
-
-Every setting lives in one struct (`sim/config.h`) and is settable by name.
-Errors are fatal, so a typo in a sweep can't silently fall back to a
-default.
+To set up and play Doom (see [doom/README.md](doom/README.md) for full options and controls):
 
 ```sh
-./rvsim -p                                   # list every setting and value
-./rvsim -O robSize=128 -O memOrder=bypass prog.bin
-./rvsim -C configs/doom.cfg prog.bin         # key = value lines, # comments
+make -C doom setup
+python3 doom/run.py --play
 ```
 
-Sizes accept `k`/`m` suffixes (`l1d.size=64k`). The full command line:
+## Configuration & CLI
+
+Every core and cache parameter lives in `SimConfig` ([sim/config.h](sim/config.h)) and can be loaded from a file (`-C`) or overridden on the command line (`-O`, repeatable). Sizes accept `k`/`m` suffixes.
+
+```sh
+./rvsim -p                                           # print active configuration
+./rvsim -C configs/doom.cfg doom/build/doom.bin      # 8-wide TAGE + 1 MiB L2 core
+./rvsim -O robSize=128 -O memOrder=bypass prog.bin   # override settings
+```
 
 ```text
 usage: ./rvsim [options] [program.hex|program.bin]
-  -t            trace pipeline occupancy every cycle (stderr)
-  -r            dump registers when the simulation ends
-  -d            differential check against the reference model
+  -t            trace cycle summary (stderr)
+  -r            dump registers on exit
+  -d            differential check against reference model
   -c <cycles>   cycle budget (default 10000000)
   -m <bytes>    memory size (default 1 MiB)
-  -C <file>     load configuration ('key = value' lines, # comments)
-  -O key=value  override one setting (repeatable; applied after -C)
-  -p            print the effective configuration and exit
-  --frame-fd N, --key-fd N  inherited display pipes (doom/run.py)
+  -C <file>     load configuration file
+  -O key=value  override one setting
+  -p            print effective configuration and exit
+  --frame-fd N, --key-fd N  display pipes
 ```
 
-## Writing programs
+### Guest Syscall ABI (`ecall`)
 
-Hex programs are whitespace-separated 32-bit instruction words, loaded at
-address zero (the reset pc); `#` and `//` start comments. Files ending in
-`.bin` load as raw little-endian binaries, so compiler output works too.
-`cdemo/` builds a freestanding C program with Clang and runs it
-(`make -C cdemo run`); the benchmarks and Doom reuse its toolchain setup.
-
-`ecall` takes a syscall number in `a7` and an argument in `a0`:
+Syscall number in `a7`, argument/return value in `a0`:
 
 | `a7` | Operation |
 | --- | --- |
-| `1` | print `a0` as a signed decimal integer |
-| `2` | print the low byte of `a0` as a character |
-| `3` | print the NUL-terminated string at address `a0` |
-| `4` | print `a0` as eight hex digits |
-| `5` | read one available stdin byte into `a0`, or `0xffffffff` if none |
-| `6` | present a framebuffer described at `a0` (`sim/display_protocol.h`) |
-| `7` | read a window key event into `a0`, or `0xffffffff` if none |
-| `10`, `93` | exit with the low byte of `a0` as the status |
+| `1` | Print `a0` as signed decimal integer |
+| `2` | Print low byte of `a0` as a character |
+| `3` | Print NUL-terminated string at guest address `a0` |
+| `4` | Print `a0` as 8 lowercase hex digits |
+| `5` | Nonblocking stdin read into `a0` (or `0xffffffff`) |
+| `6` | Present framebuffer descriptor at `a0` ([sim/display_protocol.h](sim/display_protocol.h)) |
+| `7` | Nonblocking key event poll into `a0` (or `0xffffffff`) |
+| `10`, `93` | Halt and exit with low byte of `a0` |
 
-## Layout
+## Project Layout
 
 ```text
-isa/      decode, execute semantics, disassembly (shared by core and reference)
-core/     the out-of-order core (ooo.cpp), predictor, rename, ROB, issue
-          queue, LSQ, functional units, reference model
-memory/   caches with MSHRs and writeback queues, pipelined DRAM
-sim/      configuration, statistics, loaders, syscalls, display pipe, driver
-configs/  the Doom machine configuration (baseline defaults live in sim/config.h)
-tests/    directed programs (each header says what it checks), unit tests,
-          interface and timing tests
-bench/    RV32IM benchmarks and PGO workloads
-cdemo/    freestanding C demo and its runtime
-doom/     the RV32IM Doom port, SDL viewer, and launcher
+isa/      isa.h, isa.cpp               RV32IM decode, execute semantics, disassembly
+core/     ooo.h, ooo.cpp               Out-of-order core (rename, ROB, pipeline stages)
+          predictor.h, predictor.cpp   BTB, RAS with repair, bimodal/gshare/TAGE
+          iq.h, lsq.h, fu.h, ring.h    Issue queue, LSQ/store buffer, FUs, ring buffer
+          refmodel.h, refmodel.cpp     CommitRecord and golden reference interpreter
+memory/   memory.h                     MemPort/MemRequest/MemResponse, backing RAM, DRAM
+          cache.h, cache.cpp           Nonblocking cache with MSHRs and writeback queue
+          system.h, system.cpp         L1I/L1D/L2/DRAM hierarchy and coherent peek8
+sim/      config.h, config.cpp         SimConfig, file parser, -O overrides, validator
+          syscall.h                    Guest ECALL handler and host display pipe I/O
+          display_protocol.h           Shared RVF1 frame & key ABI (shared with doom/)
+          main.cpp                     CLI driver, .hex/.bin loader, differential harness
+configs/  doom.cfg                     8-wide core configuration for Doom
+tests/    units.cpp, *.hex             Unit tests and directed RV32IM regression programs
+bench/    *.c, bench.h, Makefile       6 freestanding RV32IM microbenchmarks
+cdemo/    demo.c, start.S, linker.ld   Freestanding C demo and shared RISC-V toolchain rules
+doom/     platform.c, runtime.c, ...   RV32IM Doom port, SDL3 viewer, setup & launcher
 ```
-
-## Limitations
-
-No MMU, interrupts, privileged modes, or trap handling (misaligned and
-out-of-range accesses are precise fatal errors); no compressed, atomic, or
-floating-point extensions; `fence` is a serializing no-op; one core.

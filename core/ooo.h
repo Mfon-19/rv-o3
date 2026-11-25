@@ -1,189 +1,156 @@
-// The out-of-order superscalar core.
-//
-//            +-------+  +--------+  +----------+   +-----+  +----+
-//   2/cycle  | fetch |->| decode |->| dispatch |-->| IQ  |->| FU |--+
-//   -------> | +pred |  | rename |  | ROB/LSQ  |   |     |  |    |  |
-//            +-------+  +--------+  +----------+   +-----+  +----+  |
-//                                        ROB <-- writeback/wakeup <-+
-//                                         |
-//                                      commit (2/cycle, in order)
-//
-// The widths shown are the shipped defaults; all of them are knobs.
-//
-// Microarchitecture
-//      - Fetch pulls one aligned block per cycle (width*4 bytes rounded
-//        up to a power of two, minimum 8, or explicit fetchBytes) into a
-//        small queue. A direction
-//        table, a branch target buffer, and a return-address stack steer
-//        the next block, so correctly predicted taken branches cost nothing
-//      - Rename (in order) maps each source register to the physical
-//        register currently holding its value and hands each destination
-//        a fresh one from the free list. No physical register is written
-//        twice while live, so WAW and WAR name hazards cannot occur; the
-//        only waiting left in the machine is for values that do not
-//        exist yet
-//      - Dispatch allocates a ROB entry (and an LSQ entry for memory
-//        ops) in program order and drops the instruction into the
-//        issue queue
-//      - Issue (OUT of order) picks the oldest ready instructions whose
-//        unit can accept them, regardless of program order. Operands
-//        come from the physical register file; execute() computes the
-//        result at issue and the unit only delays when it becomes
-//        visible
-//      - Writeback (wbPorts per cycle; when more results finish than
-//        ports exist, the oldest go first) writes the physical register,
-//        wakes the issue queue, and marks the ROB entry done. A branch is
-//        checked against its prediction here, the moment the branch unit
-//        produces the real outcome; on a wrong prediction everything
-//        younger is flushed, the rename map is restored by walking the
-//        ROB from youngest to oldest, and the squashed physical
-//        registers are returned
-//      - Commit (in order) is where state becomes architectural.
-//        Displaced mappings are freed, stores move to the store buffer,
-//        syscalls take effect, the predictor trains. A fault found on a
-//        speculative path rides along and becomes fatal only if its
-//        instruction commits, so stopped at any commit boundary the
-//        machine shows a state that one-instruction-at-a-time execution
-//        could have produced
-//      - Memory ordering is a policy knob (core/lsq.h). By default loads
-//        run ahead of older stores whose addresses are not known yet; a
-//        store that later resolves to overlap replays the load. Stores
-//        write the cache only after commit, through the store buffer
-//      - System ops (ecall, ebreak, fence) dispatch only into an empty
-//        machine, run alone, and take effect at commit
-//
-// Simulation technique
-//      stepCycle runs the stages in reverse pipeline order (commit,
-//      writeback, LSQ, issue, dispatch, fetch), so each stage consumes
-//      what the stage behind it produced in an earlier cycle; the
-//      functional units and the memory system advance at the end of the
-//      cycle, like a clock edge. One ordering is deliberate: writeback
-//      runs before issue, so a value written back in cycle N can already
-//      be read by an instruction issuing in cycle N. That single rule
-//      plays the role a forwarding network plays in hardware.
+// Superscalar out-of-order RV32IM processor core: register renaming, physical
+// register file, ROB, issue queue, LSQ, store buffer, functional units, and
+// branch prediction with precise mispredict and load-replay recovery.
 
 #pragma once
 
 #include <cstdint>
 #include <functional>
-#include <string>
 #include <vector>
 
-#include "core/commit.h"
 #include "core/fu.h"
 #include "core/iq.h"
 #include "core/lsq.h"
 #include "core/predictor.h"
-#include "core/rename.h"
-#include "core/rob.h"
+#include "core/refmodel.h"
+#include "core/ring.h"
 #include "isa/isa.h"
 #include "memory/system.h"
 #include "sim/config.h"
-#include "sim/stats.h"
+
+struct PhysRegFile {
+  std::vector<uint32_t> values;
+  std::vector<uint8_t> ready;
+
+  explicit PhysRegFile(uint32_t numRegs) : values(numRegs, 0), ready(numRegs, 1) {}
+};
+
+using FreeList = Ring<uint8_t>;
+
+// Maps the 32 architectural RISC-V registers to current physical register IDs.
+struct RenameMap {
+  uint8_t archToPhys[32];
+
+  void reset() {
+    for (int i = 0; i < 32; i++)
+      archToPhys[i] = (uint8_t)i;
+  }
+};
+
+struct RobEntry {
+  uint64_t seq = 0;
+  uint32_t pc = 0;
+  Instr instr;
+  bool done = false;
+
+  uint8_t destPhysReg = 0xFF;
+  uint8_t prevPhysReg = 0xFF; // Returned to free list on commit (or restored on squash).
+  bool isMem = false;
+  bool isSystem = false;
+  uint8_t fault = 0; // 1 = misaligned, 2 = out-of-range; raised only at commit.
+
+  bool isBranch = false;
+  bool predictedTaken = false;
+  bool actualTaken = false;
+  uint32_t predictedTarget = 0;
+  uint32_t actualTarget = 0;
+  uint32_t phtIndex = 0;
+  Predictor::Checkpoint predCheckpoint;
+
+  uint8_t syscallArgPhysReg = 0;
+  uint8_t syscallNumPhysReg = 0;
+
+  bool mispredicted() const {
+    return actualTaken != predictedTaken ||
+           (actualTaken && actualTarget != predictedTarget);
+  }
+};
+
+using ROB = Ring<RobEntry>;
+
+struct CoreStats {
+  uint64_t cycles = 0;
+  uint64_t retired = 0;
+  uint64_t branches = 0;
+  uint64_t mispredicts = 0;
+  uint64_t flushes = 0;
+  uint64_t loadsForwarded = 0;
+  uint64_t loadReplays = 0;
+};
 
 class OoOCore {
 public:
-  OoOCore(const SimConfig &cfg, MemorySystem &msys);
+  OoOCore(const SimConfig &config, MemorySystem &memSystem);
 
-  // Run until an exit syscall / ebreak / fatal error, or the cycle
-  // budget runs out; returns the exit code
   int run();
-
   void dumpRegs() const;
+  uint32_t reg(int idx) const { return physRegs.values[renameMap.archToPhys[idx]]; }
 
-  // The architectural value of register i, read through the rename map
-  uint32_t reg(int i) const { return prf.val[rmap.map[i]]; }
-
-  // Called once per committed instruction, in commit order. Null by
-  // default; the differential checker plugs in here
+  // Optional callback invoked in program order for every committed instruction.
   std::function<void(const CommitRecord &)> onCommit;
 
 private:
-  const SimConfig cfg;
-  MemorySystem &msys;
-  MemPort *imem;
-  MemPort *dmem;
-  bool showMemStats;
-
-  // rename state + physical register file
-  RenameMap rmap;
-  FreeList freeList;
-  PhysRegFile prf;
-
-  // machine structures
-  ROB rob;
-  IssueQueue iq;
-  LSQ lsq;
-  StoreBuffer sb;
-  Predictor pred;
-
-  // functional units
-  std::vector<FuUnit> alus;
-  FuUnit brUnit, mulUnit, divUnit;
-  std::vector<FuUnit> agus;    // address generation; drains to the LSQ
-  std::vector<FuUnit *> units; // WB-producing units, for flush and tick
-
-  // Results waiting for a writeback port: pointers to the output slots of
-  // the units and loadOuts. An entry is added when its slot fills and
-  // removed at writeback, or at a flush once its slot is invalidated
-  std::vector<FuOp *> wbReady;
-
-  // fetch state: at most one block request is outstanding at a time
-  uint32_t pc = 0;      // next address fetch will request
-  const uint32_t fBytes; // aligned power-of-two fetch block, at least 8 bytes
-  struct Fetched {
-    uint32_t pc = 0, raw = 0;
+  struct FetchedInstr {
+    uint32_t pc = 0;
+    uint32_t raw = 0;
     bool predTaken = false;
     uint32_t predTarget = 0;
-    uint32_t predIdx = 0;             // gshare counter the prediction used
-    Predictor::Checkpoint predBefore; // predictor state before it
+    uint32_t phtIndex = 0;
+    Predictor::Checkpoint predCheckpoint;
   };
-  Ring<Fetched> fetchQ;
-  bool fOutstanding = false, fStale = false; // stale: squashed while in flight
-  uint32_t fBlock = 0, fFetchPc = 0; // the outstanding block, and the pc in it
 
-  // Several loads and committed stores can be in flight at the L1D at
-  // once. Load completions match back through {lsq slot, generation}
-  // tags, store acks through store-buffer transaction ids
-  std::vector<FuOp> loadOuts; // completed loads awaiting WB ports
-  uint32_t sbTxnCtr = 0;
-
-  // Memory-dependence predictor (Speculative mode only): a load that
-  // replayed recently waits for unknown store addresses instead
-  std::vector<uint8_t> depTable;
-  uint8_t &depEntry(uint32_t pc) {
-    return depTable[(pc >> 2) % depTable.size()];
-  }
-
-  // control
-  uint64_t seqCtr = 0;        // program-order sequence numbers (dispatch)
-  bool pendRedirect = false;  // a redirect to apply at the clock edge
-  uint32_t pendTarget = 0;
-  bool recTimerArmed = false; // attributes cycles lost to recovery:
-  uint64_t recTimerStart = 0; // recover() to the next real dispatch
-  bool halted = false;
-  int exitCode = 0;
-  bool trace;
-  Stats stats;
-  std::vector<std::string> events;
-
-  // stages, in the order stepCycle runs them
   void commitStage();
   void writebackStage();
-  void recover(uint64_t seq); // flush everything younger than seq
+  void recover(uint64_t keepSeq);
   void aguDrain();
-  void violationScan(const LsqEntry &store); // replay loads that passed it
+  void violationScan(const LsqEntry &store);
   void drainDataResponses();
   void lsqOperate();
+  FuUnit *acquireUnit(FuKind kind, size_t &nextAlu, size_t &nextAgu);
   void issueStage();
   void dispatchStage();
   void fetchStage();
-  void processFetch(const MemResponse &r);
+  void processFetch(const MemResponse &response);
   void stepCycle();
+  void printStats() const;
 
-  // trace
-  std::string vOcc, vDS, vIS, vWB, vCT;
-  void captureView();
-  void printTrace() const;
-  void note(std::string &v, const Instr &ins);
+  const SimConfig config;
+  MemorySystem &memSystem;
+  MemPort *imem = nullptr;
+  MemPort *dmem = nullptr;
+
+  RenameMap renameMap;
+  FreeList freeList;
+  PhysRegFile physRegs;
+  ROB rob;
+  IssueQueue iq;
+  LSQ lsq;
+  StoreBuffer storeBuffer;
+  Predictor predictor;
+
+  std::vector<FuUnit> alus;
+  FuUnit branchUnit;
+  FuUnit mulUnit;
+  FuUnit divUnit;
+  std::vector<FuUnit> agus;
+  std::vector<FuUnit *> execUnits;
+
+  std::vector<FuOp *> wbReady;
+  std::vector<FuOp> loadOutputs;
+  uint32_t storeBufferTxnCounter = 0;
+
+  uint32_t pc = 0;
+  const uint32_t fetchBlockBytes;
+  Ring<FetchedInstr> fetchQueue;
+  bool fetchOutstanding = false;
+  bool fetchStale = false; // Discards an in-flight I-fetch returned after a redirect.
+  uint32_t fetchBlockAddr = 0;
+  uint32_t fetchStartPc = 0;
+
+  uint64_t nextSeq = 0;
+  bool pendingRedirect = false;
+  uint32_t pendingTarget = 0;
+  bool halted = false;
+  int exitCode = 0;
+  CoreStats stats;
 };

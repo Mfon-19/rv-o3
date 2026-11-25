@@ -1,205 +1,227 @@
-// Command-line driver for rvsim. Program output (syscalls) goes to
-// stdout; trace, statistics, and diagnostics go to stderr.
+// rvsim command-line driver: parses options, loads .hex or flat .bin guest
+// images, runs OoOCore, and optionally verifies commits against RefModel (`-d`).
 
+#include <algorithm>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <optional>
+#include <sstream>
+#include <string>
 #include <vector>
 
 #include "core/ooo.h"
 #include "core/refmodel.h"
 #include "memory/system.h"
 #include "sim/config.h"
-#include "sim/loader.h"
 #include "sim/syscall.h"
 
-static void usage(const char *argv0) {
+namespace {
+
+void printUsage(const char *argv0) {
   fprintf(stderr,
           "usage: %s [options] [program.hex|program.bin]\n"
-          "  -t            trace pipeline occupancy every cycle (stderr)\n"
-          "  -r            dump registers when the simulation ends\n"
-          "  -d            differential check against the reference model\n"
-          "  -c <cycles>   cycle budget (default 10000000)\n"
-          "  -m <bytes>    memory size (default 1 MiB)\n"
-          "  -C <file>     load configuration ('key = value' lines, # comments)\n"
-          "  -O key=value  override one setting (repeatable; applied after -C)\n"
-          "  -p            print the effective configuration and exit\n"
-          "  --frame-fd N, --key-fd N  inherited display pipes (doom/run.py)\n",
+          "  -t            trace cycle summary (stderr)\n"
+          "  -r            dump registers on exit\n"
+          "  -d            differential check against reference model\n"
+          "  -c <cycles>   cycle budget\n"
+          "  -m <bytes>    memory size\n"
+          "  -C <file>     load configuration file\n"
+          "  -O key=value  override one setting\n"
+          "  -p            print effective configuration and exit\n"
+          "  --frame-fd N, --key-fd N  display pipes\n",
           argv0);
 }
 
-// One side of a differential divergence report
-static void printCommit(const char *who, const CommitRecord &r) {
-  fprintf(stderr, "  %s: seq %" PRIu64 " pc=0x%08x %-20s", who, r.sequence,
-          r.pc, disasm(decode(r.instruction)).c_str());
-  if (r.registerWrite)
-    fprintf(stderr, "  %s=0x%08x", kRegName[r.registerWrite->rd],
-            r.registerWrite->value);
-  if (r.memoryWrite)
-    fprintf(stderr, "  mem[0x%08x]=0x%x (%u bytes)", r.memoryWrite->addr,
-            r.memoryWrite->value, r.memoryWrite->size);
-  if (r.exception)
+// Loads a flat little-endian `.bin` image or a whitespace-delimited `.hex`
+// instruction listing starting at guest address 0.
+void loadProgram(Memory &memory, const char *path) {
+  const size_t pathLen = strlen(path);
+  const bool isBinary = pathLen > 4 && !strcmp(path + pathLen - 4, ".bin");
+
+  std::ifstream file(path, isBinary ? std::ios::binary : std::ios::in);
+  if (!file) {
+    fprintf(stderr, "cannot open %s\n", path);
+    exit(1);
+  }
+
+  if (isBinary) {
+    memory.loadBytes(std::vector<uint8_t>(std::istreambuf_iterator<char>(file),
+                                          std::istreambuf_iterator<char>()));
+    return;
+  }
+
+  std::vector<uint32_t> words;
+  std::string line;
+
+  while (std::getline(file, line)) {
+    for (const char *comment : {"#", "//"})
+      line.resize(std::min(line.size(), line.find(comment)));
+
+    std::istringstream stream(line);
+    std::string token;
+
+    while (stream >> token) {
+      char *end = nullptr;
+      unsigned long value = strtoul(token.c_str(), &end, 16);
+      if (end == token.c_str() || *end != '\0' || value > 0xFFFFFFFFul) {
+        fprintf(stderr, "%s: bad hex word '%s'\n", path, token.c_str());
+        exit(1);
+      }
+      words.push_back((uint32_t)value);
+    }
+  }
+
+  memory.loadWords(words);
+}
+
+void printCommit(const char *source, const CommitRecord &record) {
+  fprintf(stderr, "  %s: seq %" PRIu64 " pc=0x%08x %-20s", source,
+          record.sequence, record.pc, disasm(decode(record.instruction)).c_str());
+
+  if (record.registerWrite)
+    fprintf(stderr, "  %s=0x%08x", kRegName[record.registerWrite->rd], record.registerWrite->value);
+  if (record.memoryWrite)
+    fprintf(stderr, "  mem[0x%08x]=0x%x (%u bytes)", record.memoryWrite->addr,
+            record.memoryWrite->value, record.memoryWrite->size);
+  if (record.exception)
     fprintf(stderr, "  exception=illegal");
+
   fputc('\n', stderr);
 }
 
+// Verifies exit code, all 32 architectural registers, and every byte of RAM
+// (peeked coherently through caches) against the golden reference model.
+void verifyFinalState(const SimConfig &config, const OoOCore &core,
+                      const MemorySystem &memorySystem,
+                      const RefModel &refModel, int exitCode,
+                      uint64_t verifiedCommits) {
+  if (!refModel.halted() || refModel.exitCode() != exitCode) {
+    fprintf(stderr, "differential check FAILED: exit state diverges (%d vs %d)\n",
+            exitCode, refModel.exitCode());
+    exit(1);
+  }
+
+  for (int i = 0; i < 32; i++) {
+    if (core.reg(i) != refModel.reg(i)) {
+      fprintf(stderr, "differential check FAILED: final %s diverges (0x%08x vs 0x%08x)\n",
+              kRegName[i], core.reg(i), refModel.reg(i));
+      exit(1);
+    }
+  }
+
+  for (uint32_t addr = 0; addr < (uint32_t)config.memBytes; addr++) {
+    if (memorySystem.peek8(addr) != refModel.mem.bytes[addr]) {
+      fprintf(stderr, "differential check FAILED: final mem[0x%08x] diverges (0x%02x vs 0x%02x)\n",
+              addr, memorySystem.peek8(addr), refModel.mem.bytes[addr]);
+      exit(1);
+    }
+  }
+
+  fprintf(stderr, "--- rvsim: differential check: %" PRIu64 " commits verified, final state matches\n",
+          verifiedCommits);
+}
+
+}
+
 int main(int argc, char **argv) {
-  SimConfig cfg;
-  const char *file = nullptr;
-  const char *cfgFile = nullptr;
+  SimConfig config;
+  const char *programPath = nullptr;
+  const char *configPath = nullptr;
   std::vector<const char *> overrides;
   bool printConfig = false;
   int frameFd = -1, keyFd = -1;
-  auto fdArg = [&](int &i) {
+
+  auto parseFdArg = [&](int &idx) {
     char *end = nullptr;
-    const long fd = strtol(argv[++i], &end, 10);
-    if (!*argv[i] || *end || fd < 3 || fd > INT32_MAX)
+    const long fd = strtol(argv[++idx], &end, 10);
+    if (!*argv[idx] || *end || fd < 3 || fd > INT32_MAX)
       display::fail("invalid file descriptor");
     return int(fd);
   };
 
-  auto numArg = [&](int &i) -> uint64_t {
-    return strtoull(argv[++i], nullptr, 0);
-  };
-
   for (int i = 1; i < argc; i++) {
-    if (!strcmp(argv[i], "--frame-fd") && i + 1 < argc)
-      frameFd = fdArg(i);
-    else if (!strcmp(argv[i], "--key-fd") && i + 1 < argc)
-      keyFd = fdArg(i);
-    else if (!strcmp(argv[i], "-t"))
-      cfg.trace = true;
-    else if (!strcmp(argv[i], "-r"))
-      cfg.dumpRegs = true;
-    else if (!strcmp(argv[i], "-d"))
-      cfg.diffCheck = true;
-    else if (!strcmp(argv[i], "-c") && i + 1 < argc)
-      cfg.maxCycles = numArg(i);
-    else if (!strcmp(argv[i], "-m") && i + 1 < argc)
-      cfg.memBytes = numArg(i);
-    else if (!strcmp(argv[i], "-C") && i + 1 < argc)
-      cfgFile = argv[++i];
-    else if (!strcmp(argv[i], "-O") && i + 1 < argc)
-      overrides.push_back(argv[++i]);
-    else if (!strcmp(argv[i], "-p"))
-      printConfig = true;
-    else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-      usage(argv[0]);
-      return 0;
-    } else if (argv[i][0] == '-') {
-      usage(argv[0]);
-      return 1;
-    } else
-      file = argv[i];
+    if (!strcmp(argv[i], "--frame-fd") && i + 1 < argc) frameFd = parseFdArg(i);
+    else if (!strcmp(argv[i], "--key-fd") && i + 1 < argc) keyFd = parseFdArg(i);
+    else if (!strcmp(argv[i], "-t")) config.trace = true;
+    else if (!strcmp(argv[i], "-r")) config.dumpRegs = true;
+    else if (!strcmp(argv[i], "-d")) config.diffCheck = true;
+    else if (!strcmp(argv[i], "-c") && i + 1 < argc) config.maxCycles = strtoull(argv[++i], nullptr, 0);
+    else if (!strcmp(argv[i], "-m") && i + 1 < argc) config.memBytes = strtoull(argv[++i], nullptr, 0);
+    else if (!strcmp(argv[i], "-C") && i + 1 < argc) configPath = argv[++i];
+    else if (!strcmp(argv[i], "-O") && i + 1 < argc) overrides.push_back(argv[++i]);
+    else if (!strcmp(argv[i], "-p")) printConfig = true;
+    else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { printUsage(argv[0]); return 0; }
+    else if (argv[i][0] == '-') { printUsage(argv[0]); return 1; }
+    else programPath = argv[i];
   }
 
-  // Precedence: defaults, then the config file, then -O overrides in order
-  if (cfgFile)
-    loadConfigFile(cfg, cfgFile);
-  for (const char *kv : overrides)
-    applyConfigOverride(cfg, kv);
-  validateConfig(cfg);
+  if (configPath)
+    loadConfigFile(config, configPath);
+  for (const char *overrideArg : overrides)
+    applyConfigOverride(config, overrideArg);
+  validateConfig(config);
+
   if (printConfig) {
-    dumpConfig(cfg, stdout);
+    dumpConfig(config, stdout);
     return 0;
   }
 
-  if (!file) {
+  if (!programPath) {
     fprintf(stderr, "please provide a program file\n");
-    usage(argv[0]);
+    printUsage(argv[0]);
     return 1;
   }
 
-  const size_t n = strlen(file);
-  const bool isBin = n > 4 && !strcmp(file + n - 4, ".bin");
-  auto loadInto = [&](Memory &mem) {
-    if (isBin)
-      mem.loadBytes(loadBinFile(file));
-    else
-      mem.loadWords(loadHexFile(file));
-  };
-
   display::configure(frameFd, keyFd);
-  MemorySystem msys(cfg);
-  OoOCore core(cfg, msys);
-  loadInto(msys.backing);
 
-  // Differential check: the reference model runs alongside the core,
-  // silently, advancing one instruction each time the core commits
-  // one, and the two commit records are compared. The first mismatch
-  // pinpoints the instruction where the core corrupted architectural
-  // state
-  std::optional<RefModel> ref;
-  uint64_t verified = 0;
-  if (cfg.diffCheck) {
-    ref.emplace(cfg);
-    loadInto(ref->mem);
-    core.onCommit = [&](const CommitRecord &pipe) {
-      CommitRecord refRec;
-      if (pipe.instruction == 0x00000073 && syscallReturnsInput(ref->reg(17)) &&
-          pipe.registerWrite)
-        ref->replayInput = pipe.registerWrite->value;
-      if (!ref->step(&refRec)) {
-        fprintf(stderr,
-                "differential check FAILED: pipeline retired seq %" PRIu64
-                " but the reference model had already halted\n",
-                pipe.sequence);
-        printCommit("pipeline ", pipe);
+  MemorySystem memorySystem(config);
+  OoOCore core(config, memorySystem);
+  loadProgram(memorySystem.backing, programPath);
+
+  std::optional<RefModel> refModel;
+  uint64_t verifiedCommits = 0;
+
+  if (config.diffCheck) {
+    refModel.emplace(config);
+    loadProgram(refModel->mem, programPath);
+
+    // Step the reference interpreter once per committed OoO instruction and
+    // feed back any non-deterministic host input read by syscalls 5 or 7.
+    core.onCommit = [&](const CommitRecord &pipeRecord) {
+      CommitRecord refRecord;
+
+      if (pipeRecord.instruction == 0x00000073 &&
+          syscallReturnsInput(refModel->reg(17)) && pipeRecord.registerWrite) {
+        refModel->replayInput = pipeRecord.registerWrite->value;
+      }
+
+      if (!refModel->step(&refRecord)) {
+        fprintf(stderr, "differential check FAILED: reference model halted early\n");
+        printCommit("pipeline ", pipeRecord);
         exit(1);
       }
-      if (!(pipe == refRec)) {
+
+      if (!(pipeRecord == refRecord)) {
         fprintf(stderr, "differential check FAILED: commit streams diverge\n");
-        printCommit("pipeline ", pipe);
-        printCommit("reference", refRec);
+        printCommit("pipeline ", pipeRecord);
+        printCommit("reference", refRecord);
         exit(1);
       }
-      verified++;
+
+      verifiedCommits++;
     };
   }
 
-  int code = core.run();
+  const int exitCode = core.run();
 
-  if (cfg.diffCheck && code != 2) { // a blown cycle budget isn't architectural
-    if (!ref->halted() || ref->exitCode() != code) {
-      fprintf(stderr,
-              "differential check FAILED: exit state diverges "
-              "(pipeline exited %d, reference %s with exit %d)\n",
-              code, ref->halted() ? "halted" : "still running", ref->exitCode());
-      exit(1);
-    }
-    // Final architectural state. The commit stream alone cannot catch
-    // everything once results complete out of order: a WAW violation
-    // produces per-instruction records that are all individually
-    // correct while the stale result lands in the register file last.
-    // So the settled state is compared too; memory is read through
-    // peek8, since the newest copy of a byte may still be in a cache
-    for (int r = 0; r < 32; r++) {
-      if (core.reg(r) != ref->reg(r)) {
-        fprintf(stderr,
-                "differential check FAILED: final %s diverges "
-                "(pipeline 0x%08x, reference 0x%08x)\n",
-                kRegName[r], core.reg(r), ref->reg(r));
-        exit(1);
-      }
-    }
-    for (uint32_t a = 0; a < (uint32_t)cfg.memBytes; a++) {
-      if (msys.peek8(a) != ref->mem.bytes[a]) {
-        fprintf(stderr,
-                "differential check FAILED: final mem[0x%08x] diverges "
-                "(pipeline 0x%02x, reference 0x%02x)\n",
-                a, msys.peek8(a), ref->mem.bytes[a]);
-        exit(1);
-      }
-    }
-    fprintf(stderr,
-            "--- rvsim: differential check: %" PRIu64
-            " commits verified, final state matches\n",
-            verified);
-  }
+  if (config.diffCheck && exitCode != 2)
+    verifyFinalState(config, core, memorySystem, *refModel, exitCode, verifiedCommits);
 
-  if (cfg.dumpRegs)
+  if (config.dumpRegs)
     core.dumpRegs();
-  return code;
+
+  return exitCode;
 }

@@ -1,46 +1,55 @@
-/*
- * Recursive quicksort of 512 random words: data-dependent branches,
- * recursion, and store/load traffic over a small working set.
- */
+// Recursive quicksort benchmark stressing branch prediction, RAS, and stack traffic.
+
 #include "bench.h"
 
-#define N 512u
+#define ELEMENT_COUNT 512u
 
-static u32 a[N];
+static u32 values[ELEMENT_COUNT];
 
-static void sortrange(int lo, int hi) {
-    if (lo >= hi)
+static void sort_range(int low, int high) {
+    if (low >= high)
         return;
-    u32 pivot = a[(u32)(lo + (hi - lo) / 2)];
-    int i = lo, j = hi;
-    while (i <= j) {
-        while (a[i] < pivot)
-            i++;
-        while (a[j] > pivot)
-            j--;
-        if (i <= j) {
-            u32 t = a[i];
-            a[i] = a[j];
-            a[j] = t;
-            i++;
-            j--;
+
+    u32 pivot = values[(u32)(low + (high - low) / 2)];
+    int left = low;
+    int right = high;
+
+    while (left <= right) {
+        while (values[left] < pivot)
+            left++;
+        while (values[right] > pivot)
+            right--;
+
+        if (left <= right) {
+            u32 temp = values[left];
+            values[left] = values[right];
+            values[right] = temp;
+            left++;
+            right--;
         }
     }
-    sortrange(lo, j);
-    sortrange(i, hi);
+
+    sort_range(low, right);
+    sort_range(left, high);
 }
 
 int main(void) {
-    for (u32 i = 0; i < N; i++)
-        a[i] = lcg();
-    sortrange(0, (int)N - 1);
-    u32 ok = 1, sum = 0;
-    for (u32 i = 1; i < N; i++)
-        if (a[i - 1] > a[i])
-            ok = 0;
-    for (u32 i = 0; i < N; i++)
-        sum ^= a[i] + i;
-    print_int((int)ok);
-    print_int((int)sum);
+    for (u32 i = 0; i < ELEMENT_COUNT; i++)
+        values[i] = next_random();
+
+    sort_range(0, (int)ELEMENT_COUNT - 1);
+
+    u32 sorted_ok = 1;
+    for (u32 i = 1; i < ELEMENT_COUNT; i++) {
+        if (values[i - 1] > values[i])
+            sorted_ok = 0;
+    }
+
+    u32 checksum = 0;
+    for (u32 i = 0; i < ELEMENT_COUNT; i++)
+        checksum ^= values[i] + i;
+
+    print_int((int)sorted_ok);
+    print_int((int)checksum);
     return 0;
 }
